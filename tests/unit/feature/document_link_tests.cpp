@@ -11,7 +11,7 @@ namespace {
 
 namespace protocol = kota::ipc::protocol;
 
-TEST_SUITE(DocumentLink, Tester) {
+TEST_SUITE(document_link, Tester) {
 
 std::vector<protocol::DocumentLink> links;
 
@@ -136,7 +136,7 @@ ABCDE
     EXPECT_LINK(0, "0", TestVFS::path("data.bin"));
 }
 
-};  // TEST_SUITE(DocumentLink)
+};  // TEST_SUITE(document_link)
 
 }  // namespace
 

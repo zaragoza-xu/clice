@@ -161,7 +161,7 @@ depends-on = [{ task = "lint-cpp", args = ["{{ type }}"] }]
 
 [feature.test.tasks.unit-test]
 args = [{ arg = "type", default = "RelWithDebInfo" }]
-cmd = './build/{{ type }}/bin/unit_tests --test-dir="./tests/data"'
+cmd = './build/{{ type }}/bin/unit_tests --test-dir="./tests/data" --snapshot-dir="./tests/snapshots" --corpus-dir="./tests/corpus" --verbose'
 
 [feature.test.tasks.integration-test]
 args = [{ arg = "type", default = "RelWithDebInfo" }]
@@ -257,7 +257,7 @@ format-markdown = "fd -H -e md -x prettier --write"
 format-json = "fd -H -e json -E package-lock.json -x prettier --write"
 format-toml = "fd -H -e toml -x tombi format"
 format-yaml = """
-fd -H -e yaml -e yml -E pnpm-lock.yaml -x prettier --write && \
+fd -H -e yaml -e yml -E pnpm-lock.yaml -E '*.snap.yml' -x prettier --write && \
 fd -H "^\\.clang-(format|tidy)$" -x prettier --write --parser yaml
 """
 format = { depends-on = [

@@ -1,8 +1,11 @@
+#include <format>
 #include <string>
 
 #include "test/test.h"
 #include "test/tester.h"
 #include "feature/feature.h"
+
+#include "kota/meta/enum.h"
 
 namespace clice::testing {
 
@@ -10,7 +13,7 @@ namespace {
 
 namespace protocol = kota::ipc::protocol;
 
-TEST_SUITE(InlayHint, Tester) {
+TEST_SUITE(inlay_hint, Tester) {
 
 std::vector<protocol::InlayHint> hints;
 llvm::DenseMap<std::uint32_t, protocol::InlayHint> hints_map;
@@ -1529,6 +1532,38 @@ TEST_CASE(Dependent, skip = true) {
     EXPECT_HINT("2", "par3:");
 }
 
-};  // TEST_SUITE(InlayHint)
+TEST_CASE(snapshot) {
+    ASSERT_SNAPSHOT_GLOB(corpus_dir, "**/*.cpp", [&](std::string_view path) -> std::string {
+        if(!compile_file(path))
+            return "COMPILE_ERROR";
+        auto content = unit->interested_content();
+        LocalSourceRange range(0, content.size());
+        auto hints = feature::inlay_hints(*unit, range);
+        feature::PositionMapper mapper(content, feature::PositionEncoding::UTF8);
+        std::string result;
+        for(auto& hint: hints) {
+            auto pos = mapper.to_position(hint.offset);
+            if(!pos)
+                continue;
+            auto kind = kota::meta::enum_name(hint.kind, "Unknown");
+            result += std::format("- {{ pos: \"{}:{}\", kind: {}, label: {}",
+                                  pos->line,
+                                  pos->character,
+                                  kind,
+                                  yaml_str(hint.label));
+            if(hint.padding_left) {
+                result += ", padding_left: true";
+            }
+            if(hint.padding_right) {
+                result += ", padding_right: true";
+            }
+            result += " }\n";
+        }
+        return result;
+    });
+}
+
+};  // TEST_SUITE(inlay_hint)
+
 }  // namespace
 }  // namespace clice::testing

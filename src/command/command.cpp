@@ -8,7 +8,6 @@
 #include <string_view>
 
 #include "simdjson.h"
-#include "command/toolchain.h"
 #include "support/filesystem.h"
 #include "support/logging.h"
 
@@ -76,7 +75,7 @@ llvm::ArrayRef<const char*> CompilationDatabase::persist_args(llvm::ArrayRef<con
     if(args.empty())
         return {};
     auto* buf = allocator->Allocate<const char*>(args.size());
-    std::ranges::copy(args, buf);
+    ranges::copy(args, buf);
     return {buf, args.size()};
 }
 
@@ -199,9 +198,7 @@ object_ptr<CompilationInfo> CompilationDatabase::save_compilation_info(llvm::Str
 }
 
 std::size_t CompilationDatabase::load(llvm::StringRef path) {
-    // Clear old entries and caches (but keep allocator/strings/canonicals/infos/toolchain).
     entries.clear();
-    search_config_cache.clear();
 
     simdjson::padded_string json_buf;
     if(auto error = simdjson::padded_string::load(std::string(path)).get(json_buf)) {
@@ -326,11 +323,9 @@ std::size_t CompilationDatabase::load(llvm::StringRef path) {
     return entries.size();
 }
 
-llvm::SmallVector<CompileCommand> CompilationDatabase::lookup(llvm::StringRef file,
-                                                              const CommandOptions& options) {
-    auto path_id = paths.intern(file);
-    auto matched = find_entries(path_id);
-
+CompileCommand CompilationDatabase::build_command(std::uint32_t path_id,
+                                                  object_ptr<CompilationInfo> info,
+                                                  const CommandOptions& options) {
     auto render_arg = [&](auto& out, const kota::option::ParsedArg& arg) {
         auto cb = [&](std::string_view s) {
             out.push_back(strings.save(s).data());
@@ -338,153 +333,93 @@ llvm::SmallVector<CompileCommand> CompilationDatabase::lookup(llvm::StringRef fi
         option::table().render(arg, cb);
     };
 
-    /// Build one CompileCommand from a single CompilationInfo.
-    auto build_command = [&](object_ptr<CompilationInfo> info) -> CompileCommand {
-        llvm::StringRef directory = info->directory;
-        std::vector<const char*> flags;
-        bool is_cc1 = false;
+    llvm::StringRef directory = info->directory;
+    std::vector<const char*> flags;
 
-        auto append_arg = [&](llvm::StringRef s) {
-            flags.emplace_back(strings.save(s).data());
-        };
+    auto append_arg = [&](llvm::StringRef s) {
+        flags.emplace_back(strings.save(s).data());
+    };
 
-        auto append_args = [&](llvm::ArrayRef<const char*> args) {
-            flags.insert(flags.end(), args.begin(), args.end());
-        };
+    auto append_args = [&](llvm::ArrayRef<const char*> args) {
+        flags.insert(flags.end(), args.begin(), args.end());
+    };
 
-        if(options.query_toolchain) {
-            auto cached = query_toolchain_cached(file, directory, info->canonical->arguments);
+    append_args(info->canonical->arguments);
+    append_args(info->patch);
 
-            if(cached.empty()) {
-                if(!options.suppress_logging) {
-                    LOG_WARN("failed to query toolchain: {}", file);
-                }
-                append_args(info->canonical->arguments);
-                append_args(info->patch);
-            } else {
-                flags.assign(cached.begin(), cached.end());
-                flags.pop_back();  // remove temp source file
+    // Inject our resource dir if not already present.
+    if(options.inject_resource_dir && !resource_dir().empty() &&
+       !ranges::contains(flags, llvm::StringRef("-resource-dir"))) {
+        append_arg("-resource-dir");
+        append_arg(resource_dir());
+    }
 
-                // Replace resource dir if needed.
-                if(!resource_dir().empty()) {
-                    llvm::StringRef old_resource_dir;
-                    for(std::size_t i = 0; i + 1 < flags.size(); ++i) {
-                        if(flags[i] == llvm::StringRef("-resource-dir")) {
-                            old_resource_dir = flags[i + 1];
-                            break;
-                        }
-                    }
-                    if(!old_resource_dir.empty() && old_resource_dir != resource_dir()) {
-                        for(auto& arg: flags) {
-                            llvm::StringRef s(arg);
-                            if(s.starts_with(old_resource_dir)) {
-                                auto replaced =
-                                    resource_dir().str() + s.substr(old_resource_dir.size()).str();
-                                arg = strings.save(replaced).data();
-                            }
-                        }
-                    }
-                }
-
-                append_args(info->patch);
-
-                // Strip -main-file-name and its value from flags (to_argv() will
-                // re-inject it with the correct basename when is_cc1 is set).
-                std::vector<const char*> cleaned;
-                cleaned.reserve(flags.size());
-                for(std::size_t i = 0; i < flags.size(); ++i) {
-                    if(flags[i] == llvm::StringRef("-main-file-name") && i + 1 < flags.size()) {
-                        ++i;  // skip the value
-                        continue;
-                    }
-                    cleaned.push_back(flags[i]);
-                }
-                flags = std::move(cleaned);
-
-                // Detect cc1 mode (search rather than assuming index).
-                is_cc1 = ranges::contains(flags, llvm::StringRef("-cc1"));
-            }
-        } else {
-            append_args(info->canonical->arguments);
-            append_args(info->patch);
+    // Apply remove filter.
+    if(!options.remove.empty()) {
+        std::vector<std::string> remove_strs;
+        for(auto& s: options.remove) {
+            remove_strs.push_back(s);
         }
+        std::vector<kota::option::ParsedArg> remove_args;
+        for(auto& result: option::table().parse(remove_strs)) {
+            if(result.has_value()) {
+                remove_args.push_back(*result);
+            }
+        }
+        auto get_id = [](const kota::option::ParsedArg& arg) {
+            return arg.id;
+        };
+        ranges::sort(remove_args, {}, get_id);
 
-        // Inject our resource dir if not already present.
-        if(options.inject_resource_dir && !resource_dir().empty()) {
-            bool has_resource_dir = false;
-            for(auto& arg: flags) {
-                if(arg == llvm::StringRef("-resource-dir")) {
-                    has_resource_dir = true;
+        auto saved_flags = std::move(flags);
+        flags.clear();
+        flags.push_back(saved_flags.front());
+
+        std::vector<std::string> saved_parse_args(saved_flags.begin() + 1, saved_flags.end());
+        for(auto& result: option::table().parse(saved_parse_args)) {
+            if(!result.has_value()) {
+                continue;
+            }
+            auto& arg = *result;
+            auto id = arg.id;
+            auto range = ranges::equal_range(remove_args, id, {}, get_id);
+            bool removed = false;
+            for(auto& remove: range) {
+                if(remove.values.size() == 1 && remove.values[0] == "*") {
+                    removed = true;
+                    break;
+                }
+                if(ranges::equal(arg.values, remove.values)) {
+                    removed = true;
                     break;
                 }
             }
-            if(!has_resource_dir) {
-                append_arg("-resource-dir");
-                append_arg(resource_dir());
+            if(!removed) {
+                render_arg(flags, arg);
             }
         }
+    }
 
-        // Apply remove filter.
-        if(!options.remove.empty()) {
-            std::vector<std::string> remove_strs;
-            for(auto& s: options.remove) {
-                remove_strs.push_back(s);
-            }
-            std::vector<kota::option::ParsedArg> remove_args;
-            for(auto& result: option::table().parse(remove_strs)) {
-                if(result.has_value()) {
-                    remove_args.push_back(*result);
-                }
-            }
-            auto get_id = [](const kota::option::ParsedArg& arg) {
-                return arg.id;
-            };
-            std::ranges::sort(remove_args, {}, get_id);
+    for(auto& arg: options.append) {
+        append_arg(arg);
+    }
 
-            auto saved_flags = std::move(flags);
-            flags.clear();
-            flags.push_back(saved_flags.front());
-
-            std::vector<std::string> saved_parse_args(saved_flags.begin() + 1, saved_flags.end());
-            for(auto& result: option::table().parse(saved_parse_args)) {
-                if(!result.has_value()) {
-                    continue;
-                }
-                auto& arg = *result;
-                auto id = arg.id;
-                auto range = std::ranges::equal_range(remove_args, id, {}, get_id);
-                bool removed = false;
-                for(auto& remove: range) {
-                    if(remove.values.size() == 1 && remove.values[0] == "*") {
-                        removed = true;
-                        break;
-                    }
-                    if(std::ranges::equal(arg.values, remove.values)) {
-                        removed = true;
-                        break;
-                    }
-                }
-                if(!removed) {
-                    render_arg(flags, arg);
-                }
-            }
-        }
-
-        for(auto& arg: options.append) {
-            append_arg(arg);
-        }
-
-        return CompileCommand{
-            ResolvedFlags{directory, std::move(flags), is_cc1},
-            paths.resolve(path_id).data()
-        };
+    return CompileCommand{
+        ResolvedFlags{directory, std::move(flags), false},
+        paths.resolve(path_id).data()
     };
+}
+
+llvm::SmallVector<CompileCommand> CompilationDatabase::lookup(llvm::StringRef file,
+                                                              const CommandOptions& options) {
+    auto path_id = paths.intern(file);
+    auto matched = find_entries(path_id);
 
     llvm::SmallVector<CompileCommand> results;
 
     if(!matched.empty()) {
         for(auto& entry: matched) {
-            results.push_back(build_command(entry.info));
+            results.push_back(build_command(path_id, entry.info, options));
         }
     } else {
         // No matching entry — synthesize a default command.
@@ -507,156 +442,6 @@ llvm::SmallVector<CompileCommand> CompilationDatabase::lookup(llvm::StringRef fi
     return results;
 }
 
-SearchConfig CompilationDatabase::lookup_search_config(llvm::StringRef file,
-                                                       const CommandOptions& options) {
-    auto path_id = paths.intern(file);
-    auto matched = find_entries(path_id);
-
-    // Only cache when remove/append are empty — custom options produce
-    // per-call results that shouldn't pollute the shared cache.
-    bool cacheable = !matched.empty() && options.remove.empty() && options.append.empty();
-
-    if(cacheable) {
-        auto key = ConfigCacheKey{matched.front().info.ptr, options_bits(options)};
-        auto cache_it = search_config_cache.find(key);
-        if(cache_it != search_config_cache.end()) {
-            return cache_it->second;
-        }
-    }
-
-    auto results = lookup(file, options);
-    auto& cmd = results.front();
-    auto config = extract_search_config(cmd.to_argv(), cmd.resolved.directory);
-
-    if(cacheable) {
-        auto key = ConfigCacheKey{matched.front().info.ptr, options_bits(options)};
-        search_config_cache.try_emplace(key, config);
-    }
-    return config;
-}
-
-bool CompilationDatabase::has_cached_configs() const {
-    return !search_config_cache.empty();
-}
-
-CompilationDatabase::ToolchainExtract
-    CompilationDatabase::extract_toolchain_flags(llvm::StringRef file,
-                                                 llvm::ArrayRef<const char*> arguments) {
-    ToolchainExtract result;
-
-    // Driver binary (first arg) — e.g. "clang++" vs "clang" affects language mode.
-    result.key += arguments[0];
-    result.key += '\0';
-
-    // File extension affects language mode (C vs C++).
-    result.key += path::extension(file);
-    result.key += '\0';
-
-    result.query_args.push_back(arguments[0]);
-
-    std::vector<std::string> parse_args(arguments.begin() + 1, arguments.end());
-    auto options = kota::option::ParseOptions{.dash_dash_parsing = true,
-                                              .visibility = default_visibility(arguments[0])};
-    for(auto& result_arg: option::table().parse(parse_args, options)) {
-        if(!result_arg.has_value()) {
-            continue;
-        }
-        auto& arg = *result_arg;
-        auto id = arg.id;
-        if(!is_toolchain_option(id)) {
-            continue;
-        }
-
-        // Add option ID and all its values to the cache key.
-        result.key += std::to_string(id);
-        result.key += '\0';
-        for(auto value: arg.values) {
-            result.key += value;
-            result.key += '\0';
-        }
-
-        // Render the argument back to query args.
-        auto cb = [&](std::string_view s) {
-            result.query_args.push_back(strings.save(s).data());
-        };
-        option::table().render(arg, cb);
-    }
-
-    return result;
-}
-
-llvm::ArrayRef<const char*>
-    CompilationDatabase::query_toolchain_cached(llvm::StringRef file,
-                                                llvm::StringRef directory,
-                                                llvm::ArrayRef<const char*> arguments) {
-    auto [key, query_args] = extract_toolchain_flags(file, arguments);
-    auto it = toolchain_cache.find(key);
-    if(it != toolchain_cache.end()) {
-        return it->second;
-    }
-
-    LOG_WARN("Toolchain cache miss (spawning process): file={}, cache_size={}, key_len={}",
-             file,
-             toolchain_cache.size(),
-             key.size());
-
-    auto callback = [&](const char* s) -> const char* {
-        return strings.save(s).data();
-    };
-    toolchain::QueryParams params = {file, directory, query_args, callback};
-    auto result = toolchain::query_toolchain(params);
-
-    auto [entry, _] = toolchain_cache.try_emplace(std::move(key), std::move(result));
-    return entry->second;
-}
-
-std::vector<ToolchainQuery>
-    CompilationDatabase::get_pending_queries(llvm::ArrayRef<PendingEntry> entries) {
-    llvm::StringMap<bool> seen_keys;
-    std::vector<ToolchainQuery> queries;
-
-    for(auto& entry: entries) {
-        if(entry.arguments.empty()) {
-            continue;
-        }
-
-        auto [key, query_args] = extract_toolchain_flags(entry.file, entry.arguments);
-
-        // Skip if already cached or already queued.
-        if(toolchain_cache.count(key) || !seen_keys.try_emplace(key, true).second) {
-            continue;
-        }
-
-        LOG_DEBUG("Pre-warm: new toolchain key (len={}) for file={}", key.size(), entry.file);
-        queries.push_back(
-            {std::move(key), std::move(query_args), entry.file.str(), entry.directory.str()});
-    }
-
-    LOG_INFO("Pre-warm: {} unique keys from {} entries, {} queries needed",
-             seen_keys.size(),
-             entries.size(),
-             queries.size());
-    return queries;
-}
-
-void CompilationDatabase::inject_results(llvm::ArrayRef<ToolchainResult> results) {
-    for(auto& result: results) {
-        if(toolchain_cache.count(result.key)) {
-            continue;
-        }
-        std::vector<const char*> saved;
-        saved.reserve(result.cc1_args.size());
-        for(auto& arg: result.cc1_args) {
-            saved.push_back(strings.save(arg).data());
-        }
-        toolchain_cache.try_emplace(result.key, std::move(saved));
-    }
-}
-
-bool CompilationDatabase::has_cached_toolchain() const {
-    return !toolchain_cache.empty();
-}
-
 llvm::StringRef CompilationDatabase::resolve_path(std::uint32_t path_id) {
     return paths.resolve(path_id);
 }
@@ -672,6 +457,35 @@ bool CompilationDatabase::has_entry(llvm::StringRef file) {
 
 llvm::ArrayRef<CompilationEntry> CompilationDatabase::get_entries() const {
     return entries;
+}
+
+llvm::SmallVector<CompilationDatabase::ConfigGroup>
+    CompilationDatabase::unique_configs(const CommandOptions& options) {
+    // Group entries by CompilationInfo pointer — entries with the same pointer
+    // share identical (directory, canonical, patch) and thus identical flags.
+    llvm::DenseMap<const CompilationInfo*, std::size_t> group_indices;
+    llvm::SmallVector<ConfigGroup> result;
+    result.reserve(entries.size());
+
+    for(auto& entry: entries) {
+        auto [it, inserted] = group_indices.try_emplace(entry.info.ptr, result.size());
+        if(inserted) {
+            result.push_back({{}, build_command(entry.file, entry.info, options), entry.info});
+        }
+
+        auto& file_ids = result[it->second].file_ids;
+        if(file_ids.empty() || file_ids.back() != entry.file) {
+            file_ids.push_back(entry.file);
+        }
+    }
+
+    return result;
+}
+
+CompileCommand CompilationDatabase::group_command(const ConfigGroup& group,
+                                                  const CommandOptions& options) {
+    assert(!group.file_ids.empty() && group.info && "group must come from unique_configs()");
+    return build_command(group.file_ids.front(), group.info, options);
 }
 
 #ifdef CLICE_ENABLE_TEST

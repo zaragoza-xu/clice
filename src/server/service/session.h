@@ -45,6 +45,19 @@ struct Session {
     struct PendingCompile {
         kota::event done;
         bool succeeded = false;
+
+        /// Generation snapshot at spawn; a later didChange supersedes this compile.
+        std::uint64_t generation = 0;
+
+        /// True once module dependencies are settled and the compile has moved
+        /// on to the worker phase. Past this point the compile holds no
+        /// interest in the module graph and superseding it gains nothing —
+        /// stale waiters coalesce on its completion instead.
+        bool deps_done = false;
+
+        /// Cancels the module-dependency wait when this compile is superseded,
+        /// releasing its interest in the old dependency set.
+        kota::cancellation_source deps_scope;
     };
 
     std::shared_ptr<PendingCompile> compiling;

@@ -108,12 +108,55 @@ struct ModuleTestEnv {
 
 TEST_SUITE(CompileGraphIntegration) {
 
-// ============================================================================
-// Basic module interface units
-// ============================================================================
+ModuleTestEnv env;
+std::optional<kota::event_loop> loop;
+std::optional<CompileGraph> cg;
 
-TEST_CASE(SingleModuleNoDeps) {
-    ModuleTestEnv env;
+CompileGraph::dispatch_fn default_dispatch() {
+    return make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths);
+}
+
+CompileGraph::resolve_fn default_resolver() {
+    return make_resolver(env.cdb, env.toolchain, env.pool, env.graph);
+}
+
+void make_graph(CompileGraph::dispatch_fn dispatch, CompileGraph::resolve_fn resolve) {
+    loop.emplace();
+    cg.emplace(*loop, std::move(dispatch), std::move(resolve));
+}
+
+void make_graph() {
+    make_graph(default_dispatch(), default_resolver());
+}
+
+/// Zero-interest cancellation is deferred by one event-loop tick per cascade
+/// level; wait (bounded) until `pred` holds before asserting settled state.
+template <typename Pred>
+kota::task<> settle(Pred pred) {
+    for(int i = 0; i < 100 && !pred(); i++) {
+        co_await kota::sleep(1);
+    }
+    EXPECT_TRUE(pred());
+}
+
+/// Run the test body, then verify the shutdown protocol leaves the graph idle.
+template <typename F>
+void execute(F&& fn) {
+    auto wrapper = [&]() -> kota::task<> {
+        co_await fn();
+        co_await cg->shutdown();
+        EXPECT_TRUE(cg->idle());
+    };
+    auto t = wrapper();
+    loop->schedule(t);
+    loop->run();
+}
+
+/// ============================================================================
+///                         Basic module interface units
+/// ============================================================================
+
+TEST_CASE(single_module) {
     env.tmp.touch("mod_a.cppm", "export module A;\n" "export int foo() { return 42; }\n");
 
     auto json = build_cdb_json({
@@ -124,23 +167,16 @@ TEST_CASE(SingleModuleNoDeps) {
     ASSERT_FALSE(env.graph.lookup_module("A").empty());
     auto pid_a = env.lookup("A");
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_a]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_a).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_a).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_TRUE(env.pcm_paths.contains(pid_a));
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-TEST_CASE(ChainedModules) {
-    ModuleTestEnv env;
+TEST_CASE(chained_modules) {
     env.tmp.touch("mod_a.cppm", "export module A;\n" "export int foo() { return 42; }\n");
     env.tmp.touch("mod_b.cppm",
                   "export module B;\n"
@@ -158,24 +194,17 @@ TEST_CASE(ChainedModules) {
     ASSERT_NE(pid_a, UINT32_MAX);
     ASSERT_NE(pid_b, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_a, pid_b]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_b).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_b).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_TRUE(env.pcm_paths.contains(pid_a));
         EXPECT_TRUE(env.pcm_paths.contains(pid_b));
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-TEST_CASE(DiamondModules) {
-    ModuleTestEnv env;
+TEST_CASE(diamond_modules) {
     env.tmp.touch("mod_base.cppm",
                   "export module Base;\n" "export int base_val() { return 10; }\n");
     env.tmp.touch("mod_left.cppm",
@@ -203,27 +232,20 @@ TEST_CASE(DiamondModules) {
     auto pid_top = env.lookup("Top");
     ASSERT_NE(pid_top, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_top]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_top).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_top).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 4u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Dotted module names
-// ============================================================================
+/// ============================================================================
+///                             Dotted module names
+/// ============================================================================
 
-TEST_CASE(DottedModuleName) {
-    ModuleTestEnv env;
+TEST_CASE(dotted_module_name) {
     env.tmp.touch("io.cppm", "export module my.io;\n" "export void print() {}\n");
     env.tmp.touch("app.cppm",
                   "export module my.app;\n"
@@ -239,27 +261,20 @@ TEST_CASE(DottedModuleName) {
     auto pid_app = env.lookup("my.app");
     ASSERT_NE(pid_app, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_app]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_app).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_app).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Re-export (export import)
-// ============================================================================
+/// ============================================================================
+///                          Re-export (export import)
+/// ============================================================================
 
-TEST_CASE(ReExport) {
-    ModuleTestEnv env;
+TEST_CASE(re_export) {
     env.tmp.touch("core.cppm", "export module Core;\n" "export int core_fn() { return 1; }\n");
     env.tmp.touch("wrapper.cppm",
                   "export module Wrapper;\n"
@@ -281,27 +296,20 @@ TEST_CASE(ReExport) {
     auto pid_user = env.lookup("User");
     ASSERT_NE(pid_user, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_user]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_user).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_user).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 3u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Export block syntax
-// ============================================================================
+/// ============================================================================
+///                             Export block syntax
+/// ============================================================================
 
-TEST_CASE(ExportBlock) {
-    ModuleTestEnv env;
+TEST_CASE(export_block) {
     env.tmp.touch("block.cppm",
                   "export module Block;\n"
                   "export {\n"
@@ -325,27 +333,20 @@ TEST_CASE(ExportBlock) {
     auto pid = env.lookup("Consumer");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Global module fragment
-// ============================================================================
+/// ============================================================================
+///                            Global module fragment
+/// ============================================================================
 
-TEST_CASE(GlobalModuleFragment) {
-    ModuleTestEnv env;
+TEST_CASE(global_module_fragment) {
     env.tmp.touch("legacy.h", "inline int legacy_fn() { return 99; }\n");
     env.tmp.touch("gmf.cppm",
                   "module;\n"
@@ -361,27 +362,20 @@ TEST_CASE(GlobalModuleFragment) {
     auto pid = env.lookup("GMF");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_TRUE(env.pcm_paths.contains(pid));
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Private module fragment
-// ============================================================================
+/// ============================================================================
+///                           Private module fragment
+/// ============================================================================
 
-TEST_CASE(PrivateModuleFragment) {
-    ModuleTestEnv env;
+TEST_CASE(private_module_fragment) {
     env.tmp.touch("priv.cppm",
                   "export module Priv;\n"
                   "export int public_fn();\n"
@@ -397,27 +391,20 @@ TEST_CASE(PrivateModuleFragment) {
     auto pid = env.lookup("Priv");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_TRUE(env.pcm_paths.contains(pid));
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Module partitions — interface partition
-// ============================================================================
+/// ============================================================================
+///                   Module partitions — interface partition
+/// ============================================================================
 
-TEST_CASE(PartitionInterface) {
-    ModuleTestEnv env;
+TEST_CASE(partition_interface) {
     // Partition interface unit.
     env.tmp.touch("part.cppm", "export module M:Part;\n" "export int part_fn() { return 5; }\n");
     // Primary module interface re-exports the partition.
@@ -437,28 +424,21 @@ TEST_CASE(PartitionInterface) {
     ASSERT_NE(pid_m, UINT32_MAX);
     ASSERT_NE(env.lookup("M:Part"), UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_m]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_m).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_m).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         // Both partition and primary should be compiled.
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Multiple partitions
-// ============================================================================
+/// ============================================================================
+///                             Multiple partitions
+/// ============================================================================
 
-TEST_CASE(MultiplePartitions) {
-    ModuleTestEnv env;
+TEST_CASE(multiple_partitions) {
     env.tmp.touch("part_a.cppm", "export module Lib:A;\n" "export int a_fn() { return 1; }\n");
     env.tmp.touch("part_b.cppm", "export module Lib:B;\n" "export int b_fn() { return 2; }\n");
     env.tmp.touch("lib.cppm",
@@ -477,28 +457,21 @@ TEST_CASE(MultiplePartitions) {
     auto pid_lib = env.lookup("Lib");
     ASSERT_NE(pid_lib, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_lib]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_lib).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_lib).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         // Lib:A, Lib:B, and Lib.
         EXPECT_EQ(env.pcm_paths.size(), 3u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Partition importing another partition (within same module)
-// ============================================================================
+/// ============================================================================
+///          Partition importing another partition (within same module)
+/// ============================================================================
 
-TEST_CASE(PartitionChain) {
-    ModuleTestEnv env;
+TEST_CASE(partition_chain) {
     env.tmp.touch("types.cppm",
                   "export module Sys:Types;\n" "export struct Config { int value = 0; };\n");
     env.tmp.touch("core.cppm",
@@ -520,28 +493,21 @@ TEST_CASE(PartitionChain) {
     auto pid_sys = env.lookup("Sys");
     ASSERT_NE(pid_sys, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_sys]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_sys).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_sys).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         // Sys:Types, Sys:Core, Sys.
         EXPECT_EQ(env.pcm_paths.size(), 3u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Module with exported namespace
-// ============================================================================
+/// ============================================================================
+///                        Module with exported namespace
+/// ============================================================================
 
-TEST_CASE(ExportNamespace) {
-    ModuleTestEnv env;
+TEST_CASE(export_namespace) {
     env.tmp.touch("ns.cppm",
                   "export module NS;\n"
                   "export namespace math {\n"
@@ -562,27 +528,20 @@ TEST_CASE(ExportNamespace) {
     auto pid = env.lookup("Calc");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// GMF with include + module import
-// ============================================================================
+/// ============================================================================
+///                       GMF with include + module import
+/// ============================================================================
 
-TEST_CASE(GMFWithImport) {
-    ModuleTestEnv env;
+TEST_CASE(gmf_with_import) {
     env.tmp.touch("util.h", "inline int util_helper() { return 7; }\n");
     env.tmp.touch("base.cppm", "export module Base;\n" "export int base() { return 100; }\n");
     env.tmp.touch("combined.cppm",
@@ -601,27 +560,20 @@ TEST_CASE(GMFWithImport) {
     auto pid = env.lookup("Combined");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Deep chain (5 modules)
-// ============================================================================
+/// ============================================================================
+///                            Deep chain (5 modules)
+/// ============================================================================
 
-TEST_CASE(DeepChain) {
-    ModuleTestEnv env;
+TEST_CASE(deep_chain) {
     env.tmp.touch("m1.cppm", "export module M1;\n" "export int f1() { return 1; }\n");
     env.tmp.touch("m2.cppm",
                   "export module M2;\n"
@@ -652,27 +604,20 @@ TEST_CASE(DeepChain) {
     auto pid = env.lookup("M5");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 5u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Multiple independent modules (no shared deps)
-// ============================================================================
+/// ============================================================================
+///                Multiple independent modules (no shared deps)
+/// ============================================================================
 
-TEST_CASE(IndependentModules) {
-    ModuleTestEnv env;
+TEST_CASE(independent_modules) {
     env.tmp.touch("x.cppm", "export module X;\n" "export int x() { return 1; }\n");
     env.tmp.touch("y.cppm", "export module Y;\n" "export int y() { return 2; }\n");
 
@@ -687,28 +632,21 @@ TEST_CASE(IndependentModules) {
     ASSERT_NE(pid_x, UINT32_MAX);
     ASSERT_NE(pid_y, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_x, pid_y]() -> kota::task<> {
-        auto r1 = co_await cg.compile(pid_x).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto r1 = co_await cg->compile(pid_x).catch_cancel();
         EXPECT_TRUE(r1.has_value() && *r1);
-        auto r2 = co_await cg.compile(pid_y).catch_cancel();
+        auto r2 = co_await cg->compile(pid_y).catch_cancel();
         EXPECT_TRUE(r2.has_value() && *r2);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Module with template exports
-// ============================================================================
+/// ============================================================================
+///                         Module with template exports
+/// ============================================================================
 
-TEST_CASE(TemplateExport) {
-    ModuleTestEnv env;
+TEST_CASE(template_export) {
     env.tmp.touch("tmpl.cppm",
                   "export module Tmpl;\n"
                   "export template<typename T>\n"
@@ -729,27 +667,20 @@ TEST_CASE(TemplateExport) {
     auto pid = env.lookup("UseTmpl");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Module with class export and inheritance across modules
-// ============================================================================
+/// ============================================================================
+///           Module with class export and inheritance across modules
+/// ============================================================================
 
-TEST_CASE(ClassExportAndInheritance) {
-    ModuleTestEnv env;
+TEST_CASE(class_export_inheritance) {
     env.tmp.touch("shape.cppm",
                   "export module Shape;\n"
                   "export class Shape {\n"
@@ -776,27 +707,20 @@ TEST_CASE(ClassExportAndInheritance) {
     auto pid = env.lookup("Circle");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Recompile after update (invalidation + recompile)
-// ============================================================================
+/// ============================================================================
+///              Recompile after update (invalidation + recompile)
+/// ============================================================================
 
-TEST_CASE(RecompileAfterUpdate) {
-    ModuleTestEnv env;
+TEST_CASE(recompile_after_update) {
     env.tmp.touch("leaf.cppm", "export module Leaf;\n" "export int leaf() { return 1; }\n");
     env.tmp.touch("mid.cppm",
                   "export module Mid;\n"
@@ -814,40 +738,33 @@ TEST_CASE(RecompileAfterUpdate) {
     ASSERT_NE(pid_leaf, UINT32_MAX);
     ASSERT_NE(pid_mid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_leaf, pid_mid]() -> kota::task<> {
+    make_graph();
+    execute([&]() -> kota::task<> {
         // First compile.
-        auto r1 = co_await cg.compile(pid_mid).catch_cancel();
+        auto r1 = co_await cg->compile(pid_mid).catch_cancel();
         EXPECT_TRUE(r1.has_value() && *r1);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-        EXPECT_FALSE(cg.is_dirty(pid_leaf));
-        EXPECT_FALSE(cg.is_dirty(pid_mid));
+        EXPECT_FALSE(cg->is_dirty(pid_leaf));
+        EXPECT_FALSE(cg->is_dirty(pid_mid));
 
         // Simulate editing Leaf — should cascade to Mid.
-        cg.update(pid_leaf);
-        EXPECT_TRUE(cg.is_dirty(pid_leaf));
-        EXPECT_TRUE(cg.is_dirty(pid_mid));
+        cg->update(pid_leaf);
+        EXPECT_TRUE(cg->is_dirty(pid_leaf));
+        EXPECT_TRUE(cg->is_dirty(pid_mid));
 
         // Recompile.
-        auto r2 = co_await cg.compile(pid_mid).catch_cancel();
+        auto r2 = co_await cg->compile(pid_mid).catch_cancel();
         EXPECT_TRUE(r2.has_value() && *r2);
-        EXPECT_FALSE(cg.is_dirty(pid_leaf));
-        EXPECT_FALSE(cg.is_dirty(pid_mid));
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+        EXPECT_FALSE(cg->is_dirty(pid_leaf));
+        EXPECT_FALSE(cg->is_dirty(pid_mid));
+    });
 }
 
-// ============================================================================
-// Partition with GMF (#include inside global module fragment of partition)
-// ============================================================================
+/// ============================================================================
+///   Partition with GMF (#include inside global module fragment of partition)
+/// ============================================================================
 
-TEST_CASE(PartitionWithGMF) {
-    ModuleTestEnv env;
+TEST_CASE(partition_with_gmf) {
     env.tmp.touch("config.h", "#define MAX_SIZE 100\n");
     env.tmp.touch("part_cfg.cppm",
                   "module;\n"
@@ -865,27 +782,20 @@ TEST_CASE(PartitionWithGMF) {
     auto pid = env.lookup("Cfg");
     ASSERT_NE(pid, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid]() -> kota::task<> {
-        auto result = co_await cg.compile(pid).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         EXPECT_EQ(env.pcm_paths.size(), 2u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Cross-module partition + external import
-// ============================================================================
+/// ============================================================================
+///                   Cross-module partition + external import
+/// ============================================================================
 
-TEST_CASE(PartitionWithExternalImport) {
-    ModuleTestEnv env;
+TEST_CASE(partition_external_import) {
     // External module.
     env.tmp.touch("ext.cppm", "export module Ext;\n" "export int ext_val() { return 99; }\n");
     // Partition that imports the external module.
@@ -906,28 +816,21 @@ TEST_CASE(PartitionWithExternalImport) {
     auto pid_app = env.lookup("App");
     ASSERT_NE(pid_app, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_app]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_app).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_app).catch_cancel();
         EXPECT_TRUE(result.has_value());
         EXPECT_TRUE(*result);
         // Ext, App:Core, App.
         EXPECT_EQ(env.pcm_paths.size(), 3u);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Diamond update cascade + recompile
-// ============================================================================
+/// ============================================================================
+///                      Diamond update cascade + recompile
+/// ============================================================================
 
-TEST_CASE(DiamondUpdateCascade) {
-    ModuleTestEnv env;
+TEST_CASE(diamond_update_cascade) {
     env.tmp.touch("mod_base.cppm",
                   "export module Base;\n" "export int base_val() { return 10; }\n");
     env.tmp.touch("mod_left.cppm",
@@ -959,13 +862,10 @@ TEST_CASE(DiamondUpdateCascade) {
     ASSERT_NE(pid_base, UINT32_MAX);
     ASSERT_NE(pid_top, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_base, pid_left, pid_right, pid_top]() -> kota::task<> {
+    make_graph();
+    execute([&]() -> kota::task<> {
         // Initial compile.
-        auto r1 = co_await cg.compile(pid_top).catch_cancel();
+        auto r1 = co_await cg->compile(pid_top).catch_cancel();
         EXPECT_TRUE(r1.has_value() && *r1);
         EXPECT_EQ(env.pcm_paths.size(), 4u);
 
@@ -973,11 +873,11 @@ TEST_CASE(DiamondUpdateCascade) {
         auto old_base_pcm = env.pcm_paths[pid_base];
 
         // Update base: should cascade to Left, Right, Top.
-        auto dirtied = cg.update(pid_base);
-        EXPECT_TRUE(cg.is_dirty(pid_base));
-        EXPECT_TRUE(cg.is_dirty(pid_left));
-        EXPECT_TRUE(cg.is_dirty(pid_right));
-        EXPECT_TRUE(cg.is_dirty(pid_top));
+        auto dirtied = cg->update(pid_base);
+        EXPECT_TRUE(cg->is_dirty(pid_base));
+        EXPECT_TRUE(cg->is_dirty(pid_left));
+        EXPECT_TRUE(cg->is_dirty(pid_right));
+        EXPECT_TRUE(cg->is_dirty(pid_top));
 
         // Simulate MasterServer: erase stale PCMs for all dirtied nodes.
         for(auto id: dirtied) {
@@ -986,23 +886,19 @@ TEST_CASE(DiamondUpdateCascade) {
         EXPECT_EQ(env.pcm_paths.size(), 0u);
 
         // Recompile.
-        auto r2 = co_await cg.compile(pid_top).catch_cancel();
+        auto r2 = co_await cg->compile(pid_top).catch_cancel();
         EXPECT_TRUE(r2.has_value() && *r2);
         EXPECT_EQ(env.pcm_paths.size(), 4u);
         // PCM path should have changed (new temp file).
         EXPECT_NE(env.pcm_paths[pid_base], old_base_pcm);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Verify resolve_fn is re-invoked after update (resolved=false)
-// ============================================================================
+/// ============================================================================
+///        Verify resolve_fn is re-invoked after update (resolved=false)
+/// ============================================================================
 
-TEST_CASE(ReResolveAfterUpdate) {
-    ModuleTestEnv env;
+TEST_CASE(re_resolve_after_update) {
     // Start with Mid importing Leaf.
     env.tmp.touch("leaf.cppm", "export module Leaf;\n" "export int leaf() { return 1; }\n");
     env.tmp.touch("extra.cppm", "export module Extra;\n" "export int extra() { return 99; }\n");
@@ -1025,57 +921,36 @@ TEST_CASE(ReResolveAfterUpdate) {
     ASSERT_NE(pid_extra, UINT32_MAX);
 
     int resolve_count = 0;
-    auto counting_resolver = [&](std::uint32_t path_id) -> llvm::SmallVector<std::uint32_t> {
+    auto counting_resolver =
+        [&, inner = default_resolver()](std::uint32_t path_id) -> llvm::SmallVector<std::uint32_t> {
         if(path_id == pid_mid) {
             resolve_count++;
         }
-        // Delegate to the standard resolver.
-        auto file_path = env.pool.resolve(path_id);
-        auto results = env.cdb.lookup(file_path);
-        if(results.empty()) {
-            return {};
-        }
-        env.toolchain.resolve_or_warn(results[0]);
-        auto scan_result = scan_precise(results[0].to_argv(), results[0].resolved.directory);
-        llvm::SmallVector<std::uint32_t> deps;
-        for(auto& mod_name: scan_result.modules) {
-            auto mod_ids = env.graph.lookup_module(mod_name);
-            if(!mod_ids.empty()) {
-                deps.push_back(mod_ids[0]);
-            }
-        }
-        return deps;
+        return inner(path_id);
     };
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    std::move(counting_resolver));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, &resolve_count, pid_mid]() -> kota::task<> {
+    make_graph(default_dispatch(), std::move(counting_resolver));
+    execute([&]() -> kota::task<> {
         // First compile: resolve_fn called once for Mid.
-        auto r1 = co_await cg.compile(pid_mid).catch_cancel();
+        auto r1 = co_await cg->compile(pid_mid).catch_cancel();
         EXPECT_TRUE(r1.has_value() && *r1);
         EXPECT_EQ(resolve_count, 1);
 
         // Update Mid: resets resolved.
-        cg.update(pid_mid);
+        cg->update(pid_mid);
 
         // Recompile: resolve_fn should be called again.
-        auto r2 = co_await cg.compile(pid_mid).catch_cancel();
+        auto r2 = co_await cg->compile(pid_mid).catch_cancel();
         EXPECT_TRUE(r2.has_value() && *r2);
         EXPECT_EQ(resolve_count, 2);
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Compilation failure propagation (real clang error)
-// ============================================================================
+/// ============================================================================
+///              Compilation failure propagation (real clang error)
+/// ============================================================================
 
-TEST_CASE(CompileFailurePropagation) {
-    ModuleTestEnv env;
+TEST_CASE(compile_failure_propagation) {
     // Good module.
     env.tmp.touch("good.cppm", "export module Good;\n" "export int good() { return 1; }\n");
     // Bad module with syntax error.
@@ -1093,12 +968,9 @@ TEST_CASE(CompileFailurePropagation) {
     auto pid_bad = env.lookup("Bad");
     ASSERT_NE(pid_bad, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_bad]() -> kota::task<> {
-        auto result = co_await cg.compile(pid_bad).catch_cancel();
+    make_graph();
+    execute([&]() -> kota::task<> {
+        auto result = co_await cg->compile(pid_bad).catch_cancel();
         EXPECT_TRUE(result.has_value());
         // Compilation should fail due to undefined symbol.
         EXPECT_FALSE(*result);
@@ -1107,18 +979,14 @@ TEST_CASE(CompileFailurePropagation) {
         EXPECT_TRUE(env.pcm_paths.contains(pid_good));
         // Bad module should NOT have a PCM.
         EXPECT_FALSE(env.pcm_paths.contains(pid_bad));
-    };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+    });
 }
 
-// ============================================================================
-// Module implementation unit (consumes PCM, doesn't produce one)
-// ============================================================================
+/// ============================================================================
+///        Module implementation unit (consumes PCM, doesn't produce one)
+/// ============================================================================
 
-TEST_CASE(ModuleImplementationUnit) {
-    ModuleTestEnv env;
+TEST_CASE(module_implementation_unit) {
     // Module interface unit — produces PCM.
     env.tmp.touch("iface.cppm", "export module Greeter;\n" "export const char* greet();\n");
     // Module implementation unit — consumes PCM, no export.
@@ -1134,13 +1002,10 @@ TEST_CASE(ModuleImplementationUnit) {
     auto pid_iface = env.lookup("Greeter");
     ASSERT_NE(pid_iface, UINT32_MAX);
 
-    CompileGraph cg(make_dispatch(env.cdb, env.toolchain, env.pool, env.graph, env.pcm_paths),
-                    make_resolver(env.cdb, env.toolchain, env.pool, env.graph));
-
-    kota::event_loop loop;
-    auto test = [this, &cg, &env, pid_iface]() -> kota::task<> {
+    make_graph();
+    execute([&]() -> kota::task<> {
         // Build the interface PCM via CompileGraph.
-        auto r1 = co_await cg.compile(pid_iface).catch_cancel();
+        auto r1 = co_await cg->compile(pid_iface).catch_cancel();
         EXPECT_TRUE(r1.has_value() && *r1);
         EXPECT_TRUE(env.pcm_paths.contains(pid_iface));
 
@@ -1166,10 +1031,188 @@ TEST_CASE(ModuleImplementationUnit) {
 
         auto unit = compile(cp);
         EXPECT_TRUE(unit.completed());
+    });
+}
+
+/// ============================================================================
+///    Shared dependency: switching import target must not kill or restart it
+/// ============================================================================
+
+TEST_CASE(shared_dep_import_switch) {
+    env.tmp.touch("shared.cppm",
+                  "export module Shared;\n" "export int shared_val() { return 1; }\n");
+    env.tmp.touch("a.cppm",
+                  "export module A;\n"
+                  "import Shared;\n"
+                  "export int a_val() { return shared_val(); }\n");
+    env.tmp.touch("c.cppm",
+                  "export module C;\n"
+                  "import Shared;\n"
+                  "export int c_val() { return shared_val(); }\n");
+
+    auto json = build_cdb_json({
+        {env.tmp.root, env.tmp.path("shared.cppm"), {}},
+        {env.tmp.root, env.tmp.path("a.cppm"),      {}},
+        {env.tmp.root, env.tmp.path("c.cppm"),      {}},
+    });
+    env.setup({}, json);
+
+    auto pid_shared = env.lookup("Shared");
+    auto pid_a = env.lookup("A");
+    auto pid_c = env.lookup("C");
+    ASSERT_NE(pid_shared, UINT32_MAX);
+    ASSERT_NE(pid_a, UINT32_MAX);
+    ASSERT_NE(pid_c, UINT32_MAX);
+
+    // Gate the shared module's dispatch so the import switch can be injected
+    // while it is still compiling.
+    kota::event shared_started;
+    kota::event shared_proceed;
+    int shared_calls = 0;
+    auto inner = default_dispatch();
+    auto dispatch = [&](std::uint32_t pid) -> kota::task<bool> {
+        if(pid == pid_shared) {
+            shared_calls += 1;
+            shared_started.set();
+            co_await shared_proceed.wait();
+        }
+        co_return co_await inner(pid);
     };
-    auto t = test();
-    loop.schedule(t);
-    loop.run();
+
+    make_graph(std::move(dispatch), default_resolver());
+
+    kota::cancellation_source req_a;
+    kota::event start_c;
+    std::optional<bool> result_a, result_c;
+
+    auto request_a = [&]() -> kota::task<> {
+        auto r = co_await kota::with_token(cg->compile(pid_a), req_a.token());
+        if(r.has_value()) {
+            result_a = *r;
+        }
+    };
+
+    auto request_c = [&]() -> kota::task<> {
+        co_await start_c.wait();
+        auto r = co_await cg->compile(pid_c).catch_cancel();
+        if(r.has_value()) {
+            result_c = *r;
+        }
+    };
+
+    execute([&]() -> kota::task<> {
+        auto driver = [&]() -> kota::task<> {
+            co_await shared_started.wait();
+            EXPECT_EQ(cg->refcount(pid_shared), 1u);
+            EXPECT_EQ(shared_calls, 1);
+
+            // Simulate switching `import A` to `import C`: start the new
+            // request first, then cancel the old one — the same order the
+            // supersede path in Compiler::ensure_compiled uses, so the
+            // shared module's interest never drops to zero.
+            start_c.set();
+            req_a.cancel();
+            co_await settle([&] { return !cg->is_compiling(pid_a); });
+
+            EXPECT_TRUE(cg->is_compiling(pid_shared));
+            EXPECT_EQ(cg->refcount(pid_shared), 1u);
+            EXPECT_EQ(shared_calls, 1);
+
+            shared_proceed.set();
+            co_return;
+        };
+
+        co_await kota::when_all(request_a(), request_c(), driver());
+
+        // A was cancelled; C completed using the surviving shared build.
+        EXPECT_FALSE(result_a.has_value());
+        EXPECT_TRUE(result_c == true);
+        EXPECT_EQ(shared_calls, 1);
+        EXPECT_TRUE(env.pcm_paths.contains(pid_shared));
+        EXPECT_TRUE(env.pcm_paths.contains(pid_c));
+        EXPECT_FALSE(env.pcm_paths.contains(pid_a));
+    });
+}
+
+/// ============================================================================
+///   Shared dependency failure propagates to every consumer of the same round
+/// ============================================================================
+
+TEST_CASE(shared_dep_fails_both) {
+    env.tmp.touch(
+        "shared.cppm",
+        "export module Shared;\n" "export int shared_val() { return UNDEFINED_SYMBOL; }\n");
+    env.tmp.touch("a.cppm",
+                  "export module A;\n"
+                  "import Shared;\n"
+                  "export int a_val() { return shared_val(); }\n");
+    env.tmp.touch("c.cppm",
+                  "export module C;\n"
+                  "import Shared;\n"
+                  "export int c_val() { return shared_val(); }\n");
+
+    auto json = build_cdb_json({
+        {env.tmp.root, env.tmp.path("shared.cppm"), {}},
+        {env.tmp.root, env.tmp.path("a.cppm"),      {}},
+        {env.tmp.root, env.tmp.path("c.cppm"),      {}},
+    });
+    env.setup({}, json);
+
+    auto pid_shared = env.lookup("Shared");
+    auto pid_a = env.lookup("A");
+    auto pid_c = env.lookup("C");
+    ASSERT_NE(pid_shared, UINT32_MAX);
+
+    // Gate the shared module so both consumers join the same failing round.
+    kota::event shared_started;
+    kota::event shared_proceed;
+    int shared_calls = 0;
+    auto inner = default_dispatch();
+    auto dispatch = [&](std::uint32_t pid) -> kota::task<bool> {
+        if(pid == pid_shared) {
+            shared_calls += 1;
+            shared_started.set();
+            co_await shared_proceed.wait();
+        }
+        co_return co_await inner(pid);
+    };
+
+    make_graph(std::move(dispatch), default_resolver());
+
+    std::optional<bool> result_a, result_c;
+    auto request_a = [&]() -> kota::task<> {
+        auto r = co_await cg->compile(pid_a).catch_cancel();
+        if(r.has_value()) {
+            result_a = *r;
+        }
+    };
+    auto request_c = [&]() -> kota::task<> {
+        auto r = co_await cg->compile(pid_c).catch_cancel();
+        if(r.has_value()) {
+            result_c = *r;
+        }
+    };
+
+    execute([&]() -> kota::task<> {
+        auto driver = [&]() -> kota::task<> {
+            co_await shared_started.wait();
+            co_await kota::sleep(1);
+            // Both chains hold interest in the same round.
+            EXPECT_EQ(cg->refcount(pid_shared), 2u);
+            shared_proceed.set();
+            co_return;
+        };
+
+        co_await kota::when_all(request_a(), request_c(), driver());
+
+        // One failing round, both consumers fail without retry.
+        EXPECT_TRUE(result_a == false);
+        EXPECT_TRUE(result_c == false);
+        EXPECT_EQ(shared_calls, 1);
+        EXPECT_FALSE(env.pcm_paths.contains(pid_shared));
+        EXPECT_FALSE(env.pcm_paths.contains(pid_a));
+        EXPECT_FALSE(env.pcm_paths.contains(pid_c));
+    });
 }
 
 };  // TEST_SUITE(CompileGraphIntegration)

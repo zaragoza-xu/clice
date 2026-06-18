@@ -32,7 +32,7 @@ struct Session {
     /// Current buffer content (may differ from disk until saved).
     std::string text;
 
-    /// Monotonic generation counter, incremented on every didChange.
+    /// Monotonic generation counter, incremented on every didChange and on close.
     /// Used to detect stale compilation results (ABA prevention).
     std::uint64_t generation = 0;
 

@@ -27,11 +27,8 @@ using serde_raw = kota::codec::RawValue;
 
 /// Detect whether the cursor is inside a preamble directive (include/import).
 
-Compiler::Compiler(kota::event_loop& loop,
-                   Workspace& workspace,
-                   WorkerPool& pool,
-                   llvm::DenseMap<std::uint32_t, Session>& sessions) :
-    loop(loop), workspace(workspace), pool(pool), sessions(sessions) {}
+Compiler::Compiler(kota::event_loop& loop, Workspace& workspace, WorkerPool& pool) :
+    loop(loop), workspace(workspace), pool(pool) {}
 
 Compiler::~Compiler() {
     workspace.cancel_all();
@@ -318,12 +315,7 @@ std::optional<HeaderFileContext> Compiler::resolve_header_context(std::uint32_t 
         auto next_filename = llvm::sys::path::filename(next_path);
 
         // Prefer in-memory document text over disk content.
-        // Use the session if this file matches the session's path, otherwise
-        // fall back to disk.
         std::string content;
-        // Note: we don't have the sessions map here, so we always read from disk
-        // for intermediate chain files.  The session parameter only covers the
-        // header file itself (the target), not intermediate files in the chain.
         auto buf = llvm::MemoryBuffer::getFile(cur_path);
         if(!buf) {
             LOG_WARN("resolve_header_context: cannot read {}", cur_path);
@@ -660,28 +652,19 @@ void Compiler::record_deps(Session& session, llvm::ArrayRef<std::string> deps) {
 /// Called lazily by forward_query() / forward_build() before every
 /// feature request (hover, semantic tokens, etc.). Guarantees that when it
 /// returns true the stateful worker assigned to `path_id` holds an up-to-date
-kota::task<> Compiler::run_compile(std::uint32_t pid, std::shared_ptr<Session::PendingCompile> pc) {
-    auto find_session = [&]() -> Session* {
-        auto it = sessions.find(pid);
-        return it != sessions.end() ? &it->second : nullptr;
-    };
-
-    auto* sess = find_session();
-    if(!sess) {
-        pc->done.set();
-        co_return;
-    }
+kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
+    auto pc = session->compiling;
+    auto pid = session->path_id;
+    auto gen = session->generation;
 
     auto finish_compile = [&]() {
-        auto* s = find_session();
-        if(s && s->compiling == pc) {
-            s->compiling.reset();
+        if(session->compiling == pc) {
+            session->compiling.reset();
         }
         LOG_INFO("ensure_compiled: finish path_id={}", pid);
         pc->done.set();
     };
 
-    auto gen = sess->generation;
     LOG_INFO("ensure_compiled: starting compile path_id={} gen={}", pid, gen);
 
     auto file_path = std::string(workspace.path_pool.resolve(pid));
@@ -690,14 +673,14 @@ kota::task<> Compiler::run_compile(std::uint32_t pid, std::shared_ptr<Session::P
 
     worker::CompileParams params;
     params.path = file_path;
-    params.version = sess->version;
-    params.text = sess->text;
-    if(!fill_compile_args(file_path, params.directory, params.arguments, sess)) {
+    params.version = session->version;
+    params.text = session->text;
+    if(!fill_compile_args(file_path, params.directory, params.arguments, session.get())) {
         finish_compile();
         co_return;
     }
 
-    bool deps_ok = co_await ensure_deps(*sess,
+    bool deps_ok = co_await ensure_deps(*session,
                                         params.directory,
                                         params.arguments,
                                         params.pch,
@@ -710,18 +693,9 @@ kota::task<> Compiler::run_compile(std::uint32_t pid, std::shared_ptr<Session::P
         co_return;
     }
 
-    sess = find_session();
-    if(!sess) {
-        pc->done.set();
-        co_return;
-    }
-
-    // Superseded while preparing dependencies — don't send the stale text:
-    // the replacement compile may already have sent newer text, and the
-    // worker applies compiles in arrival order without a version check.
-    if(sess->generation != gen) {
+    if(session->generation != gen) {
         LOG_INFO("ensure_compiled: superseded before send ({} vs {}) for {}",
-                 sess->generation,
+                 session->generation,
                  gen,
                  uri_str);
         finish_compile();
@@ -730,15 +704,9 @@ kota::task<> Compiler::run_compile(std::uint32_t pid, std::shared_ptr<Session::P
 
     auto result = co_await pool.send_stateful(pid, params);
 
-    sess = find_session();
-    if(!sess) {
-        pc->done.set();
-        co_return;
-    }
-
-    if(sess->generation != gen) {
+    if(session->generation != gen) {
         LOG_INFO("ensure_compiled: generation mismatch ({} vs {}) for {}",
-                 sess->generation,
+                 session->generation,
                  gen,
                  uri_str);
         finish_compile();
@@ -752,21 +720,21 @@ kota::task<> Compiler::run_compile(std::uint32_t pid, std::shared_ptr<Session::P
         co_return;
     }
 
-    sess->ast_dirty = false;
+    session->ast_dirty = false;
     pc->succeeded = true;
-    record_deps(*sess, result.value().deps);
+    record_deps(*session, result.value().deps);
 
     if(!result.value().tu_index_data.empty()) {
         auto tu_index = index::TUIndex::from(result.value().tu_index_data.data());
         OpenFileIndex ofi;
         ofi.file_index = std::move(tu_index.main_file_index);
         ofi.symbols = std::move(tu_index.symbols);
-        ofi.content = sess->text;
+        ofi.content = params.text;
         ofi.mapper.emplace(ofi.content, lsp::PositionEncoding::UTF16);
-        sess->file_index = std::move(ofi);
+        session->file_index = std::move(ofi);
     }
 
-    auto version = sess->version;
+    auto version = session->version;
     finish_compile();
 
     publish_diagnostics(uri_str, version, result.value().diagnostics);
@@ -797,29 +765,30 @@ kota::task<> Compiler::run_compile(std::uint32_t pid, std::shared_ptr<Session::P
 /// Compiler's task_group; subsequent ones wait on the shared event.
 /// The spawned task is not cancelled by LSP $/cancelRequest, preventing
 /// the race where cancellation wakes all waiters and they all start compiles.
-kota::task<bool> Compiler::ensure_compiled(Session& session) {
-    auto path_id = session.path_id;
+kota::task<bool> Compiler::ensure_compiled(std::shared_ptr<Session> session) {
+    auto path_id = session->path_id;
+    auto gen = session->generation;
 
     LOG_DEBUG("ensure_compiled: path_id={} version={} gen={} ast_dirty={}",
               path_id,
-              session.version,
-              session.generation,
-              session.ast_dirty);
+              session->version,
+              gen,
+              session->ast_dirty);
 
-    if(!session.ast_dirty) {
-        if(!is_stale(session)) {
+    if(!session->ast_dirty) {
+        if(!is_stale(*session)) {
             co_return true;
         }
-        session.ast_dirty = true;
+        session->ast_dirty = true;
     }
 
     // If an up-to-date compile is already in flight, wait for it.
     // This co_await may be cancelled by LSP $/cancelRequest — that's fine,
     // it just means this particular feature request is abandoned.  The
     // detached compile task keeps running independently.
-    while(session.compiling) {
-        auto pending = session.compiling;
-        if(pending->generation != session.generation && !pending->deps_done) {
+    while(session->compiling) {
+        auto pending = session->compiling;
+        if(pending->generation != session->generation && !pending->deps_done) {
             // The in-flight compile is stale (user edited since it started)
             // and still holds interest in the module graph — supersede it.
             // A stale compile already past its dependency phase is left to
@@ -829,21 +798,27 @@ kota::task<bool> Compiler::ensure_compiled(Session& session) {
             break;
         }
         co_await pending->done.wait();
-        if(!session.ast_dirty)
+        if(!session->ast_dirty)
             co_return true;
     }
 
-    auto superseded = session.compiling;
-    auto pending_compile = std::make_shared<Session::PendingCompile>();
-    pending_compile->generation = session.generation;
-    session.compiling = pending_compile;
+    // If we fell through (not superseding) and the generation changed while
+    // we were waiting, the session was closed or replaced — don't compile.
+    if(!session->compiling && session->generation != gen) {
+        co_return false;
+    }
 
-    LOG_INFO("ensure_compiled: launching compile path_id={} gen={}", path_id, session.generation);
+    auto superseded = session->compiling;
+    auto pending_compile = std::make_shared<Session::PendingCompile>();
+    pending_compile->generation = session->generation;
+    session->compiling = pending_compile;
+
+    LOG_INFO("ensure_compiled: launching compile path_id={} gen={}", path_id, session->generation);
 
     // Spawn the replacement before cancelling the superseded compile: the new
     // round acquires its module-dependency interest synchronously, so shared
     // dependencies never see their interest drop to zero across the swap.
-    compile_tasks.spawn(run_compile(path_id, pending_compile));
+    compile_tasks.spawn(run_compile(session));
 
     if(superseded) {
         superseded->deps_scope.cancel();
@@ -853,25 +828,23 @@ kota::task<bool> Compiler::ensure_compiled(Session& session) {
     // by LSP $/cancelRequest, the detached task continues unaffected.
     co_await pending_compile->done.wait();
 
-    co_return !session.ast_dirty;
+    co_return !session->ast_dirty;
 }
 
 Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
-                                            Session& session,
+                                            std::shared_ptr<Session> session,
                                             std::optional<protocol::Position> position,
                                             std::optional<protocol::Range> range) {
-    auto path_id = session.path_id;
+    auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
-    // Cache text before co_await — session reference may dangle if didClose
-    // erases the entry from the sessions map during suspension.
-    auto text = session.text;
+    auto gen = session->generation;
+    auto text = session->text;
 
     if(!co_await ensure_compiled(session)) {
         co_return serde_raw{"null"};
     }
 
-    auto sit = sessions.find(path_id);
-    if(sit == sessions.end() || sit->second.ast_dirty) {
+    if(session->generation != gen) {
         co_return serde_raw{"null"};
     }
 
@@ -905,27 +878,25 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
 
 Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
                                             const protocol::Position& position,
-                                            Session& session) {
-    auto path_id = session.path_id;
+                                            std::shared_ptr<Session> session) {
+    auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
+    auto gen = session->generation;
 
     worker::BuildParams wp;
     wp.kind = kind;
     wp.file = path;
-    // Cache session fields before co_await — session reference may dangle
-    // if didClose erases the entry from the sessions map during suspension.
-    wp.version = session.version;
-    wp.text = session.text;
-    if(!fill_compile_args(path, wp.directory, wp.arguments, &session)) {
+    wp.version = session->version;
+    wp.text = session->text;
+    if(!fill_compile_args(path, wp.directory, wp.arguments, session.get())) {
         co_return serde_raw{};
     }
 
-    if(!co_await ensure_deps(session, wp.directory, wp.arguments, wp.pch, wp.pcms)) {
+    if(!co_await ensure_deps(*session, wp.directory, wp.arguments, wp.pch, wp.pcms)) {
         co_return serde_raw{};
     }
 
-    // After co_await, verify session still exists.
-    if(sessions.find(path_id) == sessions.end()) {
+    if(session->generation != gen) {
         co_return serde_raw{};
     }
 
@@ -942,15 +913,15 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
     co_return std::move(result.value().result_json);
 }
 
-Compiler::RawResult Compiler::forward_format(Session& session,
+Compiler::RawResult Compiler::forward_format(std::shared_ptr<Session> session,
                                              std::optional<protocol::Range> range) {
-    auto path_id = session.path_id;
+    auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
 
     worker::BuildParams wp;
     wp.kind = worker::BuildKind::Format;
     wp.file = path;
-    wp.text = session.text;
+    wp.text = session->text;
 
     if(range) {
         lsp::PositionMapper mapper(wp.text, lsp::PositionEncoding::UTF16);
@@ -969,14 +940,14 @@ Compiler::RawResult Compiler::forward_format(Session& session,
 }
 
 Compiler::RawResult Compiler::handle_completion(const protocol::Position& position,
-                                                Session& session) {
-    auto path_id = session.path_id;
+                                                std::shared_ptr<Session> session) {
+    auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
 
-    lsp::PositionMapper mapper(session.text, lsp::PositionEncoding::UTF16);
+    lsp::PositionMapper mapper(session->text, lsp::PositionEncoding::UTF16);
     auto offset = mapper.to_offset(position);
     if(offset) {
-        auto pctx = detect_completion_context(session.text, *offset);
+        auto pctx = detect_completion_context(session->text, *offset);
         if(pctx.kind == CompletionContext::IncludeQuoted ||
            pctx.kind == CompletionContext::IncludeAngled) {
             std::string directory;
@@ -1023,7 +994,7 @@ Compiler::RawResult Compiler::handle_completion(const protocol::Position& positi
         }
     }
 
-    co_return co_await forward_build(worker::BuildKind::Completion, position, session);
+    co_return co_await forward_build(worker::BuildKind::Completion, position, std::move(session));
 }
 
 }  // namespace clice

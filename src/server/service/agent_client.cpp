@@ -11,6 +11,7 @@
 #include "support/filesystem.h"
 #include "support/logging.h"
 
+#include "kota/ipc/lsp/position.h"
 #include "kota/ipc/lsp/uri.h"
 #include "kota/meta/enum.h"
 #include "llvm/ADT/DenseSet.h"
@@ -101,8 +102,8 @@ static std::vector<ResolvedSymbol> resolve_locator(const agentic::ReadSymbolPara
 
         for(auto& [hash, symbol]: workspace.project_index.symbols)
             try_symbol(hash, symbol);
-        indexer.for_each_overlay([&](std::uint32_t, const OpenFileIndex& ofi) -> bool {
-            for(auto& [hash, symbol]: ofi.symbols)
+        indexer.foreach_session([&](std::uint32_t, const Session& session) -> bool {
+            for(auto& [hash, symbol]: *session.symbols)
                 try_symbol(hash, symbol);
             return true;
         });
@@ -119,24 +120,29 @@ static std::vector<ResolvedSymbol> resolve_locator(const agentic::ReadSymbolPara
         auto pool_it = workspace.path_pool.cache.find(path_str);
         auto server_id = pool_it != workspace.path_pool.cache.end() ? pool_it->second : ~0u;
         if(server_id != ~0u) {
-            auto* ofi = indexer.get_overlay(server_id);
-            if(ofi && ofi->mapper) {
-                for(auto& [hash, rels]: ofi->file_index.relations) {
+            std::vector<ResolvedSymbol> session_result;
+            indexer.with_session(server_id, [&](const Session& session) {
+                auto map = session.line_map();
+                for(auto& [hash, rels]: session.file_index->relations) {
                     for(auto& rel: rels) {
                         if(rel.kind.value() != RelationKind::Definition)
                             continue;
-                        auto start = ofi->mapper->to_position(rel.range.begin);
+                        auto start = map.to_position(rel.range.begin);
                         if(start && start->line == target_line) {
                             std::string name;
                             SymbolKind kind;
-                            if(indexer.find_symbol_info(hash, name, kind))
-                                return {
-                                    {hash, std::move(name), kind, path_str, *loc.line}
-                                };
+                            if(!indexer.find_symbol_info(hash, name, kind))
+                                continue;
+                            if(kind == SymbolKind::Parameter || kind == SymbolKind::Label)
+                                continue;
+                            session_result.push_back(
+                                {hash, std::move(name), kind, path_str, *loc.line});
                         }
                     }
                 }
-            }
+            });
+            if(!session_result.empty())
+                return session_result;
         }
 
         auto it = workspace.project_index.path_pool.find(path_str);
@@ -148,19 +154,25 @@ static std::vector<ResolvedSymbol> resolve_locator(const agentic::ReadSymbolPara
         if(shard_it == workspace.merged_indices.end())
             return {};
 
+        auto& merged_index = shard_it->second;
+        auto ls = merged_index.line_starts();
+        if(ls.empty())
+            return {};
+        lsp::LineMap map(merged_index.content(), ls);
+
         for(auto& [hash, symbol]: workspace.project_index.symbols) {
             if(!symbol.reference_files.contains(proj_id))
                 continue;
             bool found = false;
-            shard_it->second.find_relations(hash,
-                                            RelationKind::Definition,
-                                            [&](const index::Relation&, protocol::Range range) {
-                                                if(range.start.line == target_line) {
-                                                    found = true;
-                                                    return false;
-                                                }
-                                                return true;
-                                            });
+            merged_index.lookup(hash, RelationKind::Definition, [&](const index::Relation& r) {
+                // FIXME: unchecked optional dereference
+                auto range = map.to_range(r.range.begin, r.range.end);
+                if(range && range->start.line == target_line) {
+                    found = true;
+                    return false;
+                }
+                return true;
+            });
             if(found)
                 return {
                     {hash, symbol.name, symbol.kind, path_str, *loc.line}
@@ -429,8 +441,8 @@ AgentClient::AgentClient(MasterServer& server, kota::ipc::JsonPeer& peer) :
 
         for(auto& [hash, symbol]: srv.workspace.project_index.symbols)
             try_symbol(hash, symbol);
-        srv.indexer.for_each_overlay([&](std::uint32_t, const OpenFileIndex& ofi) -> bool {
-            for(auto& [hash, symbol]: ofi.symbols)
+        srv.indexer.foreach_session([&](std::uint32_t, const Session& session) -> bool {
+            for(auto& [hash, symbol]: *session.symbols)
                 try_symbol(hash, symbol);
             return true;
         });
@@ -485,10 +497,10 @@ AgentClient::AgentClient(MasterServer& server, kota::ipc::JsonPeer& peer) :
             if(pool_it == srv.workspace.path_pool.cache.end())
                 co_return result;
             auto server_id = pool_it->second;
-            auto* ofi = srv.indexer.get_overlay(server_id);
-            if(ofi) {
-                auto& fi = *ofi;
-                for(auto& [hash, rels]: fi.file_index.relations) {
+            bool found_session = false;
+            srv.indexer.with_session(server_id, [&](const Session& session) {
+                found_session = true;
+                for(auto& [hash, rels]: session.file_index->relations) {
                     for(auto& rel: rels) {
                         if(rel.kind.value() != RelationKind::Definition)
                             continue;
@@ -498,24 +510,22 @@ AgentClient::AgentClient(MasterServer& server, kota::ipc::JsonPeer& peer) :
                             continue;
                         if(!is_document_level(kind))
                             continue;
-                        if(fi.mapper) {
-                            auto start = fi.mapper->to_position(rel.range.begin);
-                            auto end = fi.mapper->to_position(rel.range.end);
-                            if(start && end) {
-                                result.symbols.push_back(DocumentSymbolEntry{
-                                    .name = std::move(name),
-                                    .kind = std::string(symbol_kind_name(kind)),
-                                    .start_line = static_cast<int>(start->line) + 1,
-                                    .end_line = static_cast<int>(end->line) + 1,
-                                    .symbol_id = hash,
-                                });
-                                break;
-                            }
+                        auto range = session.line_map().to_range(rel.range.begin, rel.range.end);
+                        if(range) {
+                            result.symbols.push_back(DocumentSymbolEntry{
+                                .name = std::move(name),
+                                .kind = std::string(symbol_kind_name(kind)),
+                                .start_line = static_cast<int>(range->start.line) + 1,
+                                .end_line = static_cast<int>(range->end.line) + 1,
+                                .symbol_id = hash,
+                            });
+                            break;
                         }
                     }
                 }
+            });
+            if(found_session)
                 co_return result;
-            }
 
             auto it = srv.workspace.project_index.path_pool.find(params.path);
             if(it == srv.workspace.project_index.path_pool.cache.end())
@@ -526,6 +536,12 @@ AgentClient::AgentClient(MasterServer& server, kota::ipc::JsonPeer& peer) :
             if(shard_it == srv.workspace.merged_indices.end())
                 co_return result;
 
+            auto& merged_index = shard_it->second;
+            auto ls = merged_index.line_starts();
+            if(ls.empty())
+                co_return result;
+            lsp::LineMap map(merged_index.content(), ls);
+
             for(auto& [hash, symbol]: srv.workspace.project_index.symbols) {
                 if(symbol.name.empty())
                     continue;
@@ -534,19 +550,20 @@ AgentClient::AgentClient(MasterServer& server, kota::ipc::JsonPeer& peer) :
                 if(!symbol.reference_files.contains(proj_id))
                     continue;
 
-                shard_it->second.find_relations(
-                    hash,
-                    RelationKind::Definition,
-                    [&](const index::Relation&, protocol::Range range) {
+                merged_index.lookup(hash, RelationKind::Definition, [&](const index::Relation& r) {
+                    // FIXME: unchecked optional dereference
+                    auto range = map.to_range(r.range.begin, r.range.end);
+                    if(range) {
                         result.symbols.push_back(DocumentSymbolEntry{
                             .name = symbol.name,
                             .kind = std::string(symbol_kind_name(symbol.kind)),
-                            .start_line = static_cast<int>(range.start.line) + 1,
-                            .end_line = static_cast<int>(range.end.line) + 1,
+                            .start_line = static_cast<int>(range->start.line) + 1,
+                            .end_line = static_cast<int>(range->end.line) + 1,
                             .symbol_id = hash,
                         });
-                        return true;
-                    });
+                    }
+                    return true;
+                });
             }
 
             co_return result;

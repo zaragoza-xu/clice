@@ -928,14 +928,14 @@ auto inlay_hints(CompilationUnitRef unit,
                  const InlayHintsOptions& options,
                  PositionEncoding encoding) -> std::vector<protocol::InlayHint> {
     auto collected = inlay_hints(unit, target, options);
+    LineMap map(unit.interested_content(), unit.line_starts(), encoding);
 
-    PositionMapper converter(unit.interested_content(), encoding);
     std::vector<protocol::InlayHint> hints;
     hints.reserve(collected.size());
 
     for(const auto& hint: collected) {
         protocol::InlayHint out{
-            .position = *converter.to_position(hint.offset),
+            .position = *map.to_position(hint.offset),
             .label = hint.label,
         };
 

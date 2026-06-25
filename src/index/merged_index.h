@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "index/tu_index.h"
@@ -66,6 +67,9 @@ public:
 
     /// Get the stored source content for position mapping.
     llvm::StringRef content(this const Self& self);
+
+    /// Get line starts for position mapping.
+    std::span<const std::uint32_t> line_starts(this const Self& self);
 
     /// Merge the index with given compilation context.
     void merge(this Self& self,

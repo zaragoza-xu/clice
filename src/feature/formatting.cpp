@@ -53,13 +53,15 @@ auto document_format(llvm::StringRef file,
         return edits;
     }
 
-    PositionMapper converter(content, encoding);
+    LineMap map(content, encoding);
 
     for(const auto& replacement: *replacements) {
-        protocol::TextEdit edit;
-        edit.range.start = *converter.to_position(replacement.getOffset());
-        edit.range.end = *converter.to_position(replacement.getOffset() + replacement.getLength());
-        edit.new_text = replacement.getReplacementText().str();
+        auto begin = replacement.getOffset();
+        auto end = begin + replacement.getLength();
+        protocol::TextEdit edit{
+            .range = *map.to_range(begin, end),
+            .new_text = replacement.getReplacementText().str(),
+        };
         edits.push_back(std::move(edit));
     }
 

@@ -42,7 +42,7 @@ struct SymbolInfo {
 ///
 /// Indexer holds no index data of its own.  All persistent data lives in
 /// Workspace (disk-derived ProjectIndex + MergedIndex shards) and per-file
-/// data lives in Session (OpenFileIndex from unsaved buffers).
+/// data lives in Session (file index from unsaved buffers).
 ///
 /// Responsibilities:
 ///   - Cross-file navigation queries (definition, references, hierarchy)
@@ -55,18 +55,18 @@ struct SymbolInfo {
 ///   - Document lifecycle — handled by MasterServer
 class Indexer {
 public:
-    /// Visitor for iterating open-file overlays.  Returns false to stop early.
-    using OverlayVisitor =
-        std::function<bool(std::uint32_t server_path_id, const OpenFileIndex& index)>;
+    /// Visitor for iterating open Sessions.  Returns false to stop early.
+    using SessionVisitor =
+        std::function<bool(std::uint32_t server_path_id, const Session& session)>;
 
     Indexer(kota::event_loop& loop,
             Workspace& workspace,
             WorkerPool& pool,
             Compiler& compiler,
             std::function<bool(std::uint32_t)> is_open = {},
-            std::function<void(OverlayVisitor)> each_overlay = {}) :
+            std::function<void(SessionVisitor)> each_session = {}) :
         loop(loop), bg_tasks(loop), workspace(workspace), pool(pool), compiler(compiler),
-        is_open(std::move(is_open)), each_overlay(std::move(each_overlay)) {}
+        is_open(std::move(is_open)), each_session(std::move(each_session)) {}
 
     /// Set the LSP peer for progress reporting.  Must be called before
     /// schedule() if progress notifications are desired.
@@ -193,23 +193,23 @@ public:
     /// Cancel background indexing and wait for all tasks to settle.
     kota::task<> stop();
 
-    /// Iterate all open-file overlays via the callback set at construction.
-    void for_each_overlay(OverlayVisitor visitor) const {
-        if(each_overlay)
-            each_overlay(std::move(visitor));
+    /// Iterate all open Sessions via the callback set at construction.
+    void foreach_session(SessionVisitor visitor) const {
+        if(each_session)
+            each_session(std::move(visitor));
     }
 
-    /// Get the overlay for a specific server-level path_id (nullptr if not open).
-    const OpenFileIndex* get_overlay(std::uint32_t server_path_id) const {
-        const OpenFileIndex* result = nullptr;
-        for_each_overlay([&](std::uint32_t id, const OpenFileIndex& ofi) -> bool {
+    /// Invoke a callback with the Session for a specific server-level path_id.
+    /// The callback is not invoked if no Session exists for that path_id.
+    template <typename Fn>
+    void with_session(std::uint32_t server_path_id, Fn&& fn) const {
+        foreach_session([&](std::uint32_t id, const Session& session) -> bool {
             if(id == server_path_id) {
-                result = &ofi;
+                fn(session);
                 return false;
             }
             return true;
         });
-        return result;
     }
 
     /// Whether background indexing is currently idle (no active or queued work).
@@ -282,8 +282,8 @@ private:
     /// Checks if a server-level path_id has an open Session.
     std::function<bool(std::uint32_t)> is_open;
 
-    /// Iterates all open-file overlays (OpenFileIndex from live compilations).
-    std::function<void(OverlayVisitor)> each_overlay;
+    /// Iterates all open Sessions with valid file indices.
+    std::function<void(SessionVisitor)> each_session;
 
     /// LSP peer for progress reporting (optional, not owned).
     kota::ipc::JsonPeer* peer = nullptr;

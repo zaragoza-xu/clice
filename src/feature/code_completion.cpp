@@ -255,11 +255,8 @@ public:
         auto prefix = CompletionPrefix::from(content, offset);
         FuzzyMatcher matcher(prefix.spelling);
 
-        PositionMapper converter(content, encoding);
-        auto replace_range = protocol::Range{
-            .start = *converter.to_position(prefix.range.begin),
-            .end = *converter.to_position(prefix.range.end),
-        };
+        LineMap map(content, encoding);
+        auto replace_range = *map.to_range(prefix.range.begin, prefix.range.end);
 
         std::vector<protocol::CompletionItem> collected;
         collected.reserve(candidate_count);

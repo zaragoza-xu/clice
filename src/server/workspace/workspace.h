@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "command/command.h"
 #include "command/toolchain.h"
@@ -17,17 +18,12 @@
 #include "support/path_pool.h"
 #include "syntax/dependency_graph.h"
 
-#include "kota/ipc/lsp/position.h"
-#include "kota/ipc/lsp/protocol.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace clice {
-
-namespace protocol = kota::ipc::protocol;
-namespace lsp = kota::ipc::lsp;
 
 /// Two-layer staleness snapshot for compilation artifacts (PCH, AST, etc.).
 ///
@@ -48,89 +44,6 @@ struct HeaderFileContext {
     std::uint32_t host_path_id;   ///< Source file acting as host.
     std::string preamble_path;    ///< Path to generated preamble file on disk.
     std::uint64_t preamble_hash;  ///< Hash of preamble content for staleness.
-};
-
-/// In-memory index for an open file.  Kept separate from MergedIndex because
-/// open files change frequently, are based on unsaved buffer content, and only
-/// need to track the main file (headers are covered by PCH/PCM indexing).
-struct OpenFileIndex {
-    index::FileIndex file_index;
-    index::SymbolTable symbols;
-    std::string content;  ///< Buffer text at index time (for position mapping).
-
-    /// Cached PositionMapper built from `content`.  Avoids re-scanning line
-    /// offsets on every query.  Initialized by Indexer::set_open_file().
-    std::optional<lsp::PositionMapper> mapper;
-
-    /// Find the tightest occurrence containing `offset`.
-    /// Returns (symbol_hash, LSP range) with positions already converted.
-    std::optional<std::pair<index::SymbolHash, protocol::Range>>
-        find_occurrence(std::uint32_t offset) const;
-
-    /// Iterate relations matching `kind`, calling back with pre-converted ranges.
-    /// Callback: (const index::Relation&, protocol::Range) -> bool (true = continue).
-    template <typename Fn>
-    void find_relations(index::SymbolHash hash, RelationKind kind, Fn&& fn) const {
-        if(!mapper)
-            return;
-        auto it = file_index.relations.find(hash);
-        if(it == file_index.relations.end())
-            return;
-        for(auto& r: it->second) {
-            if(r.kind & kind) {
-                auto start = mapper->to_position(r.range.begin);
-                auto end = mapper->to_position(r.range.end);
-                if(start && end) {
-                    if(!fn(r, protocol::Range{*start, *end}))
-                        return;
-                }
-            }
-        }
-    }
-};
-
-/// Wraps index::MergedIndex with a lazily-cached PositionMapper.
-struct MergedIndexShard {
-    index::MergedIndex index;
-    mutable std::optional<lsp::PositionMapper> cached_mapper;
-
-    /// Get or lazily build a PositionMapper from the index's stored content.
-    const lsp::PositionMapper* mapper() const {
-        if(!cached_mapper) {
-            auto c = index.content();
-            if(!c.empty()) {
-                cached_mapper.emplace(c, lsp::PositionEncoding::UTF16);
-            }
-        }
-        return cached_mapper ? &*cached_mapper : nullptr;
-    }
-
-    /// Invalidate the cached mapper (call after merge changes content).
-    void invalidate_mapper() {
-        cached_mapper.reset();
-    }
-
-    /// Find occurrence at byte offset.
-    /// Returns (symbol_hash, LSP range) with positions already converted.
-    std::optional<std::pair<index::SymbolHash, protocol::Range>>
-        find_occurrence(std::uint32_t offset) const;
-
-    /// Iterate relations matching `kind`, calling back with pre-converted ranges.
-    /// Callback: (const index::Relation&, protocol::Range) -> bool (true = continue).
-    template <typename Fn>
-    void find_relations(index::SymbolHash hash, RelationKind kind, Fn&& fn) const {
-        auto* m = mapper();
-        if(!m)
-            return;
-        index.lookup(hash, kind, [&](const index::Relation& r) {
-            auto start = m->to_position(r.range.begin);
-            auto end = m->to_position(r.range.end);
-            if(start && end) {
-                return fn(r, protocol::Range{*start, *end});
-            }
-            return true;
-        });
-    }
 };
 
 /// Cached PCH state.  Content-addressed by preamble hash — shared across all
@@ -208,7 +121,7 @@ struct Workspace {
     /// Per-file index shards from background indexing, keyed by project-level
     /// path_id.  Contains symbol occurrences, relations, and stored content
     /// for position mapping.
-    llvm::DenseMap<std::uint32_t, MergedIndexShard> merged_indices;
+    llvm::DenseMap<std::uint32_t, index::MergedIndex> merged_indices;
 
     /// Called when a file is saved to disk.  Cascades invalidation through
     /// compile_graph and clears affected PCM caches.

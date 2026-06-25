@@ -9,6 +9,7 @@ namespace clice::testing {
 
 namespace {
 
+namespace lsp = kota::ipc::lsp;
 namespace protocol = kota::ipc::protocol;
 
 TEST_SUITE(folding_range, Tester) {
@@ -37,7 +38,9 @@ void run(llvm::StringRef code) {
 }
 
 auto to_local_range(const protocol::FoldingRange& range) -> LocalSourceRange {
-    feature::PositionMapper converter(unit->interested_content(), feature::PositionEncoding::UTF8);
+    auto content = unit->interested_content();
+    auto line_starts = unit->line_starts();
+    lsp::LineMap map(content, line_starts, feature::PositionEncoding::UTF8);
 
     auto start = protocol::Position{
         .line = range.start_line,
@@ -49,7 +52,7 @@ auto to_local_range(const protocol::FoldingRange& range) -> LocalSourceRange {
         .character = range.end_character.value_or(0),
     };
 
-    return LocalSourceRange(*converter.to_offset(start), *converter.to_offset(end));
+    return LocalSourceRange(*map.to_offset(start), *map.to_offset(end));
 }
 
 void EXPECT_FOLDING(std::uint32_t index,
@@ -434,11 +437,13 @@ TEST_CASE(snapshot) {
         if(!compile_file(path))
             return "COMPILE_ERROR";
         auto ranges = feature::folding_ranges(*unit);
-        feature::PositionMapper mapper(unit->interested_content(), feature::PositionEncoding::UTF8);
+        auto content = unit->interested_content();
+        auto line_starts = unit->line_starts();
+        lsp::LineMap map(content, line_starts, feature::PositionEncoding::UTF8);
         std::string result;
         for(auto& r: ranges) {
-            auto start = mapper.to_position(r.range.begin);
-            auto end = mapper.to_position(r.range.end);
+            auto start = map.to_position(r.range.begin);
+            auto end = map.to_position(r.range.end);
             if(!start || !end)
                 continue;
             result += std::format("- {{ range: \"{}:{}-{}:{}\"",

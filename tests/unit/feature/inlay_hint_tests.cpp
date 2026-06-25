@@ -11,6 +11,7 @@ namespace clice::testing {
 
 namespace {
 
+namespace lsp = kota::ipc::lsp;
 namespace protocol = kota::ipc::protocol;
 
 TEST_SUITE(inlay_hint, Tester) {
@@ -26,9 +27,11 @@ void run(llvm::StringRef code, std::source_location location = std::source_locat
     hints = feature::inlay_hints(*unit, range, {}, feature::PositionEncoding::UTF8);
 
     hints_map.clear();
-    feature::PositionMapper converter(unit->interested_content(), feature::PositionEncoding::UTF8);
+    auto content = unit->interested_content();
+    auto line_starts = unit->line_starts();
+    lsp::LineMap map(content, line_starts, feature::PositionEncoding::UTF8);
     for(auto& hint: hints) {
-        hints_map[*converter.to_offset(hint.position)] = hint;
+        hints_map[*map.to_offset(hint.position)] = hint;
     }
 
     if(!unit->diagnostics().empty()) {
@@ -1539,10 +1542,11 @@ TEST_CASE(snapshot) {
         auto content = unit->interested_content();
         LocalSourceRange range(0, content.size());
         auto hints = feature::inlay_hints(*unit, range);
-        feature::PositionMapper mapper(content, feature::PositionEncoding::UTF8);
+        auto line_starts = unit->line_starts();
+        lsp::LineMap map(content, line_starts, feature::PositionEncoding::UTF8);
         std::string result;
         for(auto& hint: hints) {
-            auto pos = mapper.to_position(hint.offset);
+            auto pos = map.to_position(hint.offset);
             if(!pos)
                 continue;
             auto kind = kota::meta::enum_name(hint.kind, "Unknown");

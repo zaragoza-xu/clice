@@ -10,8 +10,6 @@ namespace clice::feature {
 
 namespace {
 
-namespace lsp = kota::ipc::lsp;
-
 auto to_uri(llvm::StringRef file) -> std::string {
     const auto file_view = std::string_view(file.data(), file.size());
 
@@ -49,13 +47,13 @@ void add_related(protocol::Diagnostic& diagnostic,
     }
 
     auto content = unit.file_content(raw.fid);
-    PositionMapper converter(content, encoding);
+    LineMap map(content, encoding);
 
     protocol::DiagnosticRelatedInformation related{
         .location =
             protocol::Location{
                                .uri = to_uri(unit.file_path(raw.fid)),
-                               .range = to_range(converter, raw.range),
+                               .range = *map.to_range(raw.range.begin, raw.range.end),
                                },
         .message = raw.message,
     };
@@ -70,6 +68,7 @@ void add_related(protocol::Diagnostic& diagnostic,
 
 auto diagnostics(CompilationUnitRef unit, PositionEncoding encoding)
     -> std::vector<protocol::Diagnostic> {
+    LineMap map(unit.interested_content(), unit.line_starts(), encoding);
     std::vector<protocol::Diagnostic> result;
     std::optional<protocol::Diagnostic> current;
 
@@ -79,8 +78,6 @@ auto diagnostics(CompilationUnitRef unit, PositionEncoding encoding)
             current.reset();
         }
     };
-
-    PositionMapper main_converter(unit.interested_content(), encoding);
 
     for(const auto& raw: unit.diagnostics()) {
         auto level = raw.id.level;
@@ -136,7 +133,7 @@ auto diagnostics(CompilationUnitRef unit, PositionEncoding encoding)
         }
 
         if(raw.fid == unit.interested_file()) {
-            diagnostic.range = to_range(main_converter, raw.range);
+            diagnostic.range = *map.to_range(raw.range.begin, raw.range.end);
             current = std::move(diagnostic);
             continue;
         }
@@ -152,11 +149,9 @@ auto diagnostics(CompilationUnitRef unit, PositionEncoding encoding)
         }
 
         auto offset = unit.file_offset(include_location);
-        auto end_offset = offset + unit.token_spelling(include_location).size();
-        diagnostic.range = protocol::Range{
-            .start = *main_converter.to_position(offset),
-            .end = *main_converter.to_position(end_offset),
-        };
+        auto end_offset =
+            static_cast<std::uint32_t>(offset + unit.token_spelling(include_location).size());
+        diagnostic.range = *map.to_range(offset, end_offset);
 
         current = std::move(diagnostic);
     }

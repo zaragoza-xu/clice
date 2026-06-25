@@ -54,11 +54,11 @@ void Indexer::merge(const void* tu_index_data, std::size_t size) {
                 file_content_storage = (*buf)->getBuffer().str();
                 file_content = file_content_storage;
             }
-            shard.index.merge(global_path_id,
-                              tu_index.built_at,
-                              std::move(include_locs),
-                              file_idx,
-                              file_content);
+            shard.merge(global_path_id,
+                        tu_index.built_at,
+                        std::move(include_locs),
+                        file_idx,
+                        file_content);
         } else {
             std::optional<std::uint32_t> include_id;
             for(std::uint32_t i = 0; i < tu_index.graph.locations.size(); ++i) {
@@ -79,9 +79,8 @@ void Indexer::merge(const void* tu_index_data, std::size_t size) {
                 header_content_storage = (*header_buf)->getBuffer().str();
                 header_content = header_content_storage;
             }
-            shard.index.merge(global_path_id, *include_id, file_idx, header_content);
+            shard.merge(global_path_id, *include_id, file_idx, header_content);
         }
-        shard.invalidate_mapper();
     };
 
     for(auto& [tu_path_id, file_idx]: tu_index.path_file_indices) {
@@ -126,13 +125,13 @@ void Indexer::save(llvm::StringRef index_dir) {
 
     std::size_t saved = 0;
     for(auto& [path_id, shard]: workspace.merged_indices) {
-        if(!shard.index.need_rewrite())
+        if(!shard.need_rewrite())
             continue;
         auto shard_path = path::join(shards_dir, std::to_string(path_id) + ".idx");
         std::error_code write_ec;
         llvm::raw_fd_ostream os(shard_path, write_ec);
         if(!write_ec) {
-            shard.index.serialize(os);
+            shard.serialize(os);
             ++saved;
         }
     }
@@ -162,7 +161,7 @@ void Indexer::load(llvm::StringRef index_dir) {
         std::uint32_t path_id = 0;
         if(stem.getAsInteger(10, path_id))
             continue;
-        workspace.merged_indices[path_id] = MergedIndexShard{index::MergedIndex::load(it->path())};
+        workspace.merged_indices[path_id] = index::MergedIndex::load(it->path());
     }
 
     if(!workspace.merged_indices.empty()) {
@@ -183,14 +182,14 @@ bool Indexer::need_update(llvm::StringRef file_path) {
     for(auto& p: workspace.project_index.path_pool.paths) {
         path_mapping.push_back(p);
     }
-    return merged_it->second.index.need_update(path_mapping);
+    return merged_it->second.need_update(path_mapping);
 }
 
 bool Indexer::find_symbol_info(index::SymbolHash hash, std::string& name, SymbolKind& kind) const {
     bool found = false;
-    for_each_overlay([&](std::uint32_t, const OpenFileIndex& ofi) -> bool {
-        auto it = ofi.symbols.find(hash);
-        if(it != ofi.symbols.end()) {
+    foreach_session([&](std::uint32_t, const Session& session) -> bool {
+        auto it = session.symbols->find(hash);
+        if(it != session.symbols->end()) {
             name = it->second.name;
             kind = it->second.kind;
             found = true;
@@ -212,25 +211,29 @@ bool Indexer::find_symbol_info(index::SymbolHash hash, std::string& name, Symbol
 Indexer::CursorHit Indexer::resolve_cursor(llvm::StringRef path,
                                            const protocol::Position& position,
                                            Session* session) {
-    // Try the session's open file index first.
-    if(session && session->file_index) {
-        auto& index = *session->file_index;
-        if(!index.mapper)
-            return {};
-        auto offset = index.mapper->to_offset(position);
+    // FIXME: when ast_dirty, we fall back to MergedIndex which may be staler.
+    // Consider awaiting the pending recompilation to serve fresher results.
+    if(session && session->file_index && !session->ast_dirty) {
+        auto map = session->line_map();
+        auto offset = map.to_offset(position);
         if(!offset)
             return {};
-        if(auto found = index.find_occurrence(*offset))
-            return {found->first, found->second};
-        return {};
+        CursorHit hit;
+        session->file_index->lookup(*offset, [&](const index::Occurrence& occ) {
+            auto range = map.to_range(occ.range.begin, occ.range.end);
+            if(range) {
+                hit = {occ.target, *range};
+                return false;
+            }
+            return true;
+        });
+        return hit;
     }
 
-    // Fallback to MergedIndex, using session text (or reading from disk) for position -> offset.
-    const std::string* doc_text = session ? &session->text : nullptr;
-    if(!doc_text)
+    // Fallback to MergedIndex, using session text for position -> offset.
+    if(!session)
         return {};
-    lsp::PositionMapper doc_mapper(*doc_text, lsp::PositionEncoding::UTF16);
-    auto offset = doc_mapper.to_offset(position);
+    auto offset = session->line_map().to_offset(position);
     if(!offset)
         return {};
 
@@ -241,9 +244,19 @@ Indexer::CursorHit Indexer::resolve_cursor(llvm::StringRef path,
     if(shard_it == workspace.merged_indices.end())
         return {};
 
-    if(auto found = shard_it->second.find_occurrence(*offset))
-        return {found->first, found->second};
-    return {};
+    auto& merged_index = shard_it->second;
+    auto ls = merged_index.line_starts();
+    if(ls.empty())
+        return {};
+    lsp::LineMap map(merged_index.content(), ls);
+    CursorHit hit;
+    merged_index.lookup(*offset, [&](const index::Occurrence& o) {
+        auto range = map.to_range(o.range.begin, o.range.end);
+        if(range)
+            hit = {o.target, *range};
+        return false;
+    });
+    return hit;
 }
 
 std::vector<protocol::Location> Indexer::query_relations(llvm::StringRef path,
@@ -267,21 +280,27 @@ std::vector<protocol::Location> Indexer::query_relations(llvm::StringRef path,
             auto uri = lsp::URI::from_file_path(workspace.project_index.path_pool.path(file_id));
             if(!uri)
                 continue;
-            shard_it->second.find_relations(hit.hash,
-                                            kind,
-                                            [&](const auto&, protocol::Range range) {
-                                                locations.push_back({uri->str(), range});
-                                                return true;
-                                            });
+            auto& merged_index = shard_it->second;
+            auto ls = merged_index.line_starts();
+            if(ls.empty())
+                continue;
+            lsp::LineMap map(merged_index.content(), ls);
+            merged_index.lookup(hit.hash, kind, [&](const index::Relation& r) {
+                if(auto range = map.to_range(r.range.begin, r.range.end))
+                    locations.push_back({uri->str(), *range});
+                return true;
+            });
         }
     }
 
-    for_each_overlay([&](std::uint32_t id, const OpenFileIndex& ofi) -> bool {
+    foreach_session([&](std::uint32_t id, const Session& session) -> bool {
         auto uri = lsp::URI::from_file_path(std::string(workspace.path_pool.resolve(id)));
         if(!uri)
             return true;
-        ofi.find_relations(hit.hash, kind, [&](const auto&, protocol::Range range) {
-            locations.push_back({uri->str(), range});
+        auto map = session.line_map();
+        session.file_index->lookup(hit.hash, kind, [&](const index::Relation& r) {
+            if(auto range = map.to_range(r.range.begin, r.range.end))
+                locations.push_back({uri->str(), *range});
             return true;
         });
         return true;
@@ -307,19 +326,23 @@ std::optional<SymbolInfo> Indexer::lookup_symbol(const std::string& uri,
 }
 
 std::optional<protocol::Location> Indexer::find_definition_location(index::SymbolHash hash) {
-    std::optional<protocol::Location> overlay_result;
-    for_each_overlay([&](std::uint32_t id, const OpenFileIndex& ofi) -> bool {
+    std::optional<protocol::Location> session_result;
+    foreach_session([&](std::uint32_t id, const Session& session) -> bool {
         auto uri = lsp::URI::from_file_path(std::string(workspace.path_pool.resolve(id)));
         if(!uri)
             return true;
-        ofi.find_relations(hash, RelationKind::Definition, [&](const auto&, protocol::Range range) {
-            overlay_result = protocol::Location{uri->str(), range};
-            return false;
+        auto map = session.line_map();
+        session.file_index->lookup(hash, RelationKind::Definition, [&](const index::Relation& r) {
+            if(auto range = map.to_range(r.range.begin, r.range.end)) {
+                session_result = protocol::Location{uri->str(), *range};
+                return false;
+            }
+            return true;
         });
-        return !overlay_result.has_value();
+        return !session_result.has_value();
     });
-    if(overlay_result)
-        return overlay_result;
+    if(session_result)
+        return session_result;
 
     // Fall back to ProjectIndex reference files.
     auto sym_it = workspace.project_index.symbols.find(hash);
@@ -335,13 +358,19 @@ std::optional<protocol::Location> Indexer::find_definition_location(index::Symbo
         auto uri = lsp::URI::from_file_path(workspace.project_index.path_pool.path(file_id));
         if(!uri)
             continue;
+        auto& merged_index = shard_it->second;
+        auto ls = merged_index.line_starts();
+        if(ls.empty())
+            continue;
+        lsp::LineMap map(merged_index.content(), ls);
         std::optional<protocol::Location> result;
-        shard_it->second.find_relations(hash,
-                                        RelationKind::Definition,
-                                        [&](const auto&, protocol::Range range) {
-                                            result = protocol::Location{uri->str(), range};
-                                            return false;
-                                        });
+        merged_index.lookup(hash, RelationKind::Definition, [&](const index::Relation& r) {
+            if(auto range = map.to_range(r.range.begin, r.range.end)) {
+                result = protocol::Location{uri->str(), *range};
+                return false;
+            }
+            return true;
+        });
         if(result)
             return result;
     }
@@ -380,15 +409,23 @@ void Indexer::collect_grouped_relations(
             auto shard_it = workspace.merged_indices.find(file_id);
             if(shard_it == workspace.merged_indices.end())
                 continue;
-            shard_it->second.find_relations(hash, kind, [&](const auto& r, protocol::Range range) {
-                target_ranges[r.target_symbol].push_back(range);
+            auto& merged_index = shard_it->second;
+            auto ls = merged_index.line_starts();
+            if(ls.empty())
+                continue;
+            lsp::LineMap map(merged_index.content(), ls);
+            merged_index.lookup(hash, kind, [&](const index::Relation& r) {
+                if(auto range = map.to_range(r.range.begin, r.range.end))
+                    target_ranges[r.target_symbol].push_back(*range);
                 return true;
             });
         }
     }
-    for_each_overlay([&](std::uint32_t, const OpenFileIndex& ofi) -> bool {
-        ofi.find_relations(hash, kind, [&](const auto& r, protocol::Range range) {
-            target_ranges[r.target_symbol].push_back(range);
+    foreach_session([&](std::uint32_t, const Session& session) -> bool {
+        auto map = session.line_map();
+        session.file_index->lookup(hash, kind, [&](const index::Relation& r) {
+            if(auto range = map.to_range(r.range.begin, r.range.end))
+                target_ranges[r.target_symbol].push_back(*range);
             return true;
         });
         return true;
@@ -407,8 +444,7 @@ void Indexer::collect_unique_targets(index::SymbolHash hash,
             auto shard_it = workspace.merged_indices.find(file_id);
             if(shard_it == workspace.merged_indices.end())
                 continue;
-            /// No position conversion needed -- just collect target symbol hashes.
-            shard_it->second.index.lookup(hash, kind, [&](const index::Relation& r) {
+            shard_it->second.lookup(hash, kind, [&](const index::Relation& r) {
                 if(seen.insert(r.target_symbol).second) {
                     targets.push_back(r.target_symbol);
                 }
@@ -416,9 +452,9 @@ void Indexer::collect_unique_targets(index::SymbolHash hash,
             });
         }
     }
-    for_each_overlay([&](std::uint32_t, const OpenFileIndex& ofi) -> bool {
-        auto rel_it = ofi.file_index.relations.find(hash);
-        if(rel_it == ofi.file_index.relations.end())
+    foreach_session([&](std::uint32_t, const Session& session) -> bool {
+        auto rel_it = session.file_index->relations.find(hash);
+        if(rel_it == session.file_index->relations.end())
             return true;
         for(auto& r: rel_it->second) {
             if(r.kind & kind) {
@@ -460,39 +496,29 @@ static std::string extract_line(llvm::StringRef content, std::uint32_t offset) {
 }
 
 std::optional<Indexer::DefinitionText> Indexer::get_definition_text(index::SymbolHash hash) {
-    std::optional<DefinitionText> overlay_result;
-    for_each_overlay([&](std::uint32_t id, const OpenFileIndex& ofi) -> bool {
-        if(!ofi.mapper)
-            return true;
-        auto it = ofi.file_index.relations.find(hash);
-        if(it == ofi.file_index.relations.end())
-            return true;
-        for(auto& rel: it->second) {
-            if(rel.kind.value() != RelationKind::Definition)
-                continue;
+    std::optional<DefinitionText> session_result;
+    foreach_session([&](std::uint32_t id, const Session& session) -> bool {
+        auto map = session.line_map();
+        session.file_index->lookup(hash, RelationKind::Definition, [&](const index::Relation& rel) {
             auto def_range = std::bit_cast<LocalSourceRange>(rel.target_symbol);
-            if(def_range.begin >= def_range.end)
-                continue;
-            llvm::StringRef content = ofi.content;
-            if(def_range.end > content.size())
-                continue;
-            auto start = ofi.mapper->to_position(def_range.begin);
-            auto end = ofi.mapper->to_position(def_range.end);
-            if(!start || !end)
-                continue;
-            overlay_result = DefinitionText{
+            if(def_range.begin >= def_range.end || def_range.end > session.text.size())
+                return true;
+            auto range = map.to_range(def_range.begin, def_range.end);
+            if(!range)
+                return true;
+            session_result = DefinitionText{
                 .file = std::string(workspace.path_pool.resolve(id)),
-                .start_line = static_cast<int>(start->line) + 1,
-                .end_line = static_cast<int>(end->line) + 1,
-                .text =
-                    std::string(content.substr(def_range.begin, def_range.end - def_range.begin)),
+                .start_line = static_cast<int>(range->start.line) + 1,
+                .end_line = static_cast<int>(range->end.line) + 1,
+                .text = std::string(
+                    session.text.substr(def_range.begin, def_range.end - def_range.begin)),
             };
             return false;
-        }
-        return true;
+        });
+        return !session_result.has_value();
     });
-    if(overlay_result)
-        return overlay_result;
+    if(session_result)
+        return session_result;
 
     auto sym_it = workspace.project_index.symbols.find(hash);
     if(sym_it == workspace.project_index.symbols.end())
@@ -504,32 +530,30 @@ std::optional<Indexer::DefinitionText> Indexer::get_definition_text(index::Symbo
         auto shard_it = workspace.merged_indices.find(file_id);
         if(shard_it == workspace.merged_indices.end())
             continue;
-        auto* m = shard_it->second.mapper();
-        if(!m)
+        auto& merged_index = shard_it->second;
+        auto ls = merged_index.line_starts();
+        if(ls.empty())
             continue;
-        auto content = shard_it->second.index.content();
+        auto content = merged_index.content();
+        lsp::LineMap map(content, ls);
 
         std::optional<DefinitionText> result;
-        shard_it->second.index.lookup(
-            hash,
-            RelationKind::Definition,
-            [&](const index::Relation& r) {
-                auto def_range = std::bit_cast<LocalSourceRange>(r.target_symbol);
-                if(def_range.begin >= def_range.end || def_range.end > content.size())
-                    return true;
-                auto start = m->to_position(def_range.begin);
-                auto end = m->to_position(def_range.end);
-                if(!start || !end)
-                    return true;
-                result = DefinitionText{
-                    .file = workspace.project_index.path_pool.path(file_id).str(),
-                    .start_line = static_cast<int>(start->line) + 1,
-                    .end_line = static_cast<int>(end->line) + 1,
-                    .text = std::string(
-                        content.substr(def_range.begin, def_range.end - def_range.begin)),
-                };
-                return false;
-            });
+        merged_index.lookup(hash, RelationKind::Definition, [&](const index::Relation& r) {
+            auto def_range = std::bit_cast<LocalSourceRange>(r.target_symbol);
+            if(def_range.begin >= def_range.end || def_range.end > content.size())
+                return true;
+            auto range = map.to_range(def_range.begin, def_range.end);
+            if(!range)
+                return true;
+            result = DefinitionText{
+                .file = workspace.project_index.path_pool.path(file_id).str(),
+                .start_line = static_cast<int>(range->start.line) + 1,
+                .end_line = static_cast<int>(range->end.line) + 1,
+                .text =
+                    std::string(content.substr(def_range.begin, def_range.end - def_range.begin)),
+            };
+            return false;
+        });
         if(result)
             return result;
     }
@@ -549,19 +573,21 @@ std::vector<Indexer::ReferenceWithContext> Indexer::collect_references(index::Sy
             auto shard_it = workspace.merged_indices.find(file_id);
             if(shard_it == workspace.merged_indices.end())
                 continue;
-            auto* m = shard_it->second.mapper();
-            if(!m)
+            auto& merged_index = shard_it->second;
+            auto ls = merged_index.line_starts();
+            if(ls.empty())
                 continue;
-            auto content = shard_it->second.index.content();
+            auto content = merged_index.content();
+            lsp::LineMap map(content, ls);
             auto file_path = workspace.project_index.path_pool.path(file_id);
 
-            shard_it->second.index.lookup(hash, kind, [&](const index::Relation& r) {
-                auto start = m->to_position(r.range.begin);
-                if(!start)
+            merged_index.lookup(hash, kind, [&](const index::Relation& r) {
+                auto pos = map.to_position(r.range.begin);
+                if(!pos)
                     return true;
                 results.push_back(ReferenceWithContext{
                     .file = file_path.str(),
-                    .line = static_cast<int>(start->line) + 1,
+                    .line = static_cast<int>(pos->line) + 1,
                     .context = extract_line(content, r.range.begin),
                 });
                 return true;
@@ -569,27 +595,20 @@ std::vector<Indexer::ReferenceWithContext> Indexer::collect_references(index::Sy
         }
     }
 
-    for_each_overlay([&](std::uint32_t id, const OpenFileIndex& ofi) -> bool {
-        if(!ofi.mapper)
-            return true;
-        auto it = ofi.file_index.relations.find(hash);
-        if(it == ofi.file_index.relations.end())
-            return true;
+    foreach_session([&](std::uint32_t id, const Session& session) -> bool {
+        auto map = session.line_map();
         auto file_path = workspace.path_pool.resolve(id);
-        llvm::StringRef content = ofi.content;
-
-        for(auto& rel: it->second) {
-            if(rel.kind != kind)
-                continue;
-            auto start = ofi.mapper->to_position(rel.range.begin);
-            if(!start)
-                continue;
+        session.file_index->lookup(hash, kind, [&](const index::Relation& rel) {
+            auto pos = map.to_position(rel.range.begin);
+            if(!pos)
+                return true;
             results.push_back(ReferenceWithContext{
                 .file = file_path.str(),
-                .line = static_cast<int>(start->line) + 1,
-                .context = extract_line(content, rel.range.begin),
+                .line = static_cast<int>(pos->line) + 1,
+                .context = extract_line(session.text, rel.range.begin),
             });
-        }
+            return true;
+        });
         return true;
     });
 
@@ -697,10 +716,10 @@ std::vector<protocol::SymbolInformation> Indexer::search_symbols(llvm::StringRef
         seen.insert(hash);
     }
 
-    for_each_overlay([&](std::uint32_t, const OpenFileIndex& ofi) -> bool {
+    foreach_session([&](std::uint32_t, const Session& session) -> bool {
         if(results.size() >= max_results)
             return false;
-        for(auto& [hash, symbol]: ofi.symbols) {
+        for(auto& [hash, symbol]: *session.symbols) {
             if(results.size() >= max_results)
                 return false;
             if(seen.contains(hash))

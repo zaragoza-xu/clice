@@ -15,18 +15,14 @@
 
 namespace clice::feature {
 
+namespace lsp = kota::ipc::lsp;
 namespace protocol = kota::ipc::protocol;
 
+using kota::ipc::lsp::LineMap;
 using kota::ipc::lsp::PositionEncoding;
-using kota::ipc::lsp::PositionMapper;
-using kota::ipc::lsp::parse_position_encoding;
 
-inline auto to_range(const PositionMapper& converter, LocalSourceRange range) -> protocol::Range {
-    return protocol::Range{
-        .start = *converter.to_position(range.begin),
-        .end = *converter.to_position(range.end),
-    };
-}
+// FIXME: feature code uses *map.to_range() without checking the optional.
+// Need a strategy for handling out-of-range offsets gracefully.
 
 struct CodeCompletionOptions {
     bool enable_keyword_snippet = false;

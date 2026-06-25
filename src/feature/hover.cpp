@@ -1310,8 +1310,8 @@ auto to_protocol_hover(CompilationUnitRef unit,
     };
 
     if(info.symbol_range) {
-        PositionMapper converter(unit.interested_content(), encoding);
-        result.range = to_range(converter, *info.symbol_range);
+        LineMap map(unit.interested_content(), unit.line_starts(), encoding);
+        result.range = *map.to_range(info.symbol_range->begin, info.symbol_range->end);
     }
 
     return result;

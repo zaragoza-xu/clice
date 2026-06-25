@@ -2,6 +2,8 @@
 #include "index/usr.h"
 #include "semantic/ast_utility.h"
 
+#include "kota/ipc/lsp/text.h"
+
 namespace clice {
 
 CompilationKind CompilationUnitRef::kind() {
@@ -123,6 +125,15 @@ auto CompilationUnitRef::interested_file() -> clang::FileID {
 
 auto CompilationUnitRef::interested_content() -> llvm::StringRef {
     return file_content(interested_file());
+}
+
+auto CompilationUnitRef::line_starts() -> std::span<const std::uint32_t> {
+    if(self->line_starts_cache.empty()) {
+        auto content = interested_content();
+        self->line_starts_cache =
+            kota::ipc::lsp::build_line_starts({content.data(), content.size()});
+    }
+    return self->line_starts_cache;
 }
 
 bool CompilationUnitRef::is_builtin_file(clang::FileID fid) {

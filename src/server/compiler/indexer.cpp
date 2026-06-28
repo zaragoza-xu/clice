@@ -94,74 +94,132 @@ void Indexer::merge(const void* tu_index_data, std::size_t size) {
              workspace.merged_indices.size());
 }
 
-void Indexer::save(llvm::StringRef index_dir) {
-    if(index_dir.empty())
-        return;
-
-    auto ec = llvm::sys::fs::create_directories(index_dir);
+/// Begin a two-phase store write and serialize the blob to its tmp path.
+/// Returns the entry to commit, or nullopt if serialization failed.
+static std::optional<CacheStore::PendingEntry>
+    serialize_blob(CacheStore& store,
+                   llvm::StringRef key,
+                   llvm::function_ref<void(llvm::raw_ostream&)> serialize) {
+    auto pending = store.begin_store("index", key);
+    std::error_code ec;
+    llvm::raw_fd_ostream os(pending.tmp_path, ec);
     if(ec) {
-        LOG_WARN("Failed to create index directory {}: {}", std::string(index_dir), ec.message());
-        return;
+        LOG_WARN("Failed to write index blob {}: {}", key, ec.message());
+        store.abort(pending);
+        return std::nullopt;
     }
-
-    auto project_path = path::join(index_dir, "project.idx");
-    {
-        std::error_code write_ec;
-        llvm::raw_fd_ostream os(project_path, write_ec);
-        if(!write_ec) {
-            workspace.project_index.serialize(os);
-            LOG_INFO("Saved ProjectIndex to {}", project_path);
-        } else {
-            LOG_WARN("Failed to save ProjectIndex: {}", write_ec.message());
-        }
+    serialize(os);
+    os.flush();
+    // A truncated blob (disk full) must never be committed: the index
+    // namespace is Persistent, so it would be served forever.
+    if(os.has_error()) {
+        LOG_WARN("Failed to write index blob {}: {}", key, os.error().message());
+        os.clear_error();
+        store.abort(pending);
+        return std::nullopt;
     }
+    return pending;
+}
 
-    auto shards_dir = path::join(index_dir, "shards");
-    ec = llvm::sys::fs::create_directories(shards_dir);
-    if(ec) {
-        LOG_WARN("Failed to create shards directory: {}", ec.message());
-        return;
+kota::task<> Indexer::save() {
+    if(!workspace.store)
+        co_return;
+    auto& store = *workspace.store;
+
+    // Phase 1, synchronous: serialize the ProjectIndex and every dirty
+    // shard to tmp files.  No suspension point in between, so the batch is
+    // a consistent snapshot even if a merge runs before the commits below
+    // are done.  Shards are only published together with the ProjectIndex
+    // they were built against: pairing new shards with an old project blob
+    // (or vice versa) would serve a mixed snapshot after restart.
+    auto project_pending = serialize_blob(store, "project", [&](llvm::raw_ostream& os) {
+        workspace.project_index.serialize(os);
+    });
+    if(!project_pending) {
+        LOG_WARN("Skipping index save: ProjectIndex serialization failed");
+        co_return;
     }
+    LOG_INFO("Saved ProjectIndex ({} symbols)", workspace.project_index.symbols.size());
 
-    std::size_t saved = 0;
+    llvm::SmallVector<CacheStore::PendingEntry> shards;
+    std::size_t total = workspace.merged_indices.size();
     for(auto& [path_id, shard]: workspace.merged_indices) {
         if(!shard.need_rewrite())
             continue;
-        auto shard_path = path::join(shards_dir, std::to_string(path_id) + ".idx");
-        std::error_code write_ec;
-        llvm::raw_fd_ostream os(shard_path, write_ec);
-        if(!write_ec) {
-            shard.serialize(os);
-            ++saved;
+        if(auto pending = serialize_blob(store,
+                                         std::to_string(path_id),
+                                         [&](llvm::raw_ostream& os) { shard.serialize(os); })) {
+            shards.push_back(std::move(*pending));
         }
     }
-    LOG_INFO("Saved {} MergedIndex shards (of {} total)", saved, workspace.merged_indices.size());
+    LOG_INFO("Saved {} MergedIndex shards (of {} total)", shards.size(), total);
+
+    // Phase 2: commit each blob (fsync + atomic rename) on the kota thread
+    // pool, keeping the heavy IO off the event loop.  The project blob goes
+    // first; if it cannot be published, drop the shards of this snapshot.
+    auto committed =
+        co_await kota::queue([&] { return store.commit(std::move(*project_pending)); });
+    if(!committed.has_value() || !committed.value().has_value()) {
+        LOG_WARN("Failed to commit ProjectIndex blob, dropping {} shard blobs", shards.size());
+        for(auto& pending: shards) {
+            store.abort(pending);
+        }
+        co_return;
+    }
+
+    // FIXME: shard commits are strictly sequential (one co_await per shard).
+    // For large projects this adds ~N×2ms of round-trip overhead.  Consider
+    // batching commits or dispatching them in parallel on the thread pool.
+    for(auto& pending: shards) {
+        auto key = pending.key;
+        auto result = co_await kota::queue([&] { return store.commit(std::move(pending)); });
+        if(!result.has_value() || !result.value().has_value()) {
+            LOG_WARN("Failed to commit index blob {}", key);
+        }
+    }
 }
 
-void Indexer::load(llvm::StringRef index_dir) {
-    if(index_dir.empty())
+void Indexer::load() {
+    if(!workspace.store)
         return;
 
-    auto project_path = path::join(index_dir, "project.idx");
-    auto buf = llvm::MemoryBuffer::getFile(project_path);
-    if(buf) {
+    bool has_project = false;
+    auto project_path = workspace.store->lookup("index", "project");
+    if(project_path) {
+        auto buf = llvm::MemoryBuffer::getFile(*project_path);
+        if(!buf) {
+            // Transient read failure — don't load shards (useless without
+            // the project index), but don't destroy them either.
+            LOG_WARN("Failed to read ProjectIndex blob: {}", buf.getError().message());
+            return;
+        }
         workspace.project_index = index::ProjectIndex::from((*buf)->getBufferStart());
+        has_project = true;
         LOG_INFO("Loaded ProjectIndex: {} symbols", workspace.project_index.symbols.size());
     }
 
-    auto shards_dir = path::join(index_dir, "shards");
-    std::error_code ec;
-    for(auto it = llvm::sys::fs::directory_iterator(shards_dir, ec);
-        !ec && it != llvm::sys::fs::directory_iterator();
-        it.increment(ec)) {
-        auto filename = llvm::sys::path::filename(it->path());
-        if(!filename.ends_with(".idx"))
-            continue;
-        auto stem = filename.drop_back(4);
+    // Load shards; sweep blobs that no longer correspond to anything —
+    // unparseable keys, or all shards when the project index itself is
+    // gone (Persistent namespace cleanup is the caller's mark-and-sweep).
+    llvm::SmallVector<std::string> orphans;
+    workspace.store->for_each_key("index", [&](llvm::StringRef key) {
+        if(key == "project")
+            return;
+
         std::uint32_t path_id = 0;
-        if(stem.getAsInteger(10, path_id))
-            continue;
-        workspace.merged_indices[path_id] = index::MergedIndex::load(it->path());
+        if(key.getAsInteger(10, path_id) || !has_project) {
+            orphans.push_back(key.str());
+            return;
+        }
+
+        auto shard_path = workspace.store->lookup("index", key);
+        if(shard_path) {
+            workspace.merged_indices[path_id] = index::MergedIndex::load(*shard_path);
+        }
+    });
+
+    for(auto& key: orphans) {
+        workspace.store->invalidate("index", key);
     }
 
     if(!workspace.merged_indices.empty()) {
@@ -947,11 +1005,8 @@ kota::task<> Indexer::run_background_indexing() {
     }
 
     indexing_active = false;
-    auto skipped = total - dispatched;
-    LOG_INFO("Background indexing complete: {} dispatched, {} skipped (open/up-to-date)",
-             dispatched,
-             skipped);
-    save(workspace.config.project.index_dir);
+    LOG_INFO("Background indexing complete: {} files dispatched", dispatched);
+    co_await save();
 }
 
 }  // namespace clice

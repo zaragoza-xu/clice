@@ -90,6 +90,47 @@ inline std::expected<void, std::error_code> rename(llvm::StringRef from, llvm::S
     return std::expected<void, std::error_code>();
 }
 
+/// Recursively remove a directory tree using plain filesystem primitives.
+/// Use this instead of llvm::sys::fs::remove_directories: on Windows that
+/// is implemented over shell COM (CoInitializeEx + IFileOperation), which
+/// initializes apartment COM on the calling thread and silently no-ops
+/// when that fails — unsuitable for server threads.  This mirrors the
+/// recursion LLVM's own Unix implementation uses.  Symlinks — including a
+/// symlinked root — are removed without following them, so the recursion
+/// can never escape into the link's target.  Returns the first error; a
+/// missing path is not an error.
+inline std::error_code remove_all(llvm::StringRef target) {
+    llvm::sys::fs::file_status target_status;
+    if(auto status_ec = llvm::sys::fs::status(target, target_status, /*follow=*/false)) {
+        return status_ec == std::errc::no_such_file_or_directory ? std::error_code() : status_ec;
+    }
+    if(target_status.type() != llvm::sys::fs::file_type::directory_file) {
+        return llvm::sys::fs::remove(target, /*IgnoreNonExisting=*/true);
+    }
+
+    std::error_code ec;
+    for(llvm::sys::fs::directory_iterator it(target, ec, /*follow_symlinks=*/false), end;
+        !ec && it != end;
+        it.increment(ec)) {
+        auto status = it->status();
+        if(!status) {
+            return status.getError();
+        }
+        if(llvm::sys::fs::is_directory(*status)) {
+            if(auto sub_ec = remove_all(it->path())) {
+                return sub_ec;
+            }
+        } else if(auto remove_ec = llvm::sys::fs::remove(it->path(), /*IgnoreNonExisting=*/true)) {
+            return remove_ec;
+        }
+    }
+    if(ec) {
+        // A missing root is fine: there is simply nothing to remove.
+        return ec == std::errc::no_such_file_or_directory ? std::error_code() : ec;
+    }
+    return llvm::sys::fs::remove(target, /*IgnoreNonExisting=*/true);
+}
+
 }  // namespace fs
 
 namespace vfs = llvm::vfs;

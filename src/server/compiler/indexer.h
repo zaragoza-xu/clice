@@ -111,11 +111,15 @@ public:
     /// Merge a TUIndex result into Workspace's ProjectIndex and MergedIndex shards.
     void merge(const void* tu_index_data, std::size_t size);
 
-    /// Save Workspace's ProjectIndex and MergedIndex shards to disk.
-    void save(llvm::StringRef index_dir);
+    /// Save Workspace's ProjectIndex and MergedIndex shards to the cache
+    /// store ("index" namespace, Persistent policy).  Serialization runs
+    /// on the event loop; each blob's commit (fsync + rename) is offloaded
+    /// to the kota thread pool.
+    kota::task<> save();
 
-    /// Load Workspace's ProjectIndex and MergedIndex shards from disk.
-    void load(llvm::StringRef index_dir);
+    /// Load Workspace's ProjectIndex and MergedIndex shards from the cache
+    /// store, sweeping orphaned shard blobs.
+    void load();
 
     /// Check whether a file needs re-indexing (stale or missing shard).
     bool need_update(llvm::StringRef file_path);

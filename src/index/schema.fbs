@@ -85,6 +85,8 @@ kind:
     ubyte;
 refs:
     [ubyte];
+scope:
+    ubyte;
 }
 
 table SymbolEntry {
@@ -121,6 +123,9 @@ content:
 
 line_starts:
     [uint];
+
+symbols:
+    [SymbolEntry];
 }
 
 table TUFileRelationsEntry {

@@ -14,6 +14,8 @@ llvm::SmallVector<std::uint32_t> ProjectIndex::merge(this ProjectIndex& self, TU
     }
 
     for(auto& [symbol_id, symbol]: index.symbols) {
+        if(symbol.scope != SymbolScope::External)
+            continue;
         auto& target_symbol = self.symbols[symbol_id];
         if(target_symbol.name.empty()) {
             target_symbol.name = symbol.name;
@@ -57,7 +59,8 @@ void ProjectIndex::serialize(this ProjectIndex& self, llvm::raw_ostream& os) {
                                          binary::CreateSymbol(builder,
                                                               CreateString(builder, symbol.name),
                                                               symbol.kind.value(),
-                                                              CreateVector(builder, buffer)));
+                                                              CreateVector(builder, buffer),
+                                                              static_cast<uint8_t>(symbol.scope)));
     });
 
     auto project_index =
@@ -98,6 +101,7 @@ ProjectIndex ProjectIndex::from(const void* data) {
             symbol.name = name->str();
         }
         symbol.kind = SymbolKind(static_cast<std::uint8_t>(fb_symbol->kind()));
+        symbol.scope = static_cast<index::SymbolScope>(fb_symbol->scope());
         symbol.reference_files = read_bitmap(fb_symbol->refs());
     }
 

@@ -830,7 +830,9 @@ void Indexer::schedule() {
     }
 }
 
-kota::task<> Indexer::index_one(std::uint32_t server_path_id) {
+kota::task<> Indexer::index_one(std::uint32_t server_path_id,
+                                std::size_t index,
+                                std::size_t total) {
     auto file_path = std::string(workspace.path_pool.resolve(server_path_id));
 
     if(is_open && is_open(server_path_id))
@@ -853,46 +855,26 @@ kota::task<> Indexer::index_one(std::uint32_t server_path_id) {
 
     workspace.fill_pcm_deps(params.pcms);
 
-    LOG_INFO("Background indexing: {}", file_path);
+    LOG_INFO("[{}/{}] Indexing {}", index, total, file_path);
 
     auto result = co_await pool.send_stateless(params);
     if(result.has_value() && result.value().success && !result.value().tu_index_data.empty()) {
-        LOG_INFO("Background indexing got TUIndex for {}: {} bytes",
+        LOG_INFO("[{}/{}] Indexed {}: {} bytes",
+                 index,
+                 total,
                  file_path,
                  result.value().tu_index_data.size());
         merge(result.value().tu_index_data.data(), result.value().tu_index_data.size());
     } else if(result.has_value() && !result.value().success) {
-        LOG_WARN("Background index failed for {}: {}", file_path, result.value().error);
+        LOG_WARN("[{}/{}] Index failed for {}: {}", index, total, file_path, result.value().error);
     } else if(result.has_value() && result.value().tu_index_data.empty()) {
-        LOG_WARN("Background index returned empty TUIndex for {}", file_path);
+        LOG_WARN("[{}/{}] Index returned empty TUIndex for {}", index, total, file_path);
     } else {
-        LOG_WARN("Background index IPC error for {}: {}", file_path, result.error().message);
-    }
-}
-
-kota::task<> Indexer::monitor_resources() {
-    while(true) {
-        co_await kota::sleep(std::chrono::milliseconds(3000));
-
-        auto mem = kota::sys::memory();
-        if(mem.total == 0)
-            continue;
-
-        auto effective_total =
-            (mem.constrained > 0 && mem.constrained < mem.total) ? mem.constrained : mem.total;
-        auto ratio = static_cast<double>(mem.available) / static_cast<double>(effective_total);
-
-        if(ratio < 0.15 && max_concurrent > 1) {
-            --max_concurrent;
-            LOG_INFO("Index concurrency -> {} (memory pressure: {:.0f}% available)",
-                     max_concurrent,
-                     ratio * 100);
-        } else if(ratio > 0.30 && max_concurrent < baseline_concurrent) {
-            ++max_concurrent;
-            LOG_DEBUG("Index concurrency -> {} (memory OK: {:.0f}% available)",
-                      max_concurrent,
-                      ratio * 100);
-        }
+        LOG_WARN("[{}/{}] Index IPC error for {}: {}",
+                 index,
+                 total,
+                 file_path,
+                 result.error().message);
     }
 }
 
@@ -908,9 +890,8 @@ kota::task<> Indexer::run_background_indexing() {
     }
 
     indexing_active = true;
-
-    kota::cancellation_source monitor_cancel;
-    bg_tasks.spawn(kota::with_token(monitor_resources(), monitor_cancel.token()));
+    LOG_DEBUG("Background indexing: starting, {} files queued",
+              index_queue.size() - index_queue_pos);
 
     std::stable_partition(
         index_queue.begin() + index_queue_pos,
@@ -924,7 +905,9 @@ kota::task<> Indexer::run_background_indexing() {
     std::optional<lsp::ProgressReporter<kota::ipc::JsonPeer>> progress;
     if(peer) {
         progress.emplace(*peer, protocol::ProgressToken(std::string("clice/backgroundIndex")));
-        auto create_result = co_await progress->create();
+        // Timeout prevents indexing from hanging when the client never responds.
+        auto create_result =
+            co_await progress->create({.timeout = std::chrono::milliseconds(3000)});
         if(!create_result.has_error()) {
             progress->begin("Indexing", std::format("0/{} files", total), 0);
         } else {
@@ -933,8 +916,6 @@ kota::task<> Indexer::run_background_indexing() {
     }
 
     kota::task_group<> workers(loop);
-    std::size_t in_flight = 0;
-    kota::event slot_available;
 
     while(index_queue_pos < index_queue.size()) {
         if(pause_depth > 0)
@@ -947,35 +928,29 @@ kota::task<> Indexer::run_background_indexing() {
             continue;
         }
 
-        while(in_flight >= max_concurrent) {
-            slot_available.reset();
-            co_await slot_available.wait();
-        }
-
-        ++in_flight;
         ++dispatched;
-        workers.spawn([&, server_path_id]() -> kota::task<> {
-            co_await index_one(server_path_id);
-            --in_flight;
+        workers.spawn([&, server_path_id, n = dispatched]() -> kota::task<> {
+            co_await index_one(server_path_id, n, total);
             ++completed;
             if(progress) {
                 auto pct = total > 0 ? static_cast<std::uint32_t>(completed * 100 / total) : 100;
                 progress->report(std::format("{}/{} files", completed, total), pct);
             }
-            slot_available.set();
         }());
     }
 
+    LOG_DEBUG("Background indexing: all {} tasks spawned, waiting for completion", dispatched);
     co_await workers.join();
 
     if(progress) {
         progress->end(std::format("Indexed {} files", dispatched));
     }
 
-    monitor_cancel.cancel();
-
     indexing_active = false;
-    LOG_INFO("Background indexing complete: {} files dispatched", dispatched);
+    auto skipped = total - dispatched;
+    LOG_INFO("Background indexing complete: {} dispatched, {} skipped (open/up-to-date)",
+             dispatched,
+             skipped);
     save(workspace.config.project.index_dir);
 }
 

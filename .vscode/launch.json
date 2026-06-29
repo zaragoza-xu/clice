@@ -6,15 +6,15 @@
       "request": "launch",
       "name": "Debug clice",
       "program": "${workspaceFolder}/build/Debug/bin/clice",
-      "args": ["server", "--mode", "socket", "--port", "50051"],
+      "args": ["serve", "--mode", "socket", "--port", "50051"],
       "cwd": "${workspaceFolder}"
     },
     {
       "type": "lldb",
       "request": "launch",
-      "name": "Debug clice (socket, RelWithDebInfo)",
+      "name": "Debug clice (tcp, RelWithDebInfo)",
       "program": "${workspaceFolder}/build/RelWithDebInfo/bin/clice",
-      "args": ["server", "--mode", "socket", "--port", "50051"],
+      "args": ["serve", "--mode", "socket", "--port", "50051"],
       "cwd": "${workspaceFolder}"
     },
     {

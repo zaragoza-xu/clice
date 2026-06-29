@@ -45,7 +45,7 @@ export async function activate(context: ExtensionContext) {
             }
         }
 
-        let args = ["server"];
+        let args = ["serve"];
         serverOptions = {
             run: { command: executable, args: args },
             debug: { command: executable, args: args },

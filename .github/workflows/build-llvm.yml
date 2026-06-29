@@ -92,7 +92,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Free Disk Space
         if: runner.os == 'Linux'
@@ -184,7 +186,7 @@ jobs:
 
       - name: Upload cross-compiled clice for functional test
         if: ${{ matrix.target_triple && matrix.lto == 'OFF' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cross-clice-${{ matrix.target_triple }}-${{ matrix.llvm_mode }}
           path: |
@@ -216,7 +218,7 @@ jobs:
 
       - name: Upload pruned-libs manifest
         if: (!matrix.target_triple) && matrix.llvm_mode == 'RelWithDebInfo' && matrix.lto == 'OFF'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llvm-pruned-libs-${{ matrix.os }}
           path: ${{ env.LLVM_PRUNED_MANIFEST }}
@@ -308,7 +310,7 @@ jobs:
           echo "LLVM_INSTALL_ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
 
       - name: Upload LLVM install artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.LLVM_INSTALL_ARCHIVE }}
           path: ${{ env.LLVM_INSTALL_ARCHIVE }}
@@ -332,14 +334,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pixi
         with:
           environments: test-run
 
       - name: Download cross-compiled clice
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cross-clice-${{ matrix.target_triple }}-${{ matrix.llvm_mode }}
           path: build/${{ matrix.llvm_mode }}/
@@ -358,7 +362,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Download all build artifacts
         env:
@@ -372,7 +378,7 @@ jobs:
         run: python3 scripts/upload-llvm.py "${{ inputs.llvm_version }}" "${TARGET_REPO}" "${{ github.run_id }}"
 
       - name: Save manifest for update-clice job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llvm-manifest-final
           path: artifacts/llvm-manifest.json
@@ -387,10 +393,12 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Download manifest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: llvm-manifest-final
           path: .

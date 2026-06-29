@@ -8,7 +8,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pixi
         with:
@@ -25,7 +27,7 @@ jobs:
         continue-on-error: true
 
       - name: Auto correct
-        uses: huacnlee/autocorrect-action@v2
+        uses: huacnlee/autocorrect-action@v2.5.4
         with:
           args: --lint ./docs
         continue-on-error: true

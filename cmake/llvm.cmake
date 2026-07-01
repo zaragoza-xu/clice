@@ -1,131 +1,120 @@
 include_guard()
+include(FetchContent)
 
-function(setup_llvm LLVM_VERSION)
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
-
-    set(LLVM_SETUP_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/.llvm/setup-llvm.json")
-    set(LLVM_SETUP_SCRIPT "${PROJECT_SOURCE_DIR}/scripts/setup-llvm.py")
-    set(LLVM_SETUP_ARGS
-        "--version" "${LLVM_VERSION}"
-        "--build-type" "${CMAKE_BUILD_TYPE}"
-        "--binary-dir" "${CMAKE_CURRENT_BINARY_DIR}"
-        "--manifest" "${PROJECT_SOURCE_DIR}/config/llvm-manifest.json"
-        "--output" "${LLVM_SETUP_OUTPUT}"
-    )
-
-    if(CLICE_ENABLE_LTO)
-        list(APPEND LLVM_SETUP_ARGS "--enable-lto")
-    endif()
-
-    if(DEFINED LLVM_INSTALL_PATH AND NOT LLVM_INSTALL_PATH STREQUAL "")
-        list(APPEND LLVM_SETUP_ARGS "--install-path" "${LLVM_INSTALL_PATH}")
-    endif()
-
-    if(DEFINED CLICE_OFFLINE_BUILD AND CLICE_OFFLINE_BUILD)
-        list(APPEND LLVM_SETUP_ARGS "--offline")
-    endif()
-
+function(_download_llvm LLVM_VERSION)
     if(DEFINED CLICE_TARGET_TRIPLE)
         if(CLICE_TARGET_TRIPLE MATCHES "linux")
-            list(APPEND LLVM_SETUP_ARGS "--target-platform" "Linux")
+            set(_PLATFORM "linux")
+            set(_TOOLCHAIN "gnu")
         elseif(CLICE_TARGET_TRIPLE MATCHES "darwin")
-            list(APPEND LLVM_SETUP_ARGS "--target-platform" "macosx")
+            set(_PLATFORM "macos")
+            set(_TOOLCHAIN "clang")
         elseif(CLICE_TARGET_TRIPLE MATCHES "windows")
-            list(APPEND LLVM_SETUP_ARGS "--target-platform" "Windows")
+            set(_PLATFORM "windows")
+            set(_TOOLCHAIN "msvc")
+        else()
+            message(FATAL_ERROR "Unsupported platform: ${CLICE_TARGET_TRIPLE}")
         endif()
 
         if(CLICE_TARGET_TRIPLE MATCHES "^aarch64")
-            list(APPEND LLVM_SETUP_ARGS "--target-arch" "arm64")
+            set(_ARCH "arm64")
         elseif(CLICE_TARGET_TRIPLE MATCHES "^x86_64")
-            list(APPEND LLVM_SETUP_ARGS "--target-arch" "x64")
+            set(_ARCH "x64")
+        else()
+            message(FATAL_ERROR "Unsupported arch: ${CLICE_TARGET_TRIPLE}")
+        endif()
+    else()
+        if(WIN32)
+            set(_PLATFORM "windows")
+            set(_TOOLCHAIN "msvc")
+        elseif(APPLE)
+            set(_PLATFORM "macos")
+            set(_TOOLCHAIN "clang")
+        else()
+            set(_PLATFORM "linux")
+            set(_TOOLCHAIN "gnu")
+        endif()
+
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+            set(_ARCH "arm64")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x64")
+            set(_ARCH "x64")
+        else()
+            message(FATAL_ERROR "Unsupported processor: ${CMAKE_SYSTEM_PROCESSOR}")
         endif()
     endif()
 
-    execute_process(
-        COMMAND "${Python3_EXECUTABLE}" "${LLVM_SETUP_SCRIPT}" ${LLVM_SETUP_ARGS}
-        RESULT_VARIABLE LLVM_SETUP_RESULT
-        OUTPUT_VARIABLE LLVM_SETUP_STDOUT
-        ERROR_VARIABLE LLVM_SETUP_STDERR
-        ECHO_OUTPUT_VARIABLE
-        ECHO_ERROR_VARIABLE
-        COMMAND_ERROR_IS_FATAL ANY
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(_MODE "debug")
+    else()
+        set(_MODE "releasedbg")
+    endif()
+
+    set(_SUFFIX "")
+    if(CLICE_ENABLE_LTO)
+        string(APPEND _SUFFIX "-lto")
+    endif()
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT WIN32)
+        string(APPEND _SUFFIX "-asan")
+    endif()
+
+    set(_FILENAME "${_ARCH}-${_PLATFORM}-${_TOOLCHAIN}-${_MODE}${_SUFFIX}.tar.xz")
+    string(REPLACE "+" "%2B" _URL_VERSION "${LLVM_VERSION}")
+
+    FetchContent_Declare(llvm_prebuilt
+        URL "https://github.com/clice-io/clice-llvm/releases/download/${_URL_VERSION}/${_FILENAME}"
+        SOURCE_SUBDIR _none
+    )
+    FetchContent_MakeAvailable(llvm_prebuilt)
+
+    set(LLVM_INSTALL_PATH "${llvm_prebuilt_SOURCE_DIR}" PARENT_SCOPE)
+endfunction()
+
+function(setup_llvm LLVM_VERSION)
+    if(DEFINED LLVM_INSTALL_PATH AND NOT LLVM_INSTALL_PATH STREQUAL "")
+        get_filename_component(LLVM_INSTALL_PATH "${LLVM_INSTALL_PATH}" ABSOLUTE)
+    elseif(DEFINED CLICE_OFFLINE_BUILD AND CLICE_OFFLINE_BUILD)
+        message(FATAL_ERROR "LLVM_INSTALL_PATH must be set in offline mode")
+    else()
+        _download_llvm("${LLVM_VERSION}")
+    endif()
+
+    set(LLVM_INSTALL_PATH "${LLVM_INSTALL_PATH}" CACHE PATH "LLVM install" FORCE)
+
+    find_package(LLVM REQUIRED CONFIG
+        PATHS "${LLVM_INSTALL_PATH}/lib/cmake/llvm" NO_DEFAULT_PATH)
+    find_package(Clang REQUIRED CONFIG
+        PATHS "${LLVM_INSTALL_PATH}/lib/cmake/clang" NO_DEFAULT_PATH)
+
+    llvm_map_components_to_libnames(LLVM_RESOLVED
+        support frontendopenmp option targetparser)
+
+    add_library(llvm-libs INTERFACE IMPORTED)
+    target_link_libraries(llvm-libs INTERFACE
+        ${LLVM_RESOLVED}
+        clangAST clangASTMatchers clangBasic clangDriver
+        clangFormat clangFrontend clangLex clangSema clangSerialization
+        clangTidy clangTidyUtils
+        clangTidyAbseilModule clangTidyAlteraModule clangTidyAndroidModule
+        clangTidyBoostModule clangTidyBugproneModule clangTidyCERTModule
+        clangTidyConcurrencyModule clangTidyCppCoreGuidelinesModule
+        clangTidyDarwinModule clangTidyFuchsiaModule
+        clangTidyGoogleModule clangTidyHICPPModule clangTidyLinuxKernelModule
+        clangTidyLLVMModule clangTidyLLVMLibcModule clangTidyMiscModule
+        clangTidyModernizeModule clangTidyMPIModule clangTidyObjCModule
+        clangTidyOpenMPModule clangTidyPerformanceModule
+        clangTidyPortabilityModule clangTidyReadabilityModule
+        clangTidyZirconModule
+        clangTooling clangToolingCore
+        clangToolingInclusions clangToolingInclusionsStdlib clangToolingSyntax
     )
 
-    file(READ "${LLVM_SETUP_OUTPUT}" LLVM_SETUP_JSON)
-    string(JSON LLVM_INSTALL_PATH GET "${LLVM_SETUP_JSON}" install_path)
-    string(JSON LLVM_CMAKE_DIR GET "${LLVM_SETUP_JSON}" cmake_dir)
-    set(LLVM_INSTALL_PATH "${LLVM_INSTALL_PATH}" CACHE PATH "Path to LLVM installation" FORCE)
-    set(LLVM_CMAKE_DIR "${LLVM_CMAKE_DIR}" CACHE PATH "Path to LLVM CMake files" FORCE)
+    target_include_directories(llvm-libs SYSTEM INTERFACE
+        "${LLVM_INSTALL_PATH}/include")
 
-    get_filename_component(LLVM_INSTALL_PATH "${LLVM_INSTALL_PATH}" ABSOLUTE)
-
-    if(NOT EXISTS "${LLVM_INSTALL_PATH}")
-        message(FATAL_ERROR "Error: The specified LLVM_INSTALL_PATH does not exist: ${LLVM_INSTALL_PATH}")
-    endif()
-
-    # set llvm include and lib path
-    add_library(llvm-libs INTERFACE IMPORTED)
-
-    # add to include directories
-    target_include_directories(llvm-libs INTERFACE "${LLVM_INSTALL_PATH}/include")
-
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT WIN32)
-        target_link_directories(llvm-libs INTERFACE "${LLVM_INSTALL_PATH}/lib")
-        target_link_libraries(llvm-libs INTERFACE
-            LLVMSupport
-            LLVMFrontendOpenMP
-            LLVMOption
-            LLVMTargetParser
-            clangAST
-            clangASTMatchers
-            clangBasic
-            clangDriver
-            clangFormat
-            clangFrontend
-            clangLex
-            clangSema
-            clangSerialization
-            clangTidy
-            clangTidyUtils
-            clangTidyAndroidModule
-            clangTidyAbseilModule
-            clangTidyAlteraModule
-            clangTidyBoostModule
-            clangTidyBugproneModule
-            clangTidyCERTModule
-            clangTidyConcurrencyModule
-            clangTidyCppCoreGuidelinesModule
-            clangTidyDarwinModule
-            clangTidyFuchsiaModule
-            clangTidyGoogleModule
-            clangTidyHICPPModule
-            clangTidyLinuxKernelModule
-            clangTidyLLVMModule
-            clangTidyLLVMLibcModule
-            clangTidyMiscModule
-            clangTidyModernizeModule
-            clangTidyObjCModule
-            clangTidyOpenMPModule
-            clangTidyPerformanceModule
-            clangTidyPortabilityModule
-            clangTidyReadabilityModule
-            clangTidyZirconModule
-            clangTooling
-            clangToolingCore
-            clangToolingInclusions
-            clangToolingInclusionsStdlib
-            clangToolingSyntax
-        )
-    else()
-        file(GLOB LLVM_LIBRARIES CONFIGURE_DEPENDS "${LLVM_INSTALL_PATH}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}LLVM[a-zA-Z]*${CMAKE_STATIC_LIBRARY_SUFFIX}")
-        file(GLOB CLANG_LIBRARIES CONFIGURE_DEPENDS "${LLVM_INSTALL_PATH}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}clang[a-zA-Z]*${CMAKE_STATIC_LIBRARY_SUFFIX}")
-        # TODO: find a better way to find out whether zlib and zstd are needed
-        # Currently link if present in the LLVM lib directory
-        file(GLOB OTHER_REQUIRED_LIBS CONFIGURE_DEPENDS
-            "${LLVM_INSTALL_PATH}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}z${CMAKE_STATIC_LIBRARY_SUFFIX}"
-            "${LLVM_INSTALL_PATH}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}zstd${CMAKE_STATIC_LIBRARY_SUFFIX}"
-        )
-        target_link_libraries(llvm-libs INTERFACE ${LLVM_LIBRARIES} ${CLANG_LIBRARIES} ${OTHER_REQUIRED_LIBS})
+    if(NOT BUILD_SHARED_LIBS)
         target_compile_definitions(llvm-libs INTERFACE CLANG_BUILD_STATIC=1)
     endif()
+
+    message(STATUS "LLVM ${LLVM_VERSION} at ${LLVM_INSTALL_PATH}")
 endfunction()

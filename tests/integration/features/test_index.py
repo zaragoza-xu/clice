@@ -247,3 +247,167 @@ async def test_workspace_symbol_class(client, workspace):
     assert "Animal" in names
 
     client.close(uri)
+
+
+def locations_of(result):
+    if result is None:
+        return []
+    if isinstance(result, (list, tuple)):
+        return list(result)
+    return [result]
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_declaration_cross_file(client, workspace):
+    # Query a closed file: background indexing skips open files, so nav.h's
+    # shard only exists while nav.cpp stays closed (recorded index gap).
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_uri = (workspace / "nav.cpp").as_uri()
+
+    # 'area' definition in nav.cpp line 2; declaration in nav.h line 4.
+    locs = locations_of(await client.declaration_at(nav_uri, 2, 4))
+    lines = [(loc.uri.split("/")[-1], loc.range.start.line) for loc in locs]
+    assert ("nav.h", 4) in lines, f"expected nav.h:4 declaration, got {lines}"
+    # Union semantics: the definition itself is also listed.
+    assert ("nav.cpp", 2) in lines, f"expected nav.cpp:2 definition, got {lines}"
+
+    client.close(uri)
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_declaration_inline_definition(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri), "Index not ready after 30s"
+
+    # 'add' (line 18) is defined inline with no separate declaration;
+    # declaration must still navigate to the definition, not return empty.
+    locs = locations_of(await client.declaration_at(uri, 18, 4))
+    assert any(loc.range.start.line == 18 for loc in locs), (
+        f"expected the definition at line 18, got"
+        f" {[(loc.uri, loc.range.start.line) for loc in locs]}"
+    )
+
+    client.close(uri)
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_implementation(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri), "Index not ready after 30s"
+
+    # Animal::speak (line 2) is overridden by Dog::speak (9) and Cat::speak (14).
+    locs = locations_of(await client.implementation_at(uri, 2, 17))
+    lines = sorted(loc.range.start.line for loc in locs)
+    assert lines == [9, 14], f"expected overrides at lines 9 and 14, got {lines}"
+
+    client.close(uri)
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_type_definition(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_uri = (workspace / "nav.cpp").as_uri()
+
+    # global_shape (line 6) has type Shape, defined in nav.h line 6.
+    locs = locations_of(await client.type_definition_at(nav_uri, 6, 6))
+    lines = [(loc.uri.split("/")[-1], loc.range.start.line) for loc in locs]
+    assert ("nav.h", 6) in lines, f"expected Shape definition nav.h:6, got {lines}"
+
+    client.close(uri)
+
+
+@pytest.mark.workspace("index_features")
+async def test_references_declaration_flag(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_uri = (workspace / "nav.cpp").as_uri()
+
+    # 'area': declaration nav.h:4, definition nav.cpp:2, call nav.cpp:9.
+    with_decl = locations_of(await client.references_at(nav_uri, 2, 4))
+    without_decl = locations_of(
+        await client.references_at(nav_uri, 2, 4, include_declaration=False)
+    )
+    assert len(with_decl) == 3, with_decl
+    with_set = {(loc.uri.split("/")[-1], loc.range.start.line) for loc in with_decl}
+    without_set = {
+        (loc.uri.split("/")[-1], loc.range.start.line) for loc in without_decl
+    }
+    assert with_set == {("nav.h", 4), ("nav.cpp", 2), ("nav.cpp", 9)}, with_set
+    assert without_set == {("nav.cpp", 9)}, without_set
+
+    client.close(uri)
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_implementation_pure_virtual(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_h = (workspace / "nav.h").as_uri()
+
+    # Renderer::render is pure virtual; only the direct override's definition
+    # is returned (DebugGLRenderer::render belongs to GLRenderer::render).
+    locs = locations_of(await client.implementation_at(nav_h, 12, 17))
+    lines = [(loc.uri.split("/")[-1], loc.range.start.line) for loc in locs]
+    assert lines == [("nav.cpp", 12)], lines
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_implementation_chain(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_h = (workspace / "nav.h").as_uri()
+
+    # Intermediate override navigates to its own overriders.
+    locs = locations_of(await client.implementation_at(nav_h, 18, 9))
+    lines = [(loc.uri.split("/")[-1], loc.range.start.line) for loc in locs]
+    assert lines == [("nav.cpp", 14)], lines
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_type_definition_return_value(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_h = (workspace / "nav.h").as_uri()
+
+    # Known index gap: functions carry no TypeDefinition relation for their
+    # return type, so this currently yields no results.
+    result = await client.type_definition_at(nav_h, 25, 6)
+    assert result is not None and len(result) == 0, result
+
+
+@pytest.mark.workspace("index_features")
+async def test_goto_declaration_forward_declared(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_uri = (workspace / "nav.cpp").as_uri()
+
+    # 'Shape' at the global_shape declaration: forward declaration and
+    # definition are both listed.
+    locs = locations_of(await client.declaration_at(nav_uri, 6, 0))
+    lines = [(loc.uri.split("/")[-1], loc.range.start.line) for loc in locs]
+    assert ("nav.h", 2) in lines, lines
+    assert ("nav.h", 6) in lines, lines
+
+
+@pytest.mark.workspace("index_features")
+async def test_navigation_empty_open_document(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri), "Index not ready after 30s"
+
+    # 'add' has no implementations: open documents get [] back, not an error.
+    result = await client.implementation_at(uri, 18, 4)
+    assert result is not None and len(result) == 0, result
+
+
+@pytest.mark.workspace("index_features")
+async def test_navigation_closed_document_empty(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "area"), "Index not ready after 30s"
+    nav_uri = (workspace / "nav.cpp").as_uri()
+
+    # Index-only navigation serves closed documents; an empty result is a
+    # real answer, not an error.
+    result = await client.implementation_at(nav_uri, 2, 4)
+    assert result is not None and len(result) == 0, result

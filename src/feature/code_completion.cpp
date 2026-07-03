@@ -256,7 +256,10 @@ public:
         FuzzyMatcher matcher(prefix.spelling);
 
         LineMap map(content, encoding);
-        auto replace_range = *map.to_range(prefix.range.begin, prefix.range.end);
+        auto range = to_range(map, prefix.range);
+        if(!range)
+            return;
+        auto replace_range = *range;
 
         std::vector<protocol::CompletionItem> collected;
         collected.reserve(candidate_count);

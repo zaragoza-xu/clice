@@ -2,6 +2,7 @@
 #include "server/protocol/worker.h"
 #include "server/worker/worker_pool.h"
 #include "server/worker_test_helpers.h"
+#include "support/anomaly.h"
 
 #include "kota/async/async.h"
 
@@ -15,9 +16,14 @@ struct WorkerPoolFixture {
     std::vector<WorkerCrashInfo> crash_reports;
 
     WorkerPoolFixture() : pool(loop) {
+        logging::set_anomaly_trap_for_testing([](logging::AnomalyId) {});
         pool.on_crash = [this](const WorkerCrashInfo& info) {
             crash_reports.push_back(info);
         };
+    }
+
+    ~WorkerPoolFixture() {
+        logging::reset_anomaly_for_testing();
     }
 
     void add_stateless(bool alive = true, bool busy = false, bool low = true) {
@@ -622,6 +628,47 @@ TEST_CASE(StatefulLostDocuments) {
         if(!llvm::is_contained(expected, id))
             EXPECT_TRUE(f.has_owner(id));
     }
+}
+
+TEST_CASE(CrashReportsAnomaly) {
+    /// Production trigger for the WorkerCrash anomaly: process_crash is the
+    /// exact site the pool reports from.
+    WorkerPoolFixture f;
+    f.add_stateless(true, false);
+
+    std::vector<logging::AnomalyId> trapped;
+    logging::set_anomaly_trap_for_testing([&](logging::AnomalyId id) { trapped.push_back(id); });
+
+    f.simulate_crash(0, false, 0, 11);
+
+    ASSERT_EQ(trapped.size(), 1u);
+    EXPECT_EQ(trapped[0], logging::AnomalyId::WorkerCrash);
+}
+
+TEST_CASE(SpawnFailReportsAnomaly) {
+    /// Production trigger for the WorkerSpawnFail anomaly.
+    WorkerPoolFixture f;
+
+    std::vector<logging::AnomalyId> trapped;
+    logging::set_anomaly_trap_for_testing([&](logging::AnomalyId id) { trapped.push_back(id); });
+
+    WorkerPoolOptions opts;
+    opts.self_path = "/nonexistent/clice-binary";
+    opts.stateless_count = 1;
+    opts.stateful_count = 0;
+    EXPECT_FALSE(f.pool.start(opts));
+
+    ASSERT_EQ(trapped.size(), 1u);
+    EXPECT_EQ(trapped[0], logging::AnomalyId::WorkerSpawnFail);
+}
+
+TEST_CASE(OperationalErrorCodes) {
+    /// Dispatch failures marked operational must never classify as anomalies.
+    using worker::protocol::Error;
+    EXPECT_TRUE(worker::is_operational_error(Error{worker::dispatch_errc::cancelled, "x"}));
+    EXPECT_TRUE(
+        worker::is_operational_error(Error{worker::dispatch_errc::worker_unavailable, "x"}));
+    EXPECT_FALSE(worker::is_operational_error(Error{"plain failure"}));
 }
 
 TEST_CASE(CrashInfoSignal) {

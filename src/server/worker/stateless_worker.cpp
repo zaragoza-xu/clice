@@ -117,7 +117,11 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params) {
     } else {
         LOG_WARN("BuildPCH failed: file={}, {}ms, errors=[{}]", params.file, timer.ms(), errors);
         fs::remove(tmp_path);
-        return {false, errors.empty() ? "PCH compilation failed" : errors};
+        worker::BuildResult result;
+        result.success = false;
+        result.error = errors.empty() ? "PCH compilation failed" : errors;
+        result.has_user_errors = !errors.empty();
+        return result;
     }
 }
 
@@ -173,7 +177,11 @@ static worker::BuildResult handle_build_pcm(const worker::BuildParams& params) {
                  timer.ms(),
                  errors);
         fs::remove(tmp_path);
-        return {false, errors.empty() ? "PCM compilation failed" : errors};
+        worker::BuildResult result;
+        result.success = false;
+        result.error = errors.empty() ? "PCM compilation failed" : errors;
+        result.has_user_errors = !errors.empty();
+        return result;
     }
 }
 
@@ -283,7 +291,9 @@ int run_stateless_worker_mode(const std::string& worker_name, const std::string&
 
     logging::stderr_logger(worker_name, logging::options);
     if(!log_dir.empty()) {
-        logging::file_logger(worker_name, log_dir, logging::options);
+        // File only: worker stderr is reserved for crash/unexpected output,
+        // which the master relays into its own log (see logging taxonomy).
+        logging::file_logger(worker_name, log_dir, logging::options, /*mirror_stderr=*/false);
     }
 
     LOG_INFO("Starting stateless worker");

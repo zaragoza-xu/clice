@@ -1,15 +1,20 @@
 #include "server/compiler/compiler.h"
 
+#include <algorithm>
 #include <format>
 #include <ranges>
 #include <string>
+#include <utility>
 
 #include "command/argument_parser.h"
 #include "command/search_config.h"
+#include "compile/diagnostic.h"
 #include "index/tu_index.h"
 #include "server/protocol/worker.h"
+#include "support/anomaly.h"
 #include "support/filesystem.h"
 #include "support/logging.h"
+#include "support/timer.h"
 #include "syntax/include_resolver.h"
 #include "syntax/scan.h"
 
@@ -66,6 +71,36 @@ struct BuildingGuard {
         completion->set();
     }
 };
+
+/// A PCH/PCM build failure is expected when the worker reported user-code
+/// errors or the dispatch failed for an operational reason (memory-pressure
+/// preemption, crash/restart window); anything else is clice breakage and is
+/// reported as an anomaly.
+static bool expected_build_failure(const auto& result) {
+    return result.has_value() ? result.value().has_user_errors
+                              : worker::is_operational_error(result.error());
+}
+
+/// The error text of a failed build: the worker's message when it responded,
+/// the dispatch error otherwise.
+const static std::string& build_failure_message(const auto& result) {
+    return result.has_value() ? result.value().error : result.error().message;
+}
+
+/// Clamp a client-supplied position to the document, following LSP
+/// semantics: a character beyond the line length defaults to the line end,
+/// a line beyond the document defaults to the end of the content.
+static lsp::LineMap::Offset clamped_offset(const lsp::LineMap& map,
+                                           const protocol::Position& position) {
+    if(auto offset = map.to_offset(position)) {
+        return *offset;
+    }
+    auto starts = map.line_starts();
+    if(position.line >= starts.size()) {
+        return static_cast<lsp::LineMap::Offset>(map.content().size());
+    }
+    return map.line_bounds(starts[position.line]).end;
+}
 
 /// Detect whether the cursor is inside a preamble directive (include/import).
 
@@ -137,8 +172,7 @@ void Compiler::init_compile_graph() {
         worker::BuildParams bp;
         bp.kind = worker::BuildKind::BuildPCM;
         bp.file = file_path;
-        if(!fill_compile_args(file_path, bp.directory, bp.arguments))
-            co_return false;
+        fill_compile_args(file_path, bp.directory, bp.arguments);
 
         if(!workspace.store) {
             LOG_WARN("BuildPCM skipped for module {}: cache store is unavailable", mod_it->second);
@@ -157,13 +191,25 @@ void Compiler::init_compile_graph() {
                                               canonicalize(bp.arguments, ArgsProfile::Frontend)}));
 
         // Check if cached PCM is still valid.
+        llvm::StringRef pcm_miss = "no_entry";
         if(auto pcm_it = workspace.pcm_cache.find(path_id); pcm_it != workspace.pcm_cache.end()) {
-            if(pcm_it->second.key == pcm_key && workspace.store->lookup("pcm", pcm_key) &&
-               !deps_changed(workspace.path_pool, pcm_it->second.deps)) {
+            if(pcm_it->second.key != pcm_key) {
+                pcm_miss = "key_changed";
+            } else if(!workspace.store->lookup("pcm", pcm_key)) {
+                pcm_miss = "evicted";
+            } else if(deps_changed(workspace.path_pool, pcm_it->second.deps)) {
+                pcm_miss = "deps_changed";
+            } else {
                 workspace.pcm_paths[path_id] = pcm_it->second.path;
+                LOG_PERF("cache", "ns=pcm event=hit key={} module={}", pcm_key, mod_it->second);
                 co_return true;
             }
         }
+        LOG_PERF("cache",
+                 "ns=pcm event=miss reason={} key={} module={}",
+                 pcm_miss,
+                 pcm_key,
+                 mod_it->second);
 
         bp.module_name = mod_it->second;
         auto pending = workspace.store->begin_store("pcm", pcm_key);
@@ -177,9 +223,16 @@ void Compiler::init_compile_graph() {
         auto result = co_await pool.send_stateless(bp);
         if(!result.has_value() || !result.value().success) {
             workspace.store->abort(pending);
-            LOG_WARN("BuildPCM failed for module {}: {}",
-                     mod_it->second,
-                     result.has_value() ? result.value().error : result.error().message);
+            if(expected_build_failure(result)) {
+                LOG_WARN("BuildPCM failed for module {}: {}",
+                         mod_it->second,
+                         build_failure_message(result));
+            } else {
+                LOG_ANOMALY(PCMBuildFail,
+                            "PCM build failed for module {}: {}",
+                            mod_it->second,
+                            build_failure_message(result));
+            }
             co_return false;
         }
 
@@ -214,33 +267,81 @@ void Compiler::init_compile_graph() {
     LOG_INFO("CompileGraph initialized with {} module(s)", workspace.path_to_module.size());
 }
 
-bool Compiler::fill_compile_args(llvm::StringRef path,
-                                 std::string& directory,
-                                 std::vector<std::string>& arguments,
-                                 Session* session) {
-    auto path_id = workspace.path_pool.intern(path);
-
-    // 1. If the session has an active header context via switchContext,
-    //    use the host source's CDB entry with file path replaced and preamble injected.
-    if(session && session->active_context.has_value()) {
-        return fill_header_context_args(path, path_id, directory, arguments, session);
+/// Per-file command selection decision log: which tiers were tried, which one
+/// was hit, and a hash of the final command for correlating later failures.
+static void log_command_decision(llvm::StringRef path,
+                                 llvm::ArrayRef<llvm::StringRef> tried,
+                                 CommandSource source,
+                                 llvm::ArrayRef<std::string> arguments) {
+    if(logging::options.level > logging::Level::info)
+        return;
+    std::string joined;
+    for(auto& arg: arguments) {
+        joined += arg;
+        joined += '\0';
     }
+    LOG_INFO("compile_args: file={} tried=[{}] source={} args_hash={:016x}",
+             path,
+             llvm::join(tried, ","),
+             source,
+             llvm::xxh3_64bits(llvm::StringRef(joined)));
+}
 
-    // 2. Normal CDB lookup for the file itself.
-    //    Apply rules from config (append/remove flags based on file patterns).
-    std::vector<std::string> rule_append, rule_remove;
-    workspace.config.match_rules(path, rule_append, rule_remove);
-    auto results = workspace.cdb.lookup(path, {.remove = rule_remove, .append = rule_append});
-    if(!results.empty()) {
+CommandSource Compiler::fill_compile_args(llvm::StringRef path,
+                                          std::string& directory,
+                                          std::vector<std::string>& arguments,
+                                          Session* session) {
+    auto path_id = workspace.path_pool.intern(path);
+    llvm::SmallVector<llvm::StringRef, 3> tried;
+
+    // Fill from the CDB layer with config rules applied (append/remove flags
+    // based on file patterns). Also used for tier 4: lookup() synthesizes a
+    // default command for files without an entry.
+    auto fill_from_cdb = [&] {
+        std::vector<std::string> rule_append, rule_remove;
+        workspace.config.match_rules(path, rule_append, rule_remove);
+        auto results = workspace.cdb.lookup(path, {.remove = rule_remove, .append = rule_append});
         workspace.toolchain.resolve_or_warn(results.front());
         auto& cmd = results.front();
         directory = cmd.resolved.directory.str();
         arguments = cmd.to_string_argv();
-        return true;
+    };
+
+    // 1. If the session has an active header context via switchContext,
+    //    use the host source's CDB entry with file path replaced and preamble injected.
+    if(session && session->active_context.has_value()) {
+        tried.push_back("switch_context");
+        if(fill_header_context_args(path, path_id, directory, arguments, session)) {
+            log_command_decision(path, tried, CommandSource::IncludeGraph, arguments);
+            return CommandSource::IncludeGraph;
+        }
+    }
+
+    // 2. Real CDB entry for the file itself (lookup() synthesizes a command
+    //    for unknown files, so a non-empty result alone proves nothing).
+    tried.push_back("cdb");
+    if(workspace.cdb.has_entry(path)) {
+        fill_from_cdb();
+        log_command_decision(path, tried, CommandSource::CDBExact, arguments);
+        return CommandSource::CDBExact;
     }
 
     // 3. No CDB entry — try automatic header context resolution.
-    return fill_header_context_args(path, path_id, directory, arguments, session);
+    if(!(session && session->active_context.has_value())) {
+        tried.push_back("include_graph");
+        if(fill_header_context_args(path, path_id, directory, arguments, session)) {
+            log_command_decision(path, tried, CommandSource::IncludeGraph, arguments);
+            return CommandSource::IncludeGraph;
+        }
+    }
+
+    // 4. Nothing matched — use the default command the CDB layer synthesizes
+    //    for unknown files, so the file still compiles and produces
+    //    diagnostics instead of failing silently.
+    tried.push_back("fallback");
+    fill_from_cdb();
+    log_command_decision(path, tried, CommandSource::Fallback, arguments);
+    return CommandSource::Fallback;
 }
 
 bool Compiler::fill_header_context_args(llvm::StringRef path,
@@ -280,16 +381,17 @@ bool Compiler::fill_header_context_args(llvm::StringRef path,
     }
 
     auto host_path = workspace.path_pool.resolve(ctx_ptr->host_path_id);
+    if(!workspace.cdb.has_entry(host_path)) {
+        LOG_WARN("fill_header_context_args: host {} has no CDB entry", host_path);
+        return false;
+    }
+
     // Apply rules matching the HEADER path (what the user is editing) on top of
     // the host's command — rules are expected to apply uniformly to every file.
     std::vector<std::string> rule_append, rule_remove;
     workspace.config.match_rules(path, rule_append, rule_remove);
     auto host_results =
         workspace.cdb.lookup(host_path, {.remove = rule_remove, .append = rule_append});
-    if(host_results.empty()) {
-        LOG_WARN("fill_header_context_args: host {} has no CDB entry", host_path);
-        return false;
-    }
 
     workspace.toolchain.resolve_or_warn(host_results.front());
 
@@ -330,8 +432,7 @@ std::optional<HeaderFileContext> Compiler::resolve_header_context(std::uint32_t 
     if(session && session->active_context.has_value()) {
         auto preferred = *session->active_context;
         auto preferred_path = workspace.path_pool.resolve(preferred);
-        auto results = workspace.cdb.lookup(preferred_path);
-        if(!results.empty()) {
+        if(workspace.cdb.has_entry(preferred_path)) {
             auto c = workspace.dep_graph.find_include_chain(preferred, header_path_id);
             if(!c.empty()) {
                 host_path_id = preferred;
@@ -340,12 +441,12 @@ std::optional<HeaderFileContext> Compiler::resolve_header_context(std::uint32_t 
         }
     }
 
-    // Fall back to the first available host that has a CDB entry.
+    // Fall back to the first available host that has a real CDB entry —
+    // a host with a synthesized command would just be a fallback in disguise.
     if(chain.empty()) {
         for(auto candidate: hosts) {
             auto candidate_path = workspace.path_pool.resolve(candidate);
-            auto results = workspace.cdb.lookup(candidate_path);
-            if(results.empty())
+            if(!workspace.cdb.has_entry(candidate_path))
                 continue;
             auto c = workspace.dep_graph.find_include_chain(candidate, header_path_id);
             if(c.empty())
@@ -468,9 +569,48 @@ std::string uri_to_path(const std::string& uri) {
     return uri;
 }
 
+/// Clang diagnostics indicating that an input file could not be found —
+/// the symptom of a guessed compile command missing include paths.
+static bool is_file_not_found(const protocol::Diagnostic& diagnostic) {
+    if(!diagnostic.code.has_value())
+        return false;
+    auto* code = std::get_if<protocol::string>(&*diagnostic.code);
+    return code && (*code == "err_pp_file_not_found" || *code == "err_pp_error_opening_file" ||
+                    *code == "err_module_not_found");
+}
+
+/// File-top warning explaining that diagnostics were produced with a guessed
+/// compile command, pointing at the compilation database documentation.
+static protocol::Diagnostic make_inferred_command_diagnostic(CommandSource source) {
+    DiagnosticID id{
+        .value = 0,
+        .level = DiagnosticLevel::Warning,
+        .source = DiagnosticSource::Clice,
+        .name = "inferred-compile-command",
+    };
+
+    protocol::Diagnostic diagnostic;
+    diagnostic.range = protocol::Range{
+        .start = protocol::Position{.line = 0, .character = 0},
+        .end = protocol::Position{.line = 0, .character = 0},
+    };
+    diagnostic.severity = protocol::DiagnosticSeverity::Warning;
+    diagnostic.code = id.name.str();
+    if(auto uri = id.diagnostic_document_uri()) {
+        diagnostic.code_description = protocol::CodeDescription{.href = std::move(*uri)};
+    }
+    diagnostic.source = "clice";
+    diagnostic.message = std::format(
+        "No compilation database entry for this file (compile command was {}), so some includes " "may not be found. Configure compile_commands.json for accurate diagnostics.",
+        source == CommandSource::Fallback ? "synthesized from defaults"
+                                          : "inferred from an including file");
+    return diagnostic;
+}
+
 void Compiler::publish_diagnostics(const std::string& uri,
                                    int version,
-                                   const kota::codec::RawValue& diagnostics_json) {
+                                   const kota::codec::RawValue& diagnostics_json,
+                                   CommandSource source) {
     if(!peer)
         return;
     std::vector<protocol::Diagnostic> diagnostics;
@@ -480,6 +620,13 @@ void Compiler::publish_diagnostics(const std::string& uri,
             LOG_WARN("Failed to deserialize diagnostics JSON for {}", uri);
         }
     }
+
+    // Guidance (and only when it can explain something): an exact CDB match
+    // never gets the note, and neither does a guessed command that worked.
+    if(source != CommandSource::CDBExact && std::ranges::any_of(diagnostics, is_file_not_found)) {
+        diagnostics.insert(diagnostics.begin(), make_inferred_command_diagnostic(source));
+    }
+
     protocol::PublishDiagnosticsParams params;
     params.uri = uri;
     params.version = version;
@@ -527,15 +674,25 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
 
     // Reuse existing PCH if the key and deps haven't changed.  The store
     // lookup refreshes the blob's LRU position and catches eviction.
+    llvm::StringRef pch_miss = "no_entry";
     if(auto it = workspace.pch_cache.find(path_id); it != workspace.pch_cache.end()) {
         auto& st = it->second;
-        if(st.key == pch_key && !st.path.empty() && workspace.store &&
-           workspace.store->lookup("pch", pch_key) && !deps_changed(workspace.path_pool, st.deps)) {
+        if(st.key != pch_key) {
+            pch_miss = "key_changed";
+        } else if(st.path.empty()) {
+            pch_miss = "incomplete_entry";
+        } else if(!(workspace.store && workspace.store->lookup("pch", pch_key))) {
+            pch_miss = "evicted";
+        } else if(deps_changed(workspace.path_pool, st.deps)) {
+            pch_miss = "deps_changed";
+        } else {
             st.bound = bound;
             session.pch_ref = Session::PCHRef{path_id, pch_key, bound};
+            LOG_PERF("cache", "ns=pch event=hit key={} file={}", pch_key, path);
             co_return true;
         }
     }
+    LOG_PERF("cache", "ns=pch event=miss reason={} key={} file={}", pch_miss, pch_key, path);
 
     // Preamble incomplete (user still typing) — defer rebuild, reuse old PCH if available.
     if(!is_preamble_complete(text, bound)) {
@@ -584,9 +741,14 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
 
     if(!result.has_value() || !result.value().success) {
         workspace.store->abort(pending);
-        LOG_WARN("PCH build failed for {}: {}",
-                 path,
-                 result.has_value() ? result.value().error : result.error().message);
+        if(expected_build_failure(result)) {
+            LOG_WARN("PCH build failed for {}: {}", path, build_failure_message(result));
+        } else {
+            LOG_ANOMALY(PCHBuildFail,
+                        "PCH build failed for {}: {}",
+                        path,
+                        build_failure_message(result));
+        }
         co_return false;
     }
 
@@ -762,6 +924,7 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
 
     LOG_INFO("ensure_compiled: starting compile path_id={} gen={}", pid, gen);
 
+    ScopedTimer timer;
     auto file_path = std::string(workspace.path_pool.resolve(pid));
     auto uri = lsp::URI::from_file_path(file_path);
     std::string uri_str = uri.has_value() ? uri->str() : file_path;
@@ -770,10 +933,7 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
     params.path = file_path;
     params.version = session->version;
     params.text = session->text;
-    if(!fill_compile_args(file_path, params.directory, params.arguments, session.get())) {
-        finish_compile();
-        co_return;
-    }
+    auto source = fill_compile_args(file_path, params.directory, params.arguments, session.get());
 
     bool deps_ok = co_await ensure_deps(*session,
                                         params.directory,
@@ -809,7 +969,14 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
     }
 
     if(!result.has_value()) {
-        LOG_WARN("Compile failed for {}: {}", uri_str, result.error().message);
+        if(worker::is_operational_error(result.error())) {
+            LOG_WARN("Compile did not complete for {}: {}", uri_str, result.error().message);
+        } else {
+            // The worker accepts arbitrary user code; a non-operational
+            // failure at this layer is IPC/worker breakage, never a
+            // user-code problem.
+            LOG_ANOMALY(CompileFail, "Compile failed for {}: {}", uri_str, result.error().message);
+        }
         clear_diagnostics(uri_str);
         finish_compile();
         co_return;
@@ -828,7 +995,8 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
     auto version = session->version;
     finish_compile();
 
-    publish_diagnostics(uri_str, version, result.value().diagnostics);
+    LOG_PERF("request", "kind=Compile file={} total_ms={}", file_path, timer.ms());
+    publish_diagnostics(uri_str, version, result.value().diagnostics, source);
     if(on_indexing_needed)
         on_indexing_needed();
 }
@@ -931,9 +1099,11 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
     auto gen = session->generation;
     auto map = session->line_map();
 
+    ScopedTimer timer;
     if(!co_await ensure_compiled(session)) {
         co_return serde_raw{"null"};
     }
+    auto wait_ms = timer.ms();
 
     if(session->generation != gen) {
         co_return serde_raw{"null"};
@@ -944,24 +1114,30 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
     wp.path = path;
 
     if(position) {
-        auto offset = map.to_offset(*position);
-        if(!offset)
-            co_return serde_raw{"null"};
-        wp.offset = *offset;
+        wp.offset = clamped_offset(map, *position);
     }
 
     if(range) {
-        auto start = map.to_offset(range->start);
-        auto end = map.to_offset(range->end);
-        if(start && end) {
-            wp.range = {*start, *end};
+        wp.range = {clamped_offset(map, range->start), clamped_offset(map, range->end)};
+        if(wp.range.begin > wp.range.end) {
+            co_return kota::outcome_error(
+                kota::ipc::Error{kota::ipc::protocol::ErrorCode::InvalidParams,
+                                 "Range start is after its end"});
         }
     }
 
     auto result = co_await pool.send_stateful(path_id, wp);
     if(!result.has_value()) {
-        co_return serde_raw{};
+        if(!worker::is_operational_error(result.error())) {
+            LOG_ANOMALY(WorkerRequestFail,
+                        "query (kind={}) failed for {}: {}",
+                        kind,
+                        path,
+                        result.error().message);
+        }
+        co_return kota::outcome_error(std::move(result.error()));
     }
+    LOG_PERF("request", "kind={} file={} wait_ms={} total_ms={}", kind, path, wait_ms, timer.ms());
     co_return std::move(result.value());
 }
 
@@ -978,28 +1154,34 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
     wp.file = path;
     wp.version = session->version;
     wp.text = session->text;
-    if(!fill_compile_args(path, wp.directory, wp.arguments, session.get())) {
-        co_return serde_raw{};
-    }
+    fill_compile_args(path, wp.directory, wp.arguments, session.get());
 
+    ScopedTimer timer;
     if(!co_await ensure_deps(*session, wp.directory, wp.arguments, wp.pch, wp.pcms)) {
-        co_return serde_raw{};
+        LOG_WARN("forward_build: dependency preparation failed for {}", path);
+        co_return kota::outcome_error(kota::ipc::Error{"Dependency preparation failed"});
     }
+    auto wait_ms = timer.ms();
 
     if(session->generation != gen) {
-        co_return serde_raw{};
+        co_return serde_raw{"null"};
     }
 
     lsp::LineMap map(wp.text);
-    auto offset = map.to_offset(position);
-    if(!offset)
-        co_return serde_raw{"null"};
-    wp.offset = *offset;
+    wp.offset = clamped_offset(map, position);
 
     auto result = co_await pool.send_stateless(wp);
     if(!result.has_value()) {
-        co_return serde_raw{};
+        if(!worker::is_operational_error(result.error())) {
+            LOG_ANOMALY(WorkerRequestFail,
+                        "build (kind={}) failed for {}: {}",
+                        kind,
+                        path,
+                        result.error().message);
+        }
+        co_return kota::outcome_error(std::move(result.error()));
     }
+    LOG_PERF("request", "kind={} file={} wait_ms={} total_ms={}", kind, path, wait_ms, timer.ms());
     co_return std::move(result.value().result_json);
 }
 
@@ -1016,17 +1198,26 @@ Compiler::RawResult Compiler::forward_format(std::shared_ptr<Session> session,
 
     if(range) {
         lsp::LineMap map(wp.text);
-        auto begin = map.to_offset(range->start);
-        auto end = map.to_offset(range->end);
-        if(!begin || !end)
-            co_return serde_raw{"null"};
-        wp.format_range = {*begin, *end};
+        wp.format_range = {clamped_offset(map, range->start), clamped_offset(map, range->end)};
+        if(wp.format_range.begin > wp.format_range.end) {
+            co_return kota::outcome_error(
+                kota::ipc::Error{kota::ipc::protocol::ErrorCode::InvalidParams,
+                                 "Range start is after its end"});
+        }
     }
 
+    ScopedTimer timer;
     auto result = co_await pool.send_stateless(wp);
     if(!result.has_value()) {
-        co_return serde_raw{"null"};
+        if(!worker::is_operational_error(result.error())) {
+            LOG_ANOMALY(WorkerRequestFail,
+                        "format failed for {}: {}",
+                        path,
+                        result.error().message);
+        }
+        co_return kota::outcome_error(std::move(result.error()));
     }
+    LOG_PERF("request", "kind=Format file={} total_ms={}", path, timer.ms());
     co_return std::move(result.value().result_json);
 }
 
@@ -1043,8 +1234,7 @@ Compiler::RawResult Compiler::handle_completion(const protocol::Position& positi
            pctx.kind == CompletionContext::IncludeAngled) {
             std::string directory;
             std::vector<std::string> arguments;
-            if(!fill_compile_args(path, directory, arguments))
-                co_return serde_raw{"[]"};
+            fill_compile_args(path, directory, arguments);
 
             std::vector<const char*> args_ptrs;
             args_ptrs.reserve(arguments.size());

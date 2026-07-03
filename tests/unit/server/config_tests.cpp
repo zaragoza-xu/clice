@@ -378,6 +378,41 @@ TEST_CASE(TomlErrorLocated) {
     EXPECT_FALSE(result.has_value());
 }
 
+// FIXME: assert ConfigIssue::line/column once kotatsu's TOML decoder exposes
+// error locations (feature 60661c1 on the unmerged kotatsu branch); the
+// plumbing here already forwards rich_error.location when present.
+TEST_CASE(SyntaxIssueReported) {
+    TempDir tmp;
+    tmp.touch("clice.toml", "[project\nclang_tidy = true\n");
+    std::vector<ConfigIssue> issues;
+    auto result = Config::load(tmp.path("clice.toml"), tmp.root.str(), &issues);
+    EXPECT_FALSE(result.has_value());
+    ASSERT_EQ(issues.size(), 1u);
+    EXPECT_EQ(issues[0].severity, ConfigIssue::Severity::Error);
+}
+
+TEST_CASE(TypeIssueReported) {
+    TempDir tmp;
+    tmp.touch("clice.toml", "[project]\nclang_tidy = \"yes\"\n");
+    std::vector<ConfigIssue> issues;
+    auto result = Config::load(tmp.path("clice.toml"), tmp.root.str(), &issues);
+    EXPECT_FALSE(result.has_value());
+    ASSERT_EQ(issues.size(), 1u);
+    EXPECT_EQ(issues[0].severity, ConfigIssue::Severity::Error);
+    EXPECT_NE(issues[0].message.find("clang_tidy"), std::string::npos);
+}
+
+TEST_CASE(UnknownKeyIssueWarns) {
+    TempDir tmp;
+    tmp.touch("clice.toml", "[project]\nclang_tdy = true\n");
+    std::vector<ConfigIssue> issues;
+    auto result = Config::load(tmp.path("clice.toml"), tmp.root.str(), &issues);
+    EXPECT_TRUE(result.has_value());
+    ASSERT_EQ(issues.size(), 1u);
+    EXPECT_EQ(issues[0].severity, ConfigIssue::Severity::Warning);
+    EXPECT_NE(issues[0].message.find("clang_tdy"), std::string::npos);
+}
+
 TEST_CASE(WorkspaceMalformedFallback) {
     // load_from_workspace must fall back to defaults when clice.toml is malformed,
     // not propagate the failure.

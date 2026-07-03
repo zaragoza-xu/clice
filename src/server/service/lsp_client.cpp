@@ -10,6 +10,7 @@
 #include "server/protocol/extension.h"
 #include "server/protocol/worker.h"
 #include "server/service/master_server.h"
+#include "support/anomaly.h"
 #include "support/filesystem.h"
 #include "support/logging.h"
 
@@ -36,9 +37,31 @@ static serde_raw to_raw(const T& value) {
     return serde_raw{json ? std::move(*json) : "null"};
 }
 
+/// Error response for feature requests on files with no open session.
+static kota::ipc::Error document_not_open() {
+    return kota::ipc::Error{kota::ipc::protocol::ErrorCode::InvalidParams, "Document not open"};
+}
+
+/// Error response when a call/type hierarchy item cannot be resolved back to
+/// an indexed symbol.
+static kota::ipc::Error item_not_resolved(llvm::StringRef kind) {
+    return kota::ipc::Error{kota::ipc::protocol::ErrorCode::InvalidParams,
+                            std::format("Failed to resolve {} item", kind)};
+}
+
 LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(server), peer(peer) {
     server.compiler.set_peer(&peer);
     server.indexer.set_peer(&peer);
+
+    // The notify hook is process-wide and forwards anomaly/guidance messages
+    // as window/logMessage notifications. It captures the peer, so it must
+    // live exactly as long as this LSPClient (cleared in the destructor).
+    logging::set_notify_hook([&peer](logging::NotifyLevel level, std::string_view message) {
+        peer.send_notification(protocol::LogMessageParams{
+            static_cast<protocol::MessageType>(level),
+            std::string(message),
+        });
+    });
 
     using StringVec = std::vector<std::string>;
 
@@ -143,6 +166,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
 
     peer.on_notification([this]([[maybe_unused]] const protocol::InitializedParams& params) {
         this->server.initialize();
+        this->publish_config_diagnostics();
     });
 
     peer.on_request(
@@ -252,7 +276,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
         if(!session)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(document_not_open());
         co_return co_await srv.compiler.forward_query(
             worker::QueryKind::Hover,
             session,
@@ -266,7 +290,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
         if(!session)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(document_not_open());
         co_return co_await srv.compiler.forward_query(worker::QueryKind::SemanticTokens, session);
     });
 
@@ -277,7 +301,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
             auto path_id = srv.workspace.path_pool.intern(path);
             auto session = srv.find_session(path_id);
             if(!session)
-                co_return serde_raw{"null"};
+                co_return kota::outcome_error(document_not_open());
             co_return co_await srv.compiler.forward_query(worker::QueryKind::InlayHints,
                                                           session,
                                                           {},
@@ -291,7 +315,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
             auto path_id = srv.workspace.path_pool.intern(path);
             auto session = srv.find_session(path_id);
             if(!session)
-                co_return serde_raw{"null"};
+                co_return kota::outcome_error(document_not_open());
             co_return co_await srv.compiler.forward_query(worker::QueryKind::FoldingRange, session);
         });
 
@@ -302,7 +326,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
         if(!session)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(document_not_open());
         co_return co_await srv.compiler.forward_query(worker::QueryKind::DocumentSymbol, session);
     });
 
@@ -313,10 +337,10 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
         if(!session)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(document_not_open());
         auto result = co_await srv.compiler.forward_query(worker::QueryKind::DocumentLink, session);
         if(!result.has_value())
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(std::move(result.error()));
         auto& links = result.value();
         if(session->pch_ref) {
             auto& pch_cache = srv.workspace.pch_cache;
@@ -342,7 +366,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
             auto path_id = srv.workspace.path_pool.intern(path);
             auto session = srv.find_session(path_id);
             if(!session)
-                co_return serde_raw{"null"};
+                co_return kota::outcome_error(document_not_open());
             co_return co_await srv.compiler.forward_query(worker::QueryKind::CodeAction, session);
         });
 
@@ -393,7 +417,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
         if(!session)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(document_not_open());
         co_return co_await srv.compiler.forward_query(worker::QueryKind::GoToDefinition,
                                                       session,
                                                       pos);
@@ -440,7 +464,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
         if(!session)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(document_not_open());
         auto pause = srv.indexer.scoped_pause();
         auto result =
             co_await srv.compiler.handle_completion(params.text_document_position_params.position,
@@ -455,7 +479,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
             auto path_id = srv.workspace.path_pool.intern(path);
             auto session = srv.find_session(path_id);
             if(!session)
-                co_return serde_raw{"null"};
+                co_return kota::outcome_error(document_not_open());
             auto pause = srv.indexer.scoped_pause();
             auto result =
                 co_await srv.compiler.forward_build(worker::BuildKind::SignatureHelp,
@@ -471,7 +495,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
             auto path_id = srv.workspace.path_pool.intern(path);
             auto session = srv.find_session(path_id);
             if(!session)
-                co_return serde_raw{"null"};
+                co_return kota::outcome_error(document_not_open());
             auto pause = srv.indexer.scoped_pause();
             co_return co_await srv.compiler.forward_format(session);
         });
@@ -483,7 +507,7 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
         if(!session)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(document_not_open());
         auto pause = srv.indexer.scoped_pause();
         co_return co_await srv.compiler.forward_format(session, params.range);
     });
@@ -510,10 +534,8 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
                         const protocol::CallHierarchyIncomingCallsParams& params) -> RawResult {
         auto info = resolve_item(params.item.uri, params.item.range, params.item.data);
         if(!info)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(item_not_resolved("call hierarchy"));
         auto results = this->server.indexer.find_incoming_calls(info->hash);
-        if(results.empty())
-            co_return serde_raw{"null"};
         co_return to_raw(results);
     });
 
@@ -522,10 +544,8 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
                         const protocol::CallHierarchyOutgoingCallsParams& params) -> RawResult {
         auto info = resolve_item(params.item.uri, params.item.range, params.item.data);
         if(!info)
-            co_return serde_raw{"null"};
+            co_return kota::outcome_error(item_not_resolved("call hierarchy"));
         auto results = this->server.indexer.find_outgoing_calls(info->hash);
-        if(results.empty())
-            co_return serde_raw{"null"};
         co_return to_raw(results);
     });
 
@@ -552,10 +572,8 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
                              const protocol::TypeHierarchySupertypesParams& params) -> RawResult {
             auto info = resolve_item(params.item.uri, params.item.range, params.item.data);
             if(!info)
-                co_return serde_raw{"null"};
+                co_return kota::outcome_error(item_not_resolved("type hierarchy"));
             auto results = this->server.indexer.find_supertypes(info->hash);
-            if(results.empty())
-                co_return serde_raw{"null"};
             co_return to_raw(results);
         });
 
@@ -564,18 +582,14 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
                              const protocol::TypeHierarchySubtypesParams& params) -> RawResult {
             auto info = resolve_item(params.item.uri, params.item.range, params.item.data);
             if(!info)
-                co_return serde_raw{"null"};
+                co_return kota::outcome_error(item_not_resolved("type hierarchy"));
             auto results = this->server.indexer.find_subtypes(info->hash);
-            if(results.empty())
-                co_return serde_raw{"null"};
             co_return to_raw(results);
         });
 
     peer.on_request(
         [this](RequestContext& ctx, const protocol::WorkspaceSymbolParams& params) -> RawResult {
             auto results = this->server.indexer.search_symbols(params.query);
-            if(results.empty())
-                co_return serde_raw{"null"};
             co_return to_raw(results);
         });
 
@@ -706,7 +720,57 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         });
 }
 
+/// Publish clice.toml load problems as diagnostics, each on its own file's
+/// URI (multiple files can contribute issues when the first config candidate
+/// is malformed and the next one loads). The files are usually not open in
+/// the editor — publishing to a closed file is fine, the client shows it in
+/// the problems panel. The loaded file always gets a publish, so a clean
+/// load clears diagnostics from a previous (broken) state.
+void LSPClient::publish_config_diagnostics() {
+    if(server.config_path.empty())
+        return;
+
+    llvm::StringMap<std::vector<protocol::Diagnostic>> by_file;
+    // The loaded file always gets a publish (even with zero issues), so a
+    // clean load clears diagnostics from a previous broken state.
+    by_file.try_emplace(server.config_path);
+    for(auto& issue: server.config_issues) {
+        // rich_error positions are 1-based; LSP wants 0-based. An unknown
+        // position (0) maps to the file top. The range spans a single
+        // character — clients render it as the whole token anyway.
+        auto line = issue.line > 0 ? issue.line - 1 : 0;
+        auto character = issue.column > 0 ? issue.column - 1 : 0;
+
+        protocol::Diagnostic diagnostic;
+        diagnostic.range = protocol::Range{
+            .start = protocol::Position{.line = line, .character = character    },
+            .end = protocol::Position{.line = line, .character = character + 1},
+        };
+        diagnostic.severity = issue.severity == ConfigIssue::Severity::Error
+                                  ? protocol::DiagnosticSeverity::Error
+                                  : protocol::DiagnosticSeverity::Warning;
+        diagnostic.source = "clice";
+        diagnostic.message = issue.message;
+        by_file[issue.file].push_back(std::move(diagnostic));
+
+        LOG_GUIDANCE("Configuration problem in {}: {}", issue.file, issue.message);
+    }
+
+    for(auto& [file, diagnostics]: by_file) {
+        auto uri = lsp::URI::from_file_path(file.str());
+        if(!uri) {
+            LOG_WARN("Cannot build URI for config file {}", file.str());
+            continue;
+        }
+        protocol::PublishDiagnosticsParams params;
+        params.uri = uri->str();
+        params.diagnostics = std::move(diagnostics);
+        peer.send_notification(params);
+    }
+}
+
 LSPClient::~LSPClient() {
+    logging::set_notify_hook(nullptr);
     server.compiler.set_peer(nullptr);
     server.indexer.set_peer(nullptr);
 }

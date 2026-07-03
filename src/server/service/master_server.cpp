@@ -8,8 +8,10 @@
 #include "server/protocol/worker.h"
 #include "server/service/agent_client.h"
 #include "server/service/lsp_client.h"
+#include "support/anomaly.h"
 #include "support/filesystem.h"
 #include "support/logging.h"
+#include "support/timer.h"
 
 #include "kota/async/async.h"
 #include "kota/codec/json/json.h"
@@ -50,16 +52,24 @@ MasterServer::MasterServer(kota::event_loop& loop, std::string self_path) :
 MasterServer::~MasterServer() = default;
 
 void MasterServer::initialize() {
-    workspace.config = Config::load_from_workspace(workspace_root);
+    config_issues.clear();
+    config_path.clear();
+    // Load clice.toml raw and overlay initializationOptions BEFORE computing
+    // defaults: derived fields (logging_dir, index_dir, ...) must follow the
+    // final merged values (e.g. a cache_dir overridden by the client).
+    workspace.config = Config::load_from_workspace(workspace_root,
+                                                   &config_issues,
+                                                   &config_path,
+                                                   /*with_defaults=*/false);
     if(!init_options_json.empty()) {
         if(auto ov = kota::codec::json::parse(init_options_json, workspace.config); !ov) {
-            LOG_WARN("Failed to apply initializationOptions: {}", ov.error().to_string());
+            LOG_GUIDANCE("Failed to apply initializationOptions: {}", ov.error().to_string());
         } else {
-            workspace.config.apply_defaults(workspace_root);
             LOG_INFO("Applied initializationOptions overlay");
         }
         init_options_json.clear();
     }
+    workspace.config.apply_defaults(workspace_root);
 
     auto& cfg = workspace.config.project;
 
@@ -69,6 +79,7 @@ void MasterServer::initialize() {
         session_log_dir =
             path::join(cfg.logging_dir, std::format("{:%Y-%m-%d_%H-%M-%S}_{}", now, pid));
         logging::file_logger("master", session_log_dir, logging::options);
+        LOG_INFO("Session log directory: {}", session_log_dir);
     }
 
     LOG_INFO("Server ready (stateful={}, stateless={}, idle={}ms)",
@@ -85,7 +96,7 @@ void MasterServer::initialize() {
     pool_opts.worker_memory_limit = cfg.worker_memory_limit;
     pool_opts.log_dir = session_log_dir;
     if(!pool.start(pool_opts)) {
-        LOG_ERROR("Failed to start worker pool");
+        LOG_ANOMALY(WorkerSpawnFail, "Failed to start worker pool");
         return;
     }
 
@@ -286,12 +297,16 @@ void MasterServer::load_workspace() {
     }
 
     if(cdb_path.empty()) {
-        LOG_WARN("No compile_commands.json found in workspace {}", workspace_root);
+        LOG_GUIDANCE(
+            "No compile_commands.json found in workspace {}. Compile commands will be " "guessed; see https://clice.io/en/guide/quick-start for setup.",
+            workspace_root);
         return;
     }
 
+    ScopedTimer cdb_timer;
     auto count = workspace.cdb.load(cdb_path);
     LOG_INFO("Loaded CDB from {} with {} entries", cdb_path, count);
+    LOG_PERF("startup", "phase=cdb_load entries={} elapsed_ms={}", count, cdb_timer.ms());
 
     auto report = scan_dependency_graph(workspace.cdb,
                                         workspace.toolchain,
@@ -323,6 +338,11 @@ void MasterServer::load_workspace() {
         report.waves);
     if(unresolved > 0)
         LOG_WARN("{} unresolved includes", unresolved);
+    LOG_PERF("startup",
+             "phase=dep_scan files={} edges={} elapsed_ms={}",
+             report.total_files,
+             report.total_edges,
+             report.elapsed_ms);
 
     workspace.build_module_map();
     indexer.load();
@@ -409,6 +429,11 @@ int run_serve_mode(const ServerOptions& opts, const char* self_path) {
     auto port = opts.port.value_or(0);
     auto record = opts.record.value_or("");
     auto ws = opts.workspace.value_or("");
+
+    LOG_INFO("clice master starting: pid={}, mode={}, workspace={}",
+             llvm::sys::Process::getProcessId(),
+             mode == ServerMode::Pipe ? "pipe" : "socket",
+             ws.empty() ? "<from LSP initialize>" : ws);
 
     if(mode == ServerMode::Socket && (port <= 0 || port > 65535)) {
         LOG_ERROR("--port must be between 1 and 65535 in socket mode");

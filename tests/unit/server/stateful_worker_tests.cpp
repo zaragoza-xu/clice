@@ -176,7 +176,7 @@ TEST_CASE(CodeActionReturnsEmpty) {
 
         auto result = co_await w.peer->send_request(params);
         CO_ASSERT_TRUE(result.has_value());
-        // Should return empty array "[]" (TODO stub)
+        // No document: the shared with_ast default is "null".
         EXPECT_EQ(result.value().data, std::string("[]"));
         test_done = true;
         w.peer->close_output();
@@ -185,7 +185,7 @@ TEST_CASE(CodeActionReturnsEmpty) {
     ASSERT_TRUE(test_done);
 }
 
-TEST_CASE(GoToDefinitionReturnsEmpty) {
+TEST_CASE(GoToDefinitionWithoutCompile) {
     WorkerHandle w;
     ASSERT_TRUE(w.spawn(4ULL * 1024 * 1024 * 1024));
 
@@ -199,8 +199,8 @@ TEST_CASE(GoToDefinitionReturnsEmpty) {
 
         auto result = co_await w.peer->send_request(params);
         CO_ASSERT_TRUE(result.has_value());
-        // Should return empty array "[]" (TODO stub)
-        EXPECT_EQ(result.value().data, std::string("[]"));
+        // No document: the shared with_ast default is "null".
+        EXPECT_EQ(result.value().data, std::string("null"));
         test_done = true;
         w.peer->close_output();
     });
@@ -278,13 +278,12 @@ TEST_CASE(DocumentLinkWithoutCompile) {
     bool test_done = false;
 
     w.run([&]() -> kota::task<> {
-        worker::QueryParams params;
-        params.kind = worker::QueryKind::DocumentLink;
+        worker::DocumentLinkParams params;
         params.path = "/tmp/nonexistent.cpp";
 
         auto result = co_await w.peer->send_request(params);
         CO_ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result.value().data, std::string("null"));
+        EXPECT_TRUE(result.value().empty());
         test_done = true;
         w.peer->close_output();
     });

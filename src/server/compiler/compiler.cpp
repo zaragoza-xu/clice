@@ -1062,7 +1062,7 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
     st.path = committed.value().value();
     st.bound = bound;
     st.deps = capture_deps_snapshot(workspace.path_pool, result.value().deps);
-    st.document_links_json = std::move(result.value().pch_links_json);
+    st.preamble_links = std::move(result.value().preamble_links);
     st.inactive_regions = std::move(result.value().inactive_regions);
     st.open_conditionals = std::move(result.value().open_conditionals);
 
@@ -1523,6 +1523,39 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
         co_return kota::outcome_error(std::move(result.error()));
     }
     LOG_PERF("request", "kind={} file={} wait_ms={} total_ms={}", kind, path, wait_ms, timer.ms());
+    co_return std::move(result.value());
+}
+
+kota::task<std::vector<feature::DocumentLink>, kota::ipc::Error>
+    Compiler::forward_document_links(std::shared_ptr<Session> session) {
+    auto path_id = session->path_id;
+    auto path = std::string(workspace.path_pool.resolve(path_id));
+    auto gen = session->generation;
+
+    ScopedTimer timer;
+    if(!co_await ensure_compiled(session)) {
+        co_return std::vector<feature::DocumentLink>{};
+    }
+    if(session->generation != gen) {
+        co_return std::vector<feature::DocumentLink>{};
+    }
+    auto wait_ms = timer.ms();
+
+    auto result = co_await pool.send_stateful(path_id, worker::DocumentLinkParams{path});
+    if(!result.has_value()) {
+        if(!worker::is_operational_error(result.error())) {
+            LOG_ANOMALY(WorkerRequestFail,
+                        "documentLink failed for {}: {}",
+                        path,
+                        result.error().message);
+        }
+        co_return kota::outcome_error(std::move(result.error()));
+    }
+    LOG_PERF("request",
+             "kind=DocumentLink file={} wait_ms={} total_ms={}",
+             path,
+             wait_ms,
+             timer.ms());
     co_return std::move(result.value());
 }
 

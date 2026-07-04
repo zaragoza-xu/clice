@@ -6,9 +6,11 @@
 #include <utility>
 #include <vector>
 
+#include "feature/document_link.h"
 #include "syntax/token.h"
 
 #include "kota/codec/json/json.h"
+#include "kota/ipc/lsp/protocol.h"
 #include "kota/ipc/protocol.h"
 
 namespace clice::worker {
@@ -46,7 +48,6 @@ enum class QueryKind : uint8_t {
     InlayHints,
     FoldingRange,
     DocumentSymbol,
-    DocumentLink,
     CodeAction,
 };
 
@@ -146,13 +147,22 @@ struct BuildResult {
     std::string output_path;  ///< PCH or PCM path
     std::vector<std::string> deps;
     std::string tu_index_data;
-    std::string pch_links_json;
+    /// Include directives of the PCH preamble. Structured so the master can
+    /// serve both document links and go-to-definition on preamble lines.
+    std::vector<clice::feature::DocumentLink> preamble_links;
 
     /// Inactive regions within the preamble region (flat offset pairs)
     /// and the conditional stack still open at the bound.
     std::vector<std::uint32_t> inactive_regions;
-    std::vector<std::uint8_t> open_conditionals;  ///< Pre-serialized DocumentLink[] from PCH
-    kota::codec::RawValue result_json;            ///< Completion/SignatureHelp result
+    std::vector<std::uint8_t> open_conditionals;
+    kota::codec::RawValue result_json;  ///< Completion/SignatureHelp result
+};
+
+/// Request the document links of an open file's AST. Only the main-file
+/// region is covered: the preamble is compiled into the PCH, and its links
+/// travel in BuildResult::preamble_links.
+struct DocumentLinkParams {
+    std::string path;
 };
 
 struct DocumentUpdateParams {
@@ -182,6 +192,12 @@ template <>
 struct RequestTraits<clice::worker::QueryParams> {
     using Result = kota::codec::RawValue;
     constexpr inline static std::string_view method = "clice/worker/query";
+};
+
+template <>
+struct RequestTraits<clice::worker::DocumentLinkParams> {
+    using Result = std::vector<clice::feature::DocumentLink>;
+    constexpr inline static std::string_view method = "clice/worker/documentLink";
 };
 
 template <>

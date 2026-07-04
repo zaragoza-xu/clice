@@ -10,6 +10,7 @@
 
 #include "command/command.h"
 #include "command/toolchain.h"
+#include "feature/document_link.h"
 #include "index/merged_index.h"
 #include "index/project_index.h"
 #include "semantic/relation_kind.h"
@@ -29,7 +30,7 @@ namespace clice {
 
 /// On-disk cache layout version (CacheStore root `cache/v{N}`).
 /// Bump to discard all cached artifacts after incompatible format changes.
-constexpr inline std::uint32_t cache_format_version = 2;
+constexpr inline std::uint32_t cache_format_version = 3;
 
 /// Two-layer staleness snapshot for compilation artifacts (PCH, AST, etc.).
 ///
@@ -104,7 +105,9 @@ struct PCHState {
     std::string path;
     std::uint32_t bound = 0;
     DepsSnapshot deps;
-    std::string document_links_json;  ///< Pre-serialized DocumentLink[] from PCH build
+    /// Include directives of the preamble, used for document links and
+    /// go-to-definition on preamble include lines.
+    std::vector<feature::DocumentLink> preamble_links;
 
     /// Inactive regions within the preamble (flat offset pairs) and the
     /// conditional stack still open at the bound — a #if cut by the bound

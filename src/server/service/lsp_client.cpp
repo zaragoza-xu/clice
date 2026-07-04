@@ -380,36 +380,36 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         co_return co_await srv.compiler.forward_query(worker::QueryKind::DocumentSymbol, session);
     });
 
-    peer.on_request([this](RequestContext& ctx,
-                           const protocol::DocumentLinkParams& params) -> RawResult {
-        auto& srv = this->server;
-        auto path = uri_to_path(params.text_document.uri);
-        auto path_id = srv.workspace.path_pool.intern(path);
-        auto session = srv.find_session(path_id);
-        if(!session)
-            co_return kota::outcome_error(document_not_open());
-        auto result = co_await srv.compiler.forward_query(worker::QueryKind::DocumentLink, session);
-        if(!result.has_value())
-            co_return kota::outcome_error(std::move(result.error()));
-        auto& links = result.value();
-        if(session->pch_ref) {
-            auto& pch_cache = srv.workspace.pch_cache;
-            auto pch_it = pch_cache.find(session->pch_ref->key);
-            // size() > 2 skips both "" and an empty "[]": splicing an empty
-            // array into a non-empty one would leave a trailing comma.
-            if(pch_it != pch_cache.end() && pch_it->second.document_links_json.size() > 2) {
-                auto& pch_json = pch_it->second.document_links_json;
-                if(!links.data.empty() && links.data != "null" && links.data.size() > 2) {
-                    links.data.pop_back();
-                    links.data += ',';
-                    links.data.append(pch_json.begin() + 1, pch_json.end());
-                } else {
-                    links.data = pch_json;
+    peer.on_request(
+        [this](RequestContext& ctx, const protocol::DocumentLinkParams& params) -> RawResult {
+            auto& srv = this->server;
+            auto path = uri_to_path(params.text_document.uri);
+            auto path_id = srv.workspace.path_pool.intern(path);
+            auto session = srv.find_session(path_id);
+            if(!session)
+                co_return kota::outcome_error(document_not_open());
+            auto result = co_await srv.compiler.forward_document_links(session);
+            if(!result.has_value())
+                co_return kota::outcome_error(std::move(result.error()));
+
+            // The preamble is compiled into the PCH, so the worker's AST only
+            // covers the rest of the file — merge the preamble's links in front.
+            std::vector<protocol::DocumentLink> links;
+            auto append = [&](const feature::DocumentLink& link) {
+                protocol::DocumentLink out{.range = link.range};
+                out.target = link.target;
+                links.push_back(std::move(out));
+            };
+            // Skipped while dirty: a failed or superseded compile leaves
+            // the cached links describing the pre-edit preamble.
+            if(!session->ast_dirty) {
+                if(auto* pch_links = srv.find_preamble_links(*session)) {
+                    std::ranges::for_each(*pch_links, append);
                 }
             }
-        }
-        co_return std::move(links);
-    });
+            std::ranges::for_each(result.value(), append);
+            co_return to_raw(links);
+        });
 
     peer.on_request(
         [this](RequestContext& ctx, const protocol::CodeActionParams& params) -> RawResult {
@@ -467,20 +467,54 @@ LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(s
         auto& uri = params.text_document_position_params.text_document.uri;
         auto& pos = params.text_document_position_params.position;
 
-        auto result = query_at(uri, pos, RelationKind::Definition);
-        if(!result.empty()) {
-            co_return to_raw(result);
-        }
-
         auto& srv = this->server;
         auto path = uri_to_path(uri);
         auto path_id = srv.workspace.path_pool.intern(path);
         auto session = srv.find_session(path_id);
+
+        // Preamble include lines first: they have no symbol occurrence in
+        // the index and are invisible to the worker's AST. Dirty sessions
+        // skip this — the cached links may describe the pre-edit preamble —
+        // and retry below once the worker compile refreshed the PCH.
+        if(session && !session->ast_dirty) {
+            if(auto directive = srv.resolve_directive_definition(*session, pos);
+               !directive.empty()) {
+                co_return to_raw(directive);
+            }
+        }
+
+        // Dirty sessions also skip the eager index query: resolve_cursor
+        // would fall back to the stale merged shard and could return a
+        // non-empty hit for pre-edit content, bypassing the compile below.
+        if(!session || !session->ast_dirty) {
+            auto result = query_at(uri, pos, RelationKind::Definition);
+            if(!result.empty()) {
+                co_return to_raw(result);
+            }
+        }
+
         if(!session)
             co_return kota::outcome_error(document_not_open());
-        co_return co_await srv.compiler.forward_query(worker::QueryKind::GoToDefinition,
-                                                      session,
-                                                      pos);
+        auto raw =
+            co_await srv.compiler.forward_query(worker::QueryKind::GoToDefinition, session, pos);
+        if(raw.has_value() && raw.value().data != "[]" && raw.value().data != "null") {
+            co_return std::move(raw.value());
+        }
+
+        // The forward compiled a dirty buffer: retry against the refreshed
+        // session index and preamble links, but only when the compile
+        // actually completed — a failed or superseded compile leaves
+        // ast_dirty set and the caches stale.
+        if(!session->ast_dirty) {
+            if(auto retry = query_at(uri, pos, RelationKind::Definition); !retry.empty()) {
+                co_return to_raw(retry);
+            }
+            if(auto directive = srv.resolve_directive_definition(*session, pos);
+               !directive.empty()) {
+                co_return to_raw(directive);
+            }
+        }
+        co_return std::move(raw);
     });
 
     // The navigation handlers below are index-only: closed documents are

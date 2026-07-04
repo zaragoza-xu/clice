@@ -14,7 +14,7 @@ from lsprotocol.types import (
 )
 
 from tests.integration.utils.assertions import assert_clean_compile, assert_has_errors
-from tests.integration.utils.wait import IDLE_TIMEOUT
+from tests.integration.utils.wait import IDLE_TIMEOUT, wait_for_index
 
 
 @pytest.mark.workspace("modules/single_module_no_deps")
@@ -275,3 +275,59 @@ async def test_circular_module_dependency(client, workspace):
     assert len(diags) == 0, (
         f"Non-cyclic module should compile fine after cycle attempt, got: {diags}"
     )
+
+
+def to_locations(result):
+    if result is None:
+        return []
+    return list(result) if isinstance(result, (list, tuple)) else [result]
+
+
+@pytest.mark.workspace("modules/consumer_imports_module")
+async def test_import_definition(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "Math"), "Index not ready"
+    locs = to_locations(await client.definition_at(uri, 0, 8))
+    assert any(loc.uri.endswith("math.cppm") for loc in locs), locs
+
+    # Cursor on the `import` keyword itself must not navigate to the module.
+    locs = to_locations(await client.definition_at(uri, 0, 2))
+    assert not any(loc.uri.endswith("math.cppm") for loc in locs), locs
+
+
+@pytest.mark.workspace("modules/module_implementation_unit")
+async def test_module_decl_definition(client, workspace):
+    # `module Greeter;` in the implementation unit navigates to the interface.
+    uri, _ = await client.open_and_wait(workspace / "greeter_impl.cpp")
+    assert await wait_for_index(client, uri, "Greeter"), "Index not ready"
+    locs = to_locations(await client.definition_at(uri, 0, 8))
+    assert any(loc.uri.endswith("greeter.cppm") for loc in locs), locs
+
+
+@pytest.mark.workspace("modules/dotted_module_name")
+async def test_dotted_import_definition(client, workspace):
+    # `import my.io;` on line 1 of app.cppm.
+    uri, _ = await client.open_and_wait(workspace / "app.cppm")
+    assert await wait_for_index(client, uri, "my.io"), "Index not ready"
+    locs = to_locations(await client.definition_at(uri, 1, 9))
+    assert any(loc.uri.endswith("io.cppm") for loc in locs), locs
+
+
+@pytest.mark.workspace("modules/module_partitions")
+async def test_partition_import_definition(client, workspace):
+    uri, _ = await client.open_and_wait(workspace / "lib.cppm")
+    assert await wait_for_index(client, uri, "Lib:A"), "Index not ready"
+    # `export import :A;` on line 1; the partition name resolves through
+    # the enclosing module.
+    locs = to_locations(await client.definition_at(uri, 1, 15))
+    assert any(loc.uri.endswith("part_a.cppm") for loc in locs), locs
+
+
+@pytest.mark.workspace("modules/macro_import")
+async def test_macro_import_definition(client, workspace):
+    # `import MATH_MODULE;` where the name comes from a macro: the index
+    # anchors the occurrence at the expansion site.
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+    assert await wait_for_index(client, uri, "Math"), "Index not ready"
+    locs = to_locations(await client.definition_at(uri, 1, 9))
+    assert any(loc.uri.endswith("math.cppm") for loc in locs), locs

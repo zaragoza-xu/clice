@@ -5,6 +5,7 @@
 #include <string>
 
 #include "support/anomaly.h"
+#include "support/filesystem.h"
 #include "support/logging.h"
 
 #include "kota/async/io/system.h"
@@ -344,6 +345,34 @@ bool WorkerPool::process_crash(std::size_t index, bool stateful, int exit_code, 
                     w.name,
                     exit_code,
                     w.restart_count);
+    }
+
+    // Relay the tail of the dead worker's own log into the master log so CI,
+    // which only sees the master's output, still gets the worker's final
+    // assert/error message.  The LLVM crash backtrace itself stays in the
+    // worker log: truncate the relay at the first "CRASH STACK TRACE" or
+    // "Stack dump" marker so the master log carries the diagnosis, not the
+    // (noisy, non-portable) stack frames.
+    if(!log_dir.empty()) {
+        auto log_path = path::join(log_dir, w.name + ".log");
+        if(auto content = fs::read(log_path)) {
+            llvm::StringRef tail(*content);
+            for(llvm::StringRef marker: {"CRASH STACK TRACE", "Stack dump"}) {
+                if(auto pos = tail.find(marker); pos != llvm::StringRef::npos)
+                    tail = tail.substr(0, pos);
+            }
+            tail = tail.rtrim();
+
+            constexpr std::size_t max_tail = 4096;
+            if(tail.size() > max_tail) {
+                tail = tail.take_back(max_tail);
+                if(auto nl = tail.find('\n'); nl != llvm::StringRef::npos) {
+                    tail = tail.drop_front(nl + 1);
+                }
+            }
+            if(!tail.empty())
+                LOG_ERROR("Last output of crashed worker {}:\n{}", w.name, tail);
+        }
     }
 
     WorkerCrashInfo info;

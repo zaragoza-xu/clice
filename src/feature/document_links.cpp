@@ -8,8 +8,8 @@
 namespace clice::feature {
 
 auto document_links(CompilationUnitRef unit, PositionEncoding encoding)
-    -> std::vector<protocol::DocumentLink> {
-    std::vector<protocol::DocumentLink> links;
+    -> std::vector<DocumentLink> {
+    std::vector<DocumentLink> links;
 
     auto interested = unit.interested_file();
     auto directives_it = unit.directives().find(interested);
@@ -32,9 +32,7 @@ auto document_links(CompilationUnitRef unit, PositionEncoding encoding)
         auto protocol_range = to_range(map, *range);
         if(!protocol_range)
             return;
-        protocol::DocumentLink link{.range = *protocol_range};
-        link.target = target.str();
-        links.push_back(std::move(link));
+        links.push_back(DocumentLink{.range = *protocol_range, .target = target.str()});
     };
 
     for(const auto& include: directives.includes) {
@@ -62,6 +60,46 @@ auto document_links(CompilationUnitRef unit, PositionEncoding encoding)
     }
 
     return links;
+}
+
+auto include_definition(CompilationUnitRef unit, std::uint32_t offset)
+    -> std::vector<protocol::Location> {
+    std::vector<protocol::Location> locations;
+
+    auto interested = unit.interested_file();
+    auto directives_it = unit.directives().find(interested);
+    if(directives_it == unit.directives().end()) {
+        return locations;
+    }
+
+    auto content = unit.interested_content();
+    auto* lang_opts = &unit.lang_options();
+
+    auto try_directive = [&](clang::SourceLocation loc, clang::FileID target) {
+        if(!locations.empty() || !target.isValid()) {
+            return;
+        }
+        auto [fid, directive_offset] = unit.decompose_location(loc);
+        if(fid != interested || directive_offset >= content.size()) {
+            return;
+        }
+        auto range = find_directive_argument(content, directive_offset, lang_opts);
+        if(!range || !range->contains(offset)) {
+            return;
+        }
+        locations.push_back(protocol::Location{
+            .uri = to_uri(unit.file_path(target)),
+            .range = protocol::Range{},
+        });
+    };
+
+    for(const auto& include: directives_it->second.includes) {
+        try_directive(include.location, include.fid);
+    }
+    for(const auto& has_include: directives_it->second.has_includes) {
+        try_directive(has_include.location, has_include.fid);
+    }
+    return locations;
 }
 
 }  // namespace clice::feature

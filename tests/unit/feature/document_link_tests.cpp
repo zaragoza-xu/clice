@@ -14,7 +14,7 @@ namespace protocol = kota::ipc::protocol;
 
 TEST_SUITE(document_link, Tester) {
 
-std::vector<protocol::DocumentLink> links;
+std::vector<feature::DocumentLink> links;
 
 void run(llvm::StringRef source, llvm::StringRef standard = "-std=c++17") {
     add_files("main.cpp", source);
@@ -36,9 +36,8 @@ void EXPECT_LINK(std::size_t index, llvm::StringRef name, llvm::StringRef path) 
 
     ASSERT_EQ(actual.begin, expected.begin);
     ASSERT_EQ(actual.end, expected.end);
-    ASSERT_TRUE(link.target.has_value());
 
-    llvm::SmallString<128> target(link.target->begin(), link.target->end());
+    llvm::SmallString<128> target(link.target.begin(), link.target.end());
     path::remove_dots(target);
     ASSERT_EQ(target, path);
 }
@@ -137,6 +136,26 @@ ABCDE
 
     ASSERT_EQ(links.size(), 1U);
     EXPECT_LINK(0, "0", TestVFS::path("data.bin"));
+}
+
+TEST_CASE(IncludeDefinition) {
+    add_file("test.h", "#pragma once\n");
+    add_main("main.cpp", R"(
+#include @arg["test.h"]
+$(inside)
+int x = 0;
+)");
+    ASSERT_TRUE(compile());
+
+    // Inside the include argument: the included file's location.
+    auto arg = range("arg", "main.cpp");
+    auto locations = feature::include_definition(*unit, arg.begin + 1);
+    ASSERT_EQ(locations.size(), 1u);
+    EXPECT_NE(locations[0].uri.find("test.h"), std::string::npos);
+    EXPECT_EQ(locations[0].range.start.line, 0u);
+
+    // Outside any include argument: empty.
+    EXPECT_TRUE(feature::include_definition(*unit, point("inside")).empty());
 }
 
 };  // TEST_SUITE(document_link)

@@ -95,13 +95,11 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params) {
         errors = collect_errors(unit);
 
     std::string tu_index_data;
-    std::string pch_links_json;
+    std::vector<feature::DocumentLink> preamble_links;
     feature::InactiveScan inactive;
     if(success) {
         tu_index_data = serialize_tu_index(unit);
-        auto links = feature::document_links(unit);
-        auto raw = to_raw(links);
-        pch_links_json = std::move(raw.data);
+        preamble_links = feature::document_links(unit);
         inactive = feature::inactive_regions(unit, {}, 0, params.preamble_bound);
     }
 
@@ -115,7 +113,7 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params) {
         result.output_path = tmp_path;
         result.deps = pch_info.deps;
         result.tu_index_data = std::move(tu_index_data);
-        result.pch_links_json = std::move(pch_links_json);
+        result.preamble_links = std::move(preamble_links);
         result.inactive_regions = std::move(inactive.regions);
         result.open_conditionals = std::move(inactive.open_stack);
         return result;

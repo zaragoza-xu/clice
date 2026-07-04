@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "compile/compilation.h"
+#include "server/protocol/worker.h"
 #include "support/timer.h"
 
 #include "kota/codec/json/json.h"

@@ -200,8 +200,9 @@ void LSPClient::register_document_sync() {
         session = srv.open_session(path_id);
         srv.sessions.apply_open(*session, params.text_document.text, params.text_document.version);
 
-        // Restore a context choice persisted from an earlier session.
-        srv.contexts.restore_saved_context(*session);
+        // A context choice persisted from an earlier session stays
+        // authoritative only if it still holds.
+        srv.contexts.validate_saved_context(*session);
 
         srv.dispatch(FileEvent::buffer_opened(path_id));
 

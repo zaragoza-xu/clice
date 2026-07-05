@@ -1,6 +1,12 @@
+#include <filesystem>
+
+#include "schema_generated.h"
+#include "test/temp_dir.h"
 #include "test/test.h"
 #include "test/tester.h"
 #include "index/merged_index.h"
+
+#include "llvm/Support/raw_ostream.h"
 
 namespace clice::testing {
 
@@ -54,7 +60,7 @@ TEST_CASE(Serialization) {
     auto& graph = tu_index.graph;
     for(auto& [fid, index]: tu_index.file_indices) {
         llvm::StringRef path = graph.paths[graph.path_id(fid)];
-        merged_indices[path].merge(0, graph.include_location_id(fid), index, {});
+        merged_indices[path].merge("tu0", graph.include_location_id(fid), index, {});
     }
 
     for(auto& [path, merged]: merged_indices) {
@@ -77,7 +83,7 @@ TEST_CASE(LookupByOffset) {
     // Merge the main file index into a MergedIndex.
     index::MergedIndex merged;
     auto fid = unit->interested_file();
-    merged.merge(0, tu_index.graph.include_location_id(fid), tu_index.main_file_index, {});
+    merged.merge("tu0", tu_index.graph.include_location_id(fid), tu_index.main_file_index, {});
 
     // Lookup at the reference offset should find an occurrence.
     auto ref_offset = point("ref");
@@ -99,7 +105,7 @@ TEST_CASE(LookupBySymbolAndKind) {
 
     index::MergedIndex merged;
     auto fid = unit->interested_file();
-    merged.merge(0, tu_index.graph.include_location_id(fid), tu_index.main_file_index, {});
+    merged.merge("tu0", tu_index.graph.include_location_id(fid), tu_index.main_file_index, {});
 
     // Find the target_func symbol hash via occurrence lookup.
     auto target_offset = point("target");
@@ -148,10 +154,10 @@ TEST_CASE(MultipleMergesDedup) {
     // Merge header indices from both TUs into same MergedIndex.
     index::MergedIndex merged_header;
     for(auto& [fid, file_index]: tu_a.file_indices) {
-        merged_header.merge(0, tu_a.graph.include_location_id(fid), file_index, {});
+        merged_header.merge("tu0", tu_a.graph.include_location_id(fid), file_index, {});
     }
     for(auto& [fid, file_index]: tu_b.file_indices) {
-        merged_header.merge(1, tu_b.graph.include_location_id(fid), file_index, {});
+        merged_header.merge("tu1", tu_b.graph.include_location_id(fid), file_index, {});
     }
 
     // Serialize and deserialize to verify dedup survives round-trip.
@@ -173,7 +179,7 @@ TEST_CASE(SerializationRoundTripInMemory) {
     index::MergedIndex merged;
     auto fid = unit->interested_file();
     auto include_id = tu_index.graph.include_location_id(fid);
-    merged.merge(0, include_id, tu_index.main_file_index, {});
+    merged.merge("tu0", include_id, tu_index.main_file_index, {});
 
     // Serialize.
     llvm::SmallString<4096> buf;
@@ -208,8 +214,7 @@ TEST_CASE(RemoveCompilationContext) {
     // Merge as a compilation context (using the build_at overload).
     index::MergedIndex merged;
     auto fid = unit->interested_file();
-    std::vector<index::IncludeLocation> locations;
-    merged.merge(0, tu_index.built_at, std::move(locations), tu_index.main_file_index, {});
+    merged.merge("tu0", tu_index.built_at, {}, tu_index.main_file_index, {});
 
     // Verify occurrence lookup works before remove.
     bool found_before = false;
@@ -224,7 +229,7 @@ TEST_CASE(RemoveCompilationContext) {
     ASSERT_TRUE(found_before);
 
     // Remove the compilation context.
-    merged.remove(0);
+    merged.remove("tu0");
 
     // Serialize and verify the removed data round-trips.
     llvm::SmallString<4096> buf;
@@ -249,11 +254,11 @@ TEST_CASE(RemoveHeaderContext) {
     // Merge header index as header context.
     index::MergedIndex merged_header;
     for(auto& [fid, file_index]: tu_index.file_indices) {
-        merged_header.merge(0, tu_index.graph.include_location_id(fid), file_index, {});
+        merged_header.merge("tu0", tu_index.graph.include_location_id(fid), file_index, {});
     }
 
     // Remove should not crash.
-    merged_header.remove(0);
+    merged_header.remove("tu0");
 
     // Serialize after remove should work.
     llvm::SmallString<4096> buf;
@@ -261,27 +266,157 @@ TEST_CASE(RemoveHeaderContext) {
     merged_header.serialize(os);
 }
 
-TEST_CASE(RemovedBitmapRoundTrip) {
+TEST_CASE(RemergeReplacesContribution) {
+    add_file("header.h", R"(
+            #pragma once
+            inline int shared() { return 1; }
+        )");
+    add_main("main.cpp", R"(
+            #include "header.h"
+            int use() { return shared(); }
+        )");
+    ASSERT_TRUE(compile());
+    tu_index = index::TUIndex::build(*unit);
+
+    auto header_fid = unit->file_id("header.h");
+    auto& header_idx = tu_index.file_indices[header_fid];
+    auto include_id = tu_index.graph.include_location_id(header_fid);
+
+    // The symbol defined in the header: its Definition relation exists only
+    // in the header's file index, not in main's (which only references it).
+    index::SymbolHash defined{};
+    for(auto& [symbol, relations]: header_idx.relations) {
+        for(auto& relation: relations) {
+            if(relation.kind & RelationKind(RelationKind::Definition)) {
+                defined = symbol;
+            }
+        }
+    }
+
+    auto has_definition = [&](index::MergedIndex& merged) {
+        bool found = false;
+        merged.lookup(defined, RelationKind::Definition, [&](const index::Relation&) {
+            found = true;
+            return false;
+        });
+        return found;
+    };
+
+    index::MergedIndex merged;
+    merged.merge("tu0", include_id, header_idx, {});
+    ASSERT_TRUE(has_definition(merged));
+
+    // Identical re-merge (a touch): the contribution is resurrected, not lost.
+    merged.merge("tu0", include_id, header_idx, {});
+    ASSERT_TRUE(has_definition(merged));
+
+    // Re-merge of the same TU with different content: the old contribution
+    // is masked instead of being served alongside the new one.
+    merged.merge("tu0", include_id, tu_index.main_file_index, {});
+    ASSERT_FALSE(has_definition(merged));
+}
+
+TEST_CASE(RemergePreservesOtherTus) {
+    add_file("header.h", R"(
+            #pragma once
+            inline int shared() { return 1; }
+        )");
+    add_main("main.cpp", R"(
+            #include "header.h"
+            int use() { return shared(); }
+        )");
+    ASSERT_TRUE(compile());
+    tu_index = index::TUIndex::build(*unit);
+
+    auto header_fid = unit->file_id("header.h");
+    auto& header_idx = tu_index.file_indices[header_fid];
+    auto include_id = tu_index.graph.include_location_id(header_fid);
+
+    index::SymbolHash defined{};
+    for(auto& [symbol, relations]: header_idx.relations) {
+        for(auto& relation: relations) {
+            if(relation.kind & RelationKind(RelationKind::Definition)) {
+                defined = symbol;
+            }
+        }
+    }
+
+    index::MergedIndex merged;
+    merged.merge("tu0", include_id, header_idx, {});
+    merged.merge("tu1", include_id, header_idx, {});
+
+    // TU 0 moves on, TU 1 still holds the shared canonical contribution.
+    merged.merge("tu0", include_id, tu_index.main_file_index, {});
+
+    bool found = false;
+    merged.lookup(defined, RelationKind::Definition, [&](const index::Relation&) {
+        found = true;
+        return false;
+    });
+    ASSERT_TRUE(found);
+}
+
+TEST_CASE(CompactionDropsMasked) {
     build_index(R"(
-            int foo() { return 42; }
+            int $(target)foo() { return 42; }
         )");
 
-    // Merge as compilation context.
+    // Merge as compilation context, then remove: the rows are masked.
     index::MergedIndex merged;
-    std::vector<index::IncludeLocation> locations;
-    merged.merge(0, tu_index.built_at, std::move(locations), tu_index.main_file_index, {});
+    merged.merge("tu0", tu_index.built_at, {}, tu_index.main_file_index, {});
+    merged.remove("tu0");
 
-    // Remove to populate the removed bitmap.
-    merged.remove(0);
-
-    // Serialize.
     llvm::SmallString<4096> buf;
     llvm::raw_svector_ostream os(buf);
     merged.serialize(os);
 
-    // Deserialize and compare.
+    // Serialized shards are served through buffer-only lookups that never
+    // consult the removed bitmap — masked rows must not reach disk at all.
     auto restored = index::MergedIndex(buf);
-    ASSERT_TRUE(merged == restored);
+    auto offset = point("target");
+    bool found = false;
+    restored.lookup(offset, [&](const index::Occurrence&) {
+        found = true;
+        return false;
+    });
+    ASSERT_FALSE(found);
+}
+
+TEST_CASE(HasContributionTracking) {
+    add_file("header.h", R"(
+            #pragma once
+            inline int shared() { return 1; }
+        )");
+    add_main("main.cpp", R"(
+            #include "header.h"
+            int use() { return shared(); }
+        )");
+    ASSERT_TRUE(compile());
+    tu_index = index::TUIndex::build(*unit);
+
+    auto header_fid = unit->file_id("header.h");
+    auto& header_idx = tu_index.file_indices[header_fid];
+    auto include_id = tu_index.graph.include_location_id(header_fid);
+
+    index::MergedIndex merged;
+    merged.merge("tu0", include_id, header_idx, {});
+    merged.merge("tu1", include_id, header_idx, {});
+
+    ASSERT_TRUE(merged.has_contribution("tu0"));
+    ASSERT_TRUE(merged.has_contribution("tu1"));
+    ASSERT_FALSE(merged.has_contribution("tu2"));
+
+    // The buffer path must answer without deserializing the shard.
+    llvm::SmallString<4096> buf;
+    llvm::raw_svector_ostream os(buf);
+    merged.serialize(os);
+    auto restored = index::MergedIndex(buf);
+    ASSERT_TRUE(restored.has_contribution("tu0"));
+    ASSERT_FALSE(restored.has_contribution("tu2"));
+
+    merged.remove("tu0");
+    ASSERT_FALSE(merged.has_contribution("tu0"));
+    ASSERT_TRUE(merged.has_contribution("tu1"));
 }
 
 TEST_CASE(LookupFiltersRemoved) {
@@ -291,8 +426,7 @@ TEST_CASE(LookupFiltersRemoved) {
 
     // Merge as compilation context.
     index::MergedIndex merged;
-    std::vector<index::IncludeLocation> locations;
-    merged.merge(0, tu_index.built_at, std::move(locations), tu_index.main_file_index, {});
+    merged.merge("tu0", tu_index.built_at, {}, tu_index.main_file_index, {});
 
     // Verify lookup finds something before removal.
     auto offset = point("target");
@@ -305,7 +439,7 @@ TEST_CASE(LookupFiltersRemoved) {
     ASSERT_TRUE(found_before);
 
     // Remove the compilation context.
-    merged.remove(0);
+    merged.remove("tu0");
 
     // Verify lookup finds nothing after removal.
     bool found_after = false;
@@ -325,7 +459,7 @@ TEST_CASE(CacheInvalidatedAfterMerge) {
     // Merge first TU as header context.
     index::MergedIndex merged;
     auto fid = unit->interested_file();
-    merged.merge(0, tu_index.graph.include_location_id(fid), tu_index.main_file_index, {});
+    merged.merge("tu0", tu_index.graph.include_location_id(fid), tu_index.main_file_index, {});
 
     // Trigger cache build by doing a lookup.
     auto first_offset = point("first");
@@ -344,7 +478,7 @@ TEST_CASE(CacheInvalidatedAfterMerge) {
 
     // Merge second TU.
     auto fid2 = unit->interested_file();
-    merged.merge(1, tu_index.graph.include_location_id(fid2), tu_index.main_file_index, {});
+    merged.merge("tu1", tu_index.graph.include_location_id(fid2), tu_index.main_file_index, {});
 
     // Verify lookup finds the new occurrence (cache was invalidated).
     auto second_offset = point("second");
@@ -365,7 +499,7 @@ TEST_CASE(LocalSymbolTable) {
 
     index::MergedIndex merged;
     auto main_path_id = static_cast<std::uint32_t>(tu_index.graph.paths.size() - 1);
-    merged.merge(main_path_id, tu_index.built_at, {}, tu_index.main_file_index, "");
+    merged.merge("tu0", tu_index.built_at, {}, tu_index.main_file_index, "");
 
     // Collect non-External symbols from the TU that appear in the FileIndex.
     index::SymbolTable local_syms;
@@ -407,7 +541,7 @@ TEST_CASE(LocalSymbolSerialization) {
 
     index::MergedIndex merged;
     auto main_path_id = static_cast<std::uint32_t>(tu_index.graph.paths.size() - 1);
-    merged.merge(main_path_id, tu_index.built_at, {}, tu_index.main_file_index, "");
+    merged.merge("tu0", tu_index.built_at, {}, tu_index.main_file_index, "");
 
     index::SymbolTable local_syms;
     for(auto& occ: tu_index.main_file_index.occurrences) {
@@ -433,6 +567,114 @@ TEST_CASE(LocalSymbolSerialization) {
     for(auto& [hash, symbol]: local_syms) {
         ASSERT_TRUE(restored.find_symbol(hash, name, kind));
         ASSERT_EQ(name, symbol.name);
+    }
+}
+
+// The dep is backdated an hour so the merge (build_at = one minute ago)
+// records its baseline hash; a later write bumps the mtime past build_at,
+// so staleness reaches the Layer 2 content-hash check — exactly the branch
+// these tests exercise. A dep newer than build_at gets no baseline at all
+// (its content may postdate the indexed snapshot).
+index::MergedIndex build_ctx_shard(llvm::StringRef dep_path) {
+    namespace stdfs = std::filesystem;
+    stdfs::last_write_time(dep_path.str(),
+                           stdfs::file_time_type::clock::now() - std::chrono::hours(1));
+    auto build_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch() - std::chrono::minutes(1));
+
+    index::MergedIndex merged;
+    index::FileIndex file_idx;
+    index::DepLocation deps[] = {
+        {.path = dep_path, .line = 1}
+    };
+    merged.merge("tu0", build_at, deps, file_idx, "");
+    return merged;
+}
+
+TEST_CASE(TouchNoUpdate) {
+    TempDir dir;
+    auto dep = dir.path("dep.h");
+    dir.touch("dep.h", "int shared = 1;");
+
+    auto merged = build_ctx_shard(dep);
+
+    // Same content, newer mtime — a pure touch must not trigger a reindex.
+    ASSERT_FALSE(merged.need_update());
+
+    // The buffer path (serialized shard) must reach the same conclusion.
+    llvm::SmallString<4096> buf;
+    llvm::raw_svector_ostream os(buf);
+    merged.serialize(os);
+    auto restored = index::MergedIndex(llvm::StringRef(buf.data(), buf.size()));
+    ASSERT_FALSE(restored.need_update());
+}
+
+TEST_CASE(ContentChangeUpdate) {
+    TempDir dir;
+    auto dep = dir.path("dep.h");
+    dir.touch("dep.h", "int shared = 1;");
+
+    auto merged = build_ctx_shard(dep);
+
+    // Real edit: content hash diverges from the stored baseline.
+    dir.touch("dep.h", "int shared = 2;");
+    ASSERT_TRUE(merged.need_update());
+}
+
+TEST_CASE(OldShardDiscarded) {
+    TempDir dir;
+
+    // A current shard round-trips through disk and loads normally.
+    {
+        index::MergedIndex merged;
+        index::FileIndex file_idx;
+        merged.merge("tu0", std::chrono::milliseconds(1), {}, file_idx, "valid-shard");
+        auto path = dir.path("valid.idx");
+        std::error_code ec;
+        llvm::raw_fd_ostream os(path, ec);
+        merged.serialize(os);
+        os.flush();
+        ASSERT_TRUE(index::MergedIndex::load(path).content() == "valid-shard");
+    }
+
+    // A version-less (format_version=0) shard from an older build is silently
+    // discarded — load returns an empty index, as if nothing were on disk.
+    {
+        namespace binary = clice::index::binary;
+        flatbuffers::FlatBufferBuilder builder;
+        auto content = builder.CreateString("stale-shard");
+        auto paths = builder.CreateVector<flatbuffers::Offset<flatbuffers::String>>({});
+        auto cache = builder.CreateVector<flatbuffers::Offset<binary::CacheEntry>>({});
+        auto headers = builder.CreateVector<flatbuffers::Offset<binary::HeaderContextEntry>>({});
+        auto compilations =
+            builder.CreateVector<flatbuffers::Offset<binary::CompilationContextEntry>>({});
+        auto occurrences = builder.CreateVector<flatbuffers::Offset<binary::OccurrenceEntry>>({});
+        auto relations =
+            builder.CreateVector<flatbuffers::Offset<binary::SymbolRelationsEntry>>({});
+        auto root = binary::CreateMergedIndex(builder,
+                                              0,
+                                              paths,
+                                              cache,
+                                              headers,
+                                              compilations,
+                                              occurrences,
+                                              relations,
+                                              0,
+                                              content,
+                                              0,
+                                              0,
+                                              /*format_version=*/0);
+        builder.Finish(root);
+
+        auto path = dir.path("stale.idx");
+        std::error_code ec;
+        llvm::raw_fd_ostream os(path, ec);
+        os.write(reinterpret_cast<const char*>(builder.GetBufferPointer()), builder.GetSize());
+        os.flush();
+
+        auto loaded = index::MergedIndex::load(path);
+        ASSERT_TRUE(loaded.content().empty());
+        ASSERT_TRUE(loaded.need_update());
     }
 }
 

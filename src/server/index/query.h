@@ -195,28 +195,8 @@ private:
     /// Resolve a symbol hash into a SymbolInfo with definition location.
     std::optional<SymbolInfo> resolve_symbol(index::SymbolHash hash);
 
-    /// Translate a project-index path_id to the server path_id for the same
-    /// file, or nullopt if the file is not in the server path pool.
-    std::optional<std::uint32_t> to_server_id(std::uint32_t proj_path_id) const {
-        auto path = workspace.project_index.path_pool.path(proj_path_id);
-        auto it = workspace.path_pool.cache.find(path);
-        if(it == workspace.path_pool.cache.end())
-            return std::nullopt;
-        return it->second;
-    }
-
-    /// Translate a server path_id to the project-index path_id for the same
-    /// file, or nullopt if the file is not in the project-index path pool.
-    std::optional<std::uint32_t> to_proj_id(std::uint32_t server_path_id) const {
-        auto path = workspace.path_pool.resolve(server_path_id);
-        auto it = workspace.project_index.path_pool.find(path);
-        if(it == workspace.project_index.path_pool.cache.end())
-            return std::nullopt;
-        return it->second;
-    }
-
-    /// Check whether a project-level path_id has an active Session.
-    bool is_proj_path_open(std::uint32_t proj_path_id) const;
+    /// Check whether a path_id has an active Session.
+    bool is_path_open(std::uint32_t path_id) const;
 
     Workspace& workspace;
     const SessionStore& sessions;

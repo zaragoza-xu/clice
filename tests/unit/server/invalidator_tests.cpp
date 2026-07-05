@@ -12,7 +12,8 @@ TEST_SUITE(Invalidator) {
 TEST_CASE(EmptyBatchNoEffects) {
     Workspace workspace;
     SessionStore store;
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
 
     auto dirty = invalidator.apply({});
 
@@ -25,7 +26,8 @@ TEST_CASE(NoOpEventsNoEffects) {
     auto file = workspace.path_pool.intern("/proj/a.cpp");
     store.open(file);
 
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
     // Buffer sync stays in SessionStore and context switching in
     // ContextResolver; these events must produce no effects of their own.
     FileEvent events[] = {FileEvent::buffer_opened(file),
@@ -41,19 +43,17 @@ TEST_CASE(SaveResetsTrialOnly) {
     SessionStore store;
     auto saved = workspace.path_pool.intern("/proj/a.h");
     store.open(saved);
-    workspace.header_modes[saved] = HeaderMode::NeedsContext;
-    workspace.header_mode_hashes[saved] = 42;
 
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
     auto dirty = invalidator.apply(FileEvent::buffer_saved(saved));
 
     // The saved file itself is not stale — its buffer was already current —
     // only its self-containment verdict needs re-evaluation.
     ASSERT_EQ(dirty.reset_trial, llvm::SmallVector<std::uint32_t>{saved});
+    ASSERT_EQ(dirty.reset_header_mode, llvm::SmallVector<std::uint32_t>{saved});
     ASSERT_TRUE(dirty.mark_ast_dirty.empty());
     ASSERT_TRUE(dirty.force_revalidate.empty());
-    ASSERT_FALSE(workspace.header_modes.contains(saved));
-    ASSERT_FALSE(workspace.header_mode_hashes.contains(saved));
     ASSERT_TRUE(dirty.recheck_contexts);
     ASSERT_TRUE(dirty.reschedule_indexing);
 }
@@ -78,7 +78,8 @@ TEST_CASE(CascadeSplitsOpenClosed) {
         });
 
     store.open(open_user);
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
 
     auto body = [&]() -> kota::task<> {
         co_await workspace.compile_graph->compile(open_user);
@@ -108,24 +109,88 @@ TEST_CASE(ChainHitAndMiss) {
     auto hit = workspace.path_pool.intern("/proj/hit.h");
     auto miss = workspace.path_pool.intern("/proj/miss.h");
 
-    auto hit_session = store.open(hit);
-    hit_session->header_context.emplace();
-    hit_session->header_context->chain = {saved};
-    workspace.header_modes[hit] = HeaderMode::NeedsContext;
-    workspace.header_mode_hashes[hit] = 7;
+    auto closed = workspace.path_pool.intern("/proj/closed.h");
+    store.open(hit);
+    store.open(miss);
 
-    auto miss_session = store.open(miss);
-    miss_session->header_context.emplace();
-    miss_session->header_context->chain = {other};
-
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    resolver.header_contexts[hit].chain = {saved};
+    resolver.header_contexts[miss].chain = {other};
+    resolver.header_contexts[closed].chain = {saved};
+    Invalidator invalidator(workspace, store, resolver);
     auto dirty = invalidator.apply(FileEvent::buffer_saved(saved));
 
-    // Only the session whose synthesized preamble embeds the saved file
-    // re-validates; the persisted verdict drops so the trial can downgrade.
-    ASSERT_EQ(dirty.force_revalidate, llvm::SmallVector<std::uint32_t>{hit});
-    ASSERT_FALSE(workspace.header_modes.contains(hit));
-    ASSERT_FALSE(workspace.header_mode_hashes.contains(hit));
+    // Every context embedding the saved file re-validates and drops its
+    // verdict; a closed one additionally reindexes in the background — its
+    // shard rows were built under the old chain.
+    llvm::SmallVector<std::uint32_t> revalidated{hit, closed};
+    llvm::sort(revalidated);
+    ASSERT_EQ(dirty.force_revalidate, revalidated);
+    llvm::SmallVector<std::uint32_t> reset{saved, hit, closed};
+    llvm::sort(reset);
+    ASSERT_EQ(dirty.reset_header_mode, reset);
+    ASSERT_EQ(dirty.enqueue_reindex, llvm::SmallVector<std::uint32_t>{closed});
+}
+
+TEST_CASE(SaveMarksDependents) {
+    Workspace workspace;
+    SessionStore store;
+    auto header = workspace.path_pool.intern("/proj/h.h");
+    auto open_tu = workspace.path_pool.intern("/proj/a.cpp");
+    auto closed_tu = workspace.path_pool.intern("/proj/b.cpp");
+    workspace.dep_graph.set_includes(open_tu, 0, {header});
+    workspace.dep_graph.set_includes(closed_tu, 0, {header});
+    workspace.dep_graph.build_reverse_map();
+    store.open(open_tu);
+
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
+    auto dirty = invalidator.apply(FileEvent::buffer_saved(header));
+
+    // Open dependents recompile, closed ones reindex; the old/new dependent
+    // snapshots overlap fully here, so this also proves the dedup.
+    ASSERT_EQ(dirty.mark_ast_dirty, llvm::SmallVector<std::uint32_t>{open_tu});
+    ASSERT_EQ(dirty.enqueue_reindex, llvm::SmallVector<std::uint32_t>{closed_tu});
+}
+
+TEST_CASE(TransitiveDependentsEnqueue) {
+    Workspace workspace;
+    SessionStore store;
+    auto header = workspace.path_pool.intern("/proj/h.h");
+    auto middle = workspace.path_pool.intern("/proj/g.h");
+    auto root = workspace.path_pool.intern("/proj/c.cpp");
+    workspace.dep_graph.set_includes(middle, 0, {header});
+    workspace.dep_graph.set_includes(root, 0, {middle});
+    workspace.dep_graph.build_reverse_map();
+
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
+    auto dirty = invalidator.apply(FileEvent::buffer_saved(header));
+
+    // Only root TUs own index shards; the intermediate header is not one.
+    ASSERT_EQ(dirty.enqueue_reindex, llvm::SmallVector<std::uint32_t>{root});
+    ASSERT_TRUE(dirty.mark_ast_dirty.empty());
+}
+
+TEST_CASE(StaleReverseMapUnion) {
+    Workspace workspace;
+    SessionStore store;
+    auto header = workspace.path_pool.intern("/proj/h.h");
+    auto known = workspace.path_pool.intern("/proj/a.cpp");
+    auto unmapped = workspace.path_pool.intern("/proj/b.cpp");
+    workspace.dep_graph.set_includes(known, 0, {header});
+    workspace.dep_graph.build_reverse_map();
+    // Edge added without rebuilding the reverse map: visible only after the
+    // save's rescan rebuilds it. Both snapshots must contribute.
+    workspace.dep_graph.set_includes(unmapped, 0, {header});
+
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
+    auto dirty = invalidator.apply(FileEvent::buffer_saved(header));
+
+    llvm::SmallVector<std::uint32_t> expected{known, unmapped};
+    llvm::sort(expected);
+    ASSERT_EQ(dirty.enqueue_reindex, expected);
 }
 
 TEST_CASE(CloseEnqueuesReindex) {
@@ -133,7 +198,8 @@ TEST_CASE(CloseEnqueuesReindex) {
     SessionStore store;
     auto closed = workspace.path_pool.intern("/proj/a.cpp");
 
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
     auto dirty = invalidator.apply(FileEvent::buffer_closed(closed));
 
     ASSERT_EQ(dirty.enqueue_reindex, llvm::SmallVector<std::uint32_t>{closed});
@@ -149,7 +215,8 @@ TEST_CASE(CrashMarksLostDirty) {
     store.open(first);
     store.open(second);
 
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
     std::uint32_t lost[] = {first, second};
     auto dirty = invalidator.apply(FileEvent::worker_crashed(lost));
 
@@ -167,7 +234,8 @@ TEST_CASE(BatchSavesDeduplicate) {
     auto saved = workspace.path_pool.intern("/proj/a.h");
     store.open(saved);
 
-    Invalidator invalidator(workspace, store);
+    ContextResolver resolver(workspace);
+    Invalidator invalidator(workspace, store, resolver);
     FileEvent events[] = {FileEvent::buffer_saved(saved), FileEvent::buffer_saved(saved)};
     auto dirty = invalidator.apply(events);
 
@@ -181,49 +249,46 @@ TEST_SUITE(DropOrphanedChoices) {
 TEST_CASE(SurvivingEdgeKeepsChoice) {
     Workspace workspace;
     SessionStore store;
+    ContextResolver resolver(workspace);
     auto host = workspace.path_pool.intern("/proj/host.cpp");
     auto header = workspace.path_pool.intern("/proj/h.h");
     workspace.dep_graph.set_includes(host, 0, {header});
     workspace.dep_graph.build_reverse_map();
 
     auto session = store.open(header);
-    session->active_context = Session::ActiveContext{host, std::nullopt, ""};
-    workspace.saved_contexts[header] = SavedContext{host, std::nullopt, ""};
+    resolver.saved_contexts[header] = SavedContext{host, std::nullopt, ""};
 
-    ContextResolver resolver(workspace);
     ASSERT_FALSE(resolver.drop_orphaned_choices(store));
-    ASSERT_TRUE(session->active_context.has_value());
-    ASSERT_TRUE(workspace.saved_contexts.contains(header));
+    ASSERT_TRUE(resolver.saved_contexts.contains(header));
 }
 
 TEST_CASE(RemovedEdgeDropsChoice) {
     Workspace workspace;
     SessionStore store;
+    ContextResolver resolver(workspace);
     auto host = workspace.path_pool.intern("/proj/host.cpp");
     auto header = workspace.path_pool.intern("/proj/h.h");
     workspace.dep_graph.build_reverse_map();
 
     auto session = store.open(header);
-    session->active_context = Session::ActiveContext{host, std::nullopt, ""};
-    session->header_context.emplace();
     session->trial_done = true;
-    workspace.saved_contexts[header] = SavedContext{host, std::nullopt, ""};
+    resolver.header_contexts[header] = HeaderContext{};
+    resolver.saved_contexts[header] = SavedContext{host, std::nullopt, ""};
     auto generation = session->generation;
 
-    ContextResolver resolver(workspace);
     ASSERT_TRUE(resolver.drop_orphaned_choices(store));
-    ASSERT_FALSE(session->active_context.has_value());
-    ASSERT_FALSE(session->header_context.has_value());
+    ASSERT_FALSE(resolver.header_contexts.contains(header));
     ASSERT_TRUE(session->ast_dirty);
     ASSERT_FALSE(session->trial_done);
     ASSERT_EQ(session->generation, generation + 1);
-    ASSERT_FALSE(workspace.saved_contexts.contains(header));
+    ASSERT_FALSE(resolver.saved_contexts.contains(header));
 }
 
 TEST_CASE(VanishedOccurrenceDropsChoice) {
     TempDir tmp;
     Workspace workspace;
     SessionStore store;
+    ContextResolver resolver(workspace);
     // The host still includes the header, but only once — the pinned
     // occurrence #1 no longer exists.
     tmp.touch("host.cpp", R"(#include "h.h")");
@@ -233,13 +298,11 @@ TEST_CASE(VanishedOccurrenceDropsChoice) {
     workspace.dep_graph.set_includes(host, 0, {header});
     workspace.dep_graph.build_reverse_map();
 
-    auto session = store.open(header);
-    session->active_context = Session::ActiveContext{host, 1, ""};
-    workspace.saved_contexts[header] = SavedContext{host, 1, ""};
+    store.open(header);
+    resolver.saved_contexts[header] = SavedContext{host, 1, ""};
 
-    ContextResolver resolver(workspace);
     ASSERT_TRUE(resolver.drop_orphaned_choices(store));
-    ASSERT_FALSE(session->active_context.has_value());
+    ASSERT_FALSE(resolver.saved_contexts.contains(header));
 }
 
 };  // TEST_SUITE(DropOrphanedChoices)

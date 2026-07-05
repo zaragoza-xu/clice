@@ -1,90 +1,51 @@
 #pragma once
 
-#include <algorithm>
 #include <cstdint>
-#include <vector>
+#include <optional>
 
 #include "index/tu_index.h"
+#include "support/path_pool.h"
 
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/Support/Allocator.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace clice::index {
 
-struct PathPool {
-    llvm::BumpPtrAllocator allocator;
-
-    std::vector<llvm::StringRef> paths;
-
-    llvm::DenseMap<llvm::StringRef, std::uint32_t> cache;
-
-    llvm::StringRef save(llvm::StringRef s) {
-        auto data = allocator.Allocate<char>(s.size() + 1);
-        std::ranges::copy(s, data);
-        data[s.size()] = '\0';
-        return llvm::StringRef(data, s.size());
-    }
-
-    auto path_id(llvm::StringRef path) {
-        assert(!path.empty());
-
-        // Normalize backslashes to forward slashes so that paths from different
-        // sources (URI decoding, CDB, clang FileManager) compare equal on
-        // Windows where native separators are backslashes.
-        llvm::SmallString<256> normalized;
-        if(path.contains('\\')) {
-            normalized = path;
-            std::replace(normalized.begin(), normalized.end(), '\\', '/');
-            path = normalized;
-        }
-
-        auto [it, success] = cache.try_emplace(path, paths.size());
-        if(!success) {
-            return it->second;
-        }
-
-        auto& [k, v] = *it;
-        k = save(path);
-        paths.emplace_back(k);
-        return it->second;
-    }
-
-    llvm::StringRef path(std::uint32_t id) {
-        return paths[id];
-    }
-
-    /// Look up a path in the cache, normalizing backslashes first.
-    /// Returns cache.end() if the path is not interned.
-    auto find(llvm::StringRef path) {
-        llvm::SmallString<256> normalized;
-        if(path.contains('\\')) {
-            normalized = path;
-            std::replace(normalized.begin(), normalized.end(), '\\', '/');
-            path = normalized;
-        }
-        return cache.find(path);
-    }
-};
-
-struct FileInfo {
-    std::int64_t mtime;
-};
-
+/// Project-wide symbol table accumulated from background indexing.
+///
+/// There is a single path-id space at runtime: the server-wide
+/// clice::PathPool. Symbol reference bitmaps carry those ids directly, so
+/// queries never translate between pools. Runtime ids are per-session and
+/// never persist — serialization remaps every referenced id into a compact
+/// self-contained path table (which is also the garbage collection: paths no
+/// longer referenced by any symbol or shard are simply not written), and
+/// loading interns the table back into the running pool.
 struct ProjectIndex {
-    PathPool path_pool;
-
-    llvm::DenseMap<std::uint32_t, std::uint32_t> indices;
-
     SymbolTable symbols;
 
-    llvm::SmallVector<std::uint32_t> merge(this ProjectIndex& self, TUIndex& index);
+    /// Merge a TU's external symbols, interning the TU's paths into `pool`.
+    /// Returns the TU-local id → pool id mapping for the TU's path graph.
+    llvm::SmallVector<std::uint32_t> merge(this ProjectIndex& self,
+                                           TUIndex& index,
+                                           clice::PathPool& pool);
 
-    void serialize(this ProjectIndex& self, llvm::raw_ostream& os);
+    /// Serialize with a compact path table covering exactly the ids used by
+    /// the symbol bitmaps plus `shards`, the pool ids of the files owning a
+    /// MergedIndex shard blob (persisted so the loader knows what to fetch).
+    void serialize(this const ProjectIndex& self,
+                   llvm::raw_ostream& os,
+                   const clice::PathPool& pool,
+                   llvm::ArrayRef<std::uint32_t> shards);
 
-    static ProjectIndex from(const void* data);
+    /// Restore from a serialized blob, interning its path table into `pool`
+    /// and filling `shards` with the pool ids of the files whose shard blobs
+    /// the loader should fetch. Returns nullopt for an unreadable or
+    /// old-format blob — the caller treats that as "no index on disk" and
+    /// rebuilds in the background.
+    static std::optional<ProjectIndex> from(const void* data,
+                                            std::size_t size,
+                                            clice::PathPool& pool,
+                                            llvm::SmallVectorImpl<std::uint32_t>& shards);
 };
 
 }  // namespace clice::index

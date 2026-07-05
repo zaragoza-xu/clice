@@ -17,10 +17,12 @@
 #include "support/timer.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 
 namespace clice {
 
@@ -30,8 +32,9 @@ void BackgroundIndexer::merge(const void* tu_index_data, std::size_t size) {
         LOG_WARN("Ignoring TUIndex with empty path graph");
         return;
     }
-    auto file_ids_map = workspace.project_index.merge(tu_index);
+    auto file_ids_map = workspace.project_index.merge(tu_index, workspace.path_pool);
     auto main_tu_path_id = static_cast<std::uint32_t>(tu_index.graph.paths.size() - 1);
+    llvm::StringRef main_tu_path = tu_index.graph.paths[main_tu_path_id];
 
     // Collect non-External symbols referenced in a FileIndex.  Each file's
     // MergedIndex shard stores exactly the local symbols its occurrences
@@ -47,31 +50,39 @@ void BackgroundIndexer::merge(const void* tu_index_data, std::size_t size) {
         return result;
     };
 
+    // Only shards that actually receive this TU's new contribution count as
+    // touched; a file still in the include graph but with an empty FileIndex
+    // must be swept below like a dropped one.
+    llvm::DenseSet<std::uint32_t> touched;
+
     auto merge_file_index = [&](std::uint32_t tu_path_id, index::FileIndex& file_idx) {
         auto global_path_id = file_ids_map[tu_path_id];
         auto& shard = workspace.merged_indices[global_path_id];
 
         if(tu_path_id == main_tu_path_id) {
-            std::vector<index::IncludeLocation> include_locs;
+            llvm::SmallVector<index::DepLocation> deps;
+            deps.reserve(tu_index.graph.locations.size() + 1);
+            // The TU's own content is a dependency of its shard too: without
+            // it, a closed TU edited on disk with unchanged includes would
+            // never look stale.
+            deps.push_back({main_tu_path, 0, 0});
             for(auto& loc: tu_index.graph.locations) {
-                index::IncludeLocation remapped = loc;
-                remapped.path_id = file_ids_map[loc.path_id];
-                include_locs.push_back(remapped);
+                deps.push_back({tu_index.graph.paths[loc.path_id], loc.line, loc.include});
             }
-            auto file_path = workspace.project_index.path_pool.path(global_path_id);
-            llvm::StringRef file_content;
-            std::string file_content_storage;
+            auto file_path = workspace.path_pool.resolve(global_path_id);
             auto buf = llvm::MemoryBuffer::getFile(file_path);
-            if(buf) {
-                file_content_storage = (*buf)->getBuffer().str();
-                file_content = file_content_storage;
+            if(!buf) {
+                // Overwriting the shard's stored content with nothing would
+                // silently break every position mapping for this TU; keep the
+                // old snapshot, the staleness check re-enqueues it later.
+                LOG_WARN("Skip merge for {}: cannot read content: {}",
+                         file_path,
+                         buf.getError().message());
+                return;
             }
-            shard.merge(global_path_id,
-                        tu_index.built_at,
-                        std::move(include_locs),
-                        file_idx,
-                        file_content);
+            shard.merge(main_tu_path, tu_index.built_at, deps, file_idx, (*buf)->getBuffer());
             shard.merge_symbols(collect_local_symbols(file_idx));
+            touched.insert(global_path_id);
         } else {
             std::optional<std::uint32_t> include_id;
             for(std::uint32_t i = 0; i < tu_index.graph.locations.size(); ++i) {
@@ -84,7 +95,7 @@ void BackgroundIndexer::merge(const void* tu_index_data, std::size_t size) {
                 LOG_WARN("Skip merge for path {}: include location not found", global_path_id);
                 return;
             }
-            auto header_path = workspace.project_index.path_pool.path(global_path_id);
+            auto header_path = workspace.path_pool.resolve(global_path_id);
             llvm::StringRef header_content;
             std::string header_content_storage;
             auto header_buf = llvm::MemoryBuffer::getFile(header_path);
@@ -92,8 +103,11 @@ void BackgroundIndexer::merge(const void* tu_index_data, std::size_t size) {
                 header_content_storage = (*header_buf)->getBuffer().str();
                 header_content = header_content_storage;
             }
-            shard.merge(global_path_id, *include_id, file_idx, header_content);
+            // Keyed by the including TU so a reindex of that TU replaces its
+            // prior contribution to this header's shard.
+            shard.merge(main_tu_path, *include_id, file_idx, header_content);
             shard.merge_symbols(collect_local_symbols(file_idx));
+            touched.insert(global_path_id);
         }
     };
 
@@ -101,6 +115,20 @@ void BackgroundIndexer::merge(const void* tu_index_data, std::size_t size) {
         merge_file_index(tu_path_id, file_idx);
     }
     merge_file_index(main_tu_path_id, tu_index.main_file_index);
+
+    // A file dropped from this TU (a removed transitive include, or one
+    // whose contribution became empty) is no longer merged above, but its
+    // shard may still hold this TU's previous contribution — sweep it, or
+    // references under the dropped include keep being served as if the edge
+    // still existed.
+    for(auto& [path_id, shard]: workspace.merged_indices) {
+        if(touched.contains(path_id)) {
+            continue;
+        }
+        if(shard.has_contribution(main_tu_path)) {
+            shard.remove(main_tu_path);
+        }
+    }
 
     auto external_count = std::ranges::count_if(tu_index.symbols, [](auto& kv) {
         return kv.second.scope == index::SymbolScope::External;
@@ -110,6 +138,12 @@ void BackgroundIndexer::merge(const void* tu_index_data, std::size_t size) {
              tu_index.symbols.size(),
              external_count,
              workspace.merged_indices.size());
+}
+
+/// Stable blob key for a file's shard: runtime pool ids are per-session,
+/// so blobs are named by a hash of the path instead.
+static std::string shard_key(llvm::StringRef path) {
+    return std::format("{:016x}", llvm::xxh3_64bits(path));
 }
 
 /// Begin a two-phase store write and serialize the blob to its tmp path.
@@ -151,8 +185,17 @@ kota::task<> BackgroundIndexer::save() {
     // are done.  Shards are only published together with the ProjectIndex
     // they were built against: pairing new shards with an old project blob
     // (or vice versa) would serve a mixed snapshot after restart.
+    // The project blob doubles as the shard manifest: it lists every file
+    // owning a shard so the loader knows exactly which blobs to fetch (and
+    // sweeps the rest).
+    llvm::SmallVector<std::uint32_t> shard_ids;
+    shard_ids.reserve(workspace.merged_indices.size());
+    for(auto& [path_id, shard]: workspace.merged_indices) {
+        shard_ids.push_back(path_id);
+    }
+
     auto project_pending = serialize_blob(store, "project", [&](llvm::raw_ostream& os) {
-        workspace.project_index.serialize(os);
+        workspace.project_index.serialize(os, workspace.path_pool, shard_ids);
     });
     if(!project_pending) {
         LOG_WARN("Skipping index save: ProjectIndex serialization failed");
@@ -166,7 +209,7 @@ kota::task<> BackgroundIndexer::save() {
         if(!shard.need_rewrite())
             continue;
         if(auto pending = serialize_blob(store,
-                                         std::to_string(path_id),
+                                         shard_key(workspace.path_pool.resolve(path_id)),
                                          [&](llvm::raw_ostream& os) { shard.serialize(os); })) {
             shards.push_back(std::move(*pending));
         }
@@ -210,6 +253,7 @@ void BackgroundIndexer::load() {
     ScopedTimer timer;
 
     bool has_project = false;
+    llvm::StringSet<> expected_keys;
     auto project_path = workspace.store->lookup("index", "project");
     if(project_path) {
         auto buf = llvm::MemoryBuffer::getFile(*project_path);
@@ -219,28 +263,50 @@ void BackgroundIndexer::load() {
             LOG_WARN("Failed to read ProjectIndex blob: {}", buf.getError().message());
             return;
         }
-        workspace.project_index = index::ProjectIndex::from((*buf)->getBufferStart());
-        has_project = true;
-        LOG_INFO("Loaded ProjectIndex: {} symbols", workspace.project_index.symbols.size());
+        // An unreadable or old-format blob loads as "no index on disk":
+        // everything is swept and rebuilt once in the background.
+        llvm::SmallVector<std::uint32_t> manifest;
+        auto loaded = index::ProjectIndex::from((*buf)->getBufferStart(),
+                                                (*buf)->getBufferSize(),
+                                                workspace.path_pool,
+                                                manifest);
+        if(loaded) {
+            workspace.project_index = std::move(*loaded);
+            has_project = true;
+            LOG_INFO("Loaded ProjectIndex: {} symbols", workspace.project_index.symbols.size());
+
+            // The manifest names every shard blob; fetch exactly those. A
+            // blob the loader rejects (corruption, old format) counts as
+            // missing: enqueue the file so the background round rebuilds it
+            // — for headers no CDB entry would ever re-enqueue it otherwise.
+            for(auto path_id: manifest) {
+                auto key = shard_key(workspace.path_pool.resolve(path_id));
+                auto shard_path = workspace.store->lookup("index", key);
+                auto shard =
+                    shard_path ? index::MergedIndex::load(*shard_path) : index::MergedIndex();
+                if(shard.loaded()) {
+                    workspace.merged_indices[path_id] = std::move(shard);
+                    expected_keys.insert(key);
+                } else {
+                    LOG_INFO("Discarding unreadable shard for {}",
+                             workspace.path_pool.resolve(path_id));
+                    enqueue(path_id);
+                }
+            }
+        } else {
+            LOG_INFO("Discarding old-format ProjectIndex blob");
+        }
     }
 
-    // Load shards; sweep blobs that no longer correspond to anything —
-    // unparseable keys, or all shards when the project index itself is
-    // gone (Persistent namespace cleanup is the caller's mark-and-sweep).
+    // Sweep every blob the manifest does not name (or all of them when the
+    // project index itself is gone or outdated — Persistent namespace
+    // cleanup is the caller's mark-and-sweep).
     llvm::SmallVector<std::string> orphans;
     workspace.store->for_each_key("index", [&](llvm::StringRef key) {
-        if(key == "project")
+        if(key == "project" && has_project)
             return;
-
-        std::uint32_t path_id = 0;
-        if(key.getAsInteger(10, path_id) || !has_project) {
+        if(!expected_keys.contains(key)) {
             orphans.push_back(key.str());
-            return;
-        }
-
-        auto shard_path = workspace.store->lookup("index", key);
-        if(shard_path) {
-            workspace.merged_indices[path_id] = index::MergedIndex::load(*shard_path);
         }
     });
 
@@ -259,19 +325,11 @@ void BackgroundIndexer::load() {
 }
 
 bool BackgroundIndexer::need_update(llvm::StringRef file_path) {
-    auto cache_it = workspace.project_index.path_pool.find(file_path);
-    if(cache_it == workspace.project_index.path_pool.cache.end())
-        return true;
-
-    auto merged_it = workspace.merged_indices.find(cache_it->second);
+    auto merged_it = workspace.merged_indices.find(workspace.path_pool.intern(file_path));
     if(merged_it == workspace.merged_indices.end())
         return true;
 
-    llvm::SmallVector<llvm::StringRef> path_mapping;
-    for(auto& p: workspace.project_index.path_pool.paths) {
-        path_mapping.push_back(p);
-    }
-    return merged_it->second.need_update(path_mapping);
+    return merged_it->second.need_update();
 }
 
 void BackgroundIndexer::enqueue(std::uint32_t server_path_id) {

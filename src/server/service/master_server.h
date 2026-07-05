@@ -5,8 +5,12 @@
 #include <vector>
 
 #include "server/compiler/compiler.h"
-#include "server/compiler/indexer.h"
-#include "server/service/session.h"
+#include "server/context/context_resolver.h"
+#include "server/feature/feature_router.h"
+#include "server/index/background_indexer.h"
+#include "server/index/query.h"
+#include "server/session/session.h"
+#include "server/session/session_store.h"
 #include "server/worker/worker_pool.h"
 #include "server/workspace/config.h"
 #include "server/workspace/workspace.h"
@@ -67,14 +71,12 @@ enum class ServerLifecycle : std::uint8_t {
 };
 
 /// Core server state — owns the two-layer state model (Workspace + Sessions),
-/// the worker pool, compilation engine, and indexer.
+/// the worker pool, compilation engine, index query, and background indexer.
 ///
 /// Does NOT own any transport or peer.  Protocol-specific handler registration
-/// is done by LSPClient and AgentClient, which access private members directly.
+/// is done by LSPClient and AgentClient, which drive the server through its
+/// public members; the composition itself lives entirely here.
 class MasterServer {
-    friend class LSPClient;
-    friend class AgentClient;
-
 public:
     MasterServer(kota::event_loop& loop, std::string self_path);
     ~MasterServer();
@@ -89,16 +91,6 @@ public:
     std::shared_ptr<Session> open_session(std::uint32_t path_id);
     void close_session(std::uint32_t path_id, kota::ipc::JsonPeer& peer);
 
-    /// The preamble include links of a session's active PCH, or nullptr.
-    const std::vector<feature::DocumentLink>* find_preamble_links(const Session& session);
-
-    /// Resolve go-to-definition on a preamble include line that the worker
-    /// AST cannot see: the include is compiled into the PCH, so the target
-    /// is answered from the PCH's cached preamble links. Module names go
-    /// through the ordinary index pipeline, not this path.
-    std::vector<protocol::Location>
-        resolve_directive_definition(Session& session, const protocol::Position& position);
-
     void on_file_saved(std::uint32_t path_id);
 
     void schedule_shutdown();
@@ -107,8 +99,46 @@ public:
         return shutdown_event;
     }
 
+    /// The table of open documents and the buffer-sync logic. Public so
+    /// transports and features can reach open sessions directly (e.g.
+    /// sessions.find(path_id)); MasterServer's open/close methods layer the
+    /// non-map orchestration (pool eviction, diagnostics, indexing) on top.
+    SessionStore sessions;
+
+    /// The composed services that make up the server, declared (and thus
+    /// constructed) in dependency order. Transports and features drive the
+    /// server through these directly; the wiring between them lives in wire().
+    kota::event_loop& loop;
+    Workspace workspace;
+    WorkerPool pool;
+    ContextResolver contexts;
+    Compiler compiler;
+    IndexQuery index_query;
+    BackgroundIndexer background_indexer;
+    FeatureRouter features;
+
+    /// Lifecycle state, advanced by the LSP initialize/shutdown handlers.
+    ServerLifecycle lifecycle = ServerLifecycle::Uninitialized;
+
+    /// Initialization parameters captured from the LSP initialize request (or
+    /// serve-mode options), consumed when loading the workspace and publishing
+    /// config diagnostics.
+    std::string workspace_root;
+    std::string init_options_json;
+    /// Problems found while loading clice.toml during initialize(), kept so
+    /// LSPClient can publish them as diagnostics on the config file's URI.
+    std::vector<ConfigIssue> config_issues;
+    /// Path of the config file that was found (empty when none).
+    std::string config_path;
+
 private:
-    kota::event shutdown_event;
+    /// The server's wiring diagram: every domain→domain callback hook
+    /// (pool crash/eviction, indexing scheduling, ...) is assigned here
+    /// and nowhere else, so the composition root shows all cross-component
+    /// plumbing in one place. domain→transport communication does not go
+    /// through here — it uses Signal members that transports subscribe to.
+    void wire();
+
     void load_workspace();
 
     /// Open the CacheStore under cache_dir and register the blob
@@ -119,29 +149,14 @@ private:
     /// times survive crashes (the store itself is passive by design).
     kota::task<> cache_checkpoint_task();
 
-    kota::event_loop& loop;
+    kota::event shutdown_event;
 
     /// Server-owned background tasks (cache checkpoint); cancelled and
     /// joined in shutdown_and_cleanup().
     kota::task_group<> bg_tasks;
 
-    Workspace workspace;
-    llvm::DenseMap<std::uint32_t, std::shared_ptr<Session>> sessions;
-    WorkerPool pool;
-    Compiler compiler;
-    Indexer indexer;
-
-    ServerLifecycle lifecycle = ServerLifecycle::Uninitialized;
     std::string self_path;
-    std::string workspace_root;
     std::string session_log_dir;
-    std::string init_options_json;
-
-    /// Problems found while loading clice.toml during initialize(), kept so
-    /// LSPClient can publish them as diagnostics on the config file's URI.
-    std::vector<ConfigIssue> config_issues;
-    /// Path of the config file that was found (empty when none).
-    std::string config_path;
 };
 
 int run_serve_mode(const ServerOptions& opts, const char* self_path);

@@ -11,7 +11,11 @@ from lsprotocol.types import (
 )
 
 from tests.integration.utils import write_cdb
-from tests.integration.utils.wait import MTIME_GRANULARITY
+from tests.integration.utils.wait import (
+    MTIME_GRANULARITY,
+    reference_uris,
+    wait_for_reference,
+)
 
 HEADER_V1 = """\
 #define TARGET alpha
@@ -28,19 +32,6 @@ inline int beta() { return 2; }
 """
 
 CLOSED_TU = '#include "header.h"\nint use_target() { return TARGET(); }\n'
-
-
-async def reference_uris(client, uri, line, character):
-    refs = await client.references_at(uri, line, character, include_declaration=False)
-    return [ref.uri for ref in (refs or [])]
-
-
-async def wait_for_reference(client, uri, line, character, expected_uri, timeout=30):
-    for _ in range(timeout):
-        if expected_uri in await reference_uris(client, uri, line, character):
-            return True
-        await asyncio.sleep(1)
-    return False
 
 
 async def test_header_save_reindexes_dependents(client, tmp_path):
@@ -80,5 +71,36 @@ async def test_header_save_reindexes_dependents(client, tmp_path):
     # references beta, and the stale alpha reference is gone.
     assert await wait_for_reference(client, header_uri, 2, 11, closed_uri), (
         "closed TU was not reindexed after the header save"
+    )
+    assert closed_uri not in await reference_uris(client, header_uri, 1, 11)
+
+
+async def test_divergent_save_follows_disk(client, tmp_path):
+    (tmp_path / "header.h").write_text(HEADER_V1, newline="\n")
+    (tmp_path / "closed.cpp").write_text(CLOSED_TU, newline="\n")
+    write_cdb(tmp_path, ["closed.cpp"])
+    await client.initialize(tmp_path)
+
+    header_uri = (tmp_path / "header.h").as_uri()
+    closed_uri = (tmp_path / "closed.cpp").as_uri()
+    await client.open_and_wait(tmp_path / "header.h")
+
+    assert await wait_for_reference(client, header_uri, 1, 11, closed_uri), (
+        "initial index never produced the closed TU's alpha reference"
+    )
+
+    # A save hook rewrote the file as the save landed: the disk holds V2
+    # while the buffer still holds V1 and no didChange is ever sent.
+    # (alpha/beta keep their positions across versions, so buffer-resolved
+    # lookups on the open header stay valid.)
+    await asyncio.sleep(MTIME_GRANULARITY)
+    (tmp_path / "header.h").write_text(HEADER_V2, newline="\n")
+    client.text_document_did_save(
+        DidSaveTextDocumentParams(text_document=TextDocumentIdentifier(uri=header_uri))
+    )
+
+    # Dependents must follow the disk truth, not the pre-save state.
+    assert await wait_for_reference(client, header_uri, 2, 11, closed_uri), (
+        "closed TU was not reindexed against the hook-rewritten disk"
     )
     assert closed_uri not in await reference_uris(client, header_uri, 1, 11)

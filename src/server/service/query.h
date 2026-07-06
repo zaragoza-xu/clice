@@ -9,7 +9,7 @@
 #include "semantic/relation_kind.h"
 #include "semantic/symbol_kind.h"
 #include "server/protocol/agentic.h"
-#include "server/workspace/workspace.h"
+#include "server/state/workspace.h"
 
 #include "kota/ipc/lsp/position.h"
 #include "kota/ipc/lsp/protocol.h"
@@ -56,7 +56,7 @@ struct ResolvedSymbol {
 ///
 /// NOT responsible for:
 ///   - Compilation — handled by Compiler
-///   - Background indexing — handled by BackgroundIndexer
+///   - Background indexing — handled by Indexer
 ///   - Document lifecycle — handled by MasterServer
 class IndexQuery {
 public:

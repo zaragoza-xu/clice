@@ -41,28 +41,40 @@ static kota::ipc::Error document_not_open() {
     return kota::ipc::Error{kota::ipc::protocol::ErrorCode::InvalidParams, "Document not open"};
 }
 
+/// True once the server has begun shutting down; document-sync
+/// notifications arriving past this point are dropped.
+static bool past_shutdown(ServerLifecycle lifecycle) {
+    return lifecycle == ServerLifecycle::ShuttingDown || lifecycle == ServerLifecycle::Exited;
+}
+
 LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(server), peer(peer) {
     output_conn = server.compiler.on_output.connect(
         [this](const std::shared_ptr<Session>& session) { push_output(*session); });
     progress_conn =
         server.indexer.on_progress_changed.connect([this]() { report_index_progress(); });
 
-    // The notify hook is process-wide and forwards anomaly/guidance messages
-    // as window/logMessage notifications. It captures the peer, so it must
-    // live exactly as long as this LSPClient (cleared in the destructor).
-    // TODO: materialize these messages into server state and deliver them
-    // through a typed signal instead of a process-wide hook.
-    logging::set_notify_hook([&peer](logging::NotifyLevel level, std::string_view message) {
-        peer.send_notification(protocol::LogMessageParams{
-            static_cast<protocol::MessageType>(level),
-            std::string(message),
-        });
-    });
+    // Guidance/anomaly messages travel as window/logMessage, which the LSP
+    // spec allows before the initialize handshake — drain what a headless
+    // server accumulated, then drain again on every wake-up.
+    forward_notify_messages();
+    notify_conn = server.on_notify.connect([this]() { forward_notify_messages(); });
 
     register_lifecycle();
     register_document_sync();
     register_language_features();
     register_extensions();
+}
+
+void LSPClient::forward_notify_messages() {
+    auto first_seq = server.notify_seq - server.notify_log.size();
+    for(auto seq = std::max(notify_cursor, first_seq); seq < server.notify_seq; ++seq) {
+        auto& message = server.notify_log[static_cast<std::size_t>(seq - first_seq)];
+        peer.send_notification(protocol::LogMessageParams{
+            static_cast<protocol::MessageType>(message.level),
+            message.text,
+        });
+    }
+    notify_cursor = server.notify_seq;
 }
 
 LSPClient::ResolvedDoc LSPClient::resolve_uri(const std::string& uri) {
@@ -103,11 +115,6 @@ void LSPClient::register_lifecycle() {
             .open_close = true,
             .change = protocol::TextDocumentSyncKind::Incremental,
             .save = protocol::variant<protocol::boolean, protocol::SaveOptions>{true},
-        };
-        caps.workspace = protocol::WorkspaceOptions{};
-        caps.workspace->workspace_folders = protocol::WorkspaceFoldersServerCapabilities{
-            .supported = true,
-            .change_notifications = true,
         };
 
         caps.hover_provider = true;
@@ -173,8 +180,34 @@ void LSPClient::register_lifecycle() {
     });
 
     peer.on_notification([this]([[maybe_unused]] const protocol::InitializedParams& params) {
-        this->server.initialize();
+        auto& srv = this->server;
+        // A server pre-initialized from the command line (serve
+        // --workspace) rejects the LSP initialize request but the client
+        // still completes its handshake; re-running initialize() here
+        // would spawn a second worker pool.
+        if(srv.lifecycle == ServerLifecycle::Initialized) {
+            srv.initialize();
+        }
+
+        this->client_ready = true;
         this->publish_config_diagnostics();
+
+        // Replay compile outputs that materialized while no ready client
+        // was attached (documents opened and compiled before the
+        // handshake, or while the server ran headless). Only outputs that
+        // still describe the current buffer are replayed: an edit during
+        // the handshake marks the session dirty, and pushing the pre-edit
+        // output would pair stale inactive regions (whose notification
+        // carries no version) with the new text — the next compile pushes
+        // fresh results instead.
+        srv.sessions.for_each(
+            [this]([[maybe_unused]] std::uint32_t path_id, const Session& session) {
+                if(session.output.has_value() && !session.ast_dirty &&
+                   session.output->version == session.version) {
+                    this->push_output(session);
+                }
+                return true;
+            });
     });
 
     peer.on_request(
@@ -194,10 +227,21 @@ void LSPClient::register_lifecycle() {
 void LSPClient::register_document_sync() {
     peer.on_notification([this](const protocol::DidOpenTextDocumentParams& params) {
         auto& srv = this->server;
-        if(srv.lifecycle != ServerLifecycle::Ready)
+        if(past_shutdown(srv.lifecycle))
             return;
 
         auto [path, path_id, session] = resolve_uri(params.text_document.uri);
+
+        // A didOpen racing ahead of the initialize handshake is a client
+        // protocol violation, but sessions are plain state with no worker
+        // dependency — accept the buffer so the session is in place once
+        // the server is ready. A compile attempted before then degrades to
+        // an operational worker-unavailable error and leaves the session
+        // dirty, so the first post-ready request recompiles it.
+        if(srv.lifecycle != ServerLifecycle::Ready) {
+            LOG_WARN("didOpen before the server is ready, accepting: {}", path);
+        }
+
         session = srv.open_session(path_id);
         srv.sessions.apply_open(*session, params.text_document.text, params.text_document.version);
 
@@ -212,12 +256,23 @@ void LSPClient::register_document_sync() {
 
     peer.on_notification([this](const protocol::DidChangeTextDocumentParams& params) {
         auto& srv = this->server;
-        if(srv.lifecycle != ServerLifecycle::Ready)
+        if(past_shutdown(srv.lifecycle))
             return;
 
         auto [path, path_id, session] = resolve_uri(params.text_document.uri);
-        if(!session)
+        if(!session) {
+            // Dropping is the only safe move: without the didOpen baseline
+            // there is no buffer to fold the edits into.
+            LOG_ERROR("didChange for a document with no open session, dropping: {}", path);
             return;
+        }
+
+        if(params.text_document.version <= session->version) {
+            LOG_WARN("didChange version did not increase for {}: {} -> {}",
+                     path,
+                     session->version,
+                     params.text_document.version);
+        }
 
         srv.sessions.apply_change(*session, params.content_changes, params.text_document.version);
 
@@ -231,15 +286,24 @@ void LSPClient::register_document_sync() {
 
     peer.on_notification([this](const protocol::DidCloseTextDocumentParams& params) {
         auto& srv = this->server;
-        if(srv.lifecycle != ServerLifecycle::Ready)
+        if(past_shutdown(srv.lifecycle))
             return;
 
+        // Accepted before the server is ready for the same reason didOpen
+        // is: a session opened during the handshake window must not stay
+        // open forever when the editor already closed it. The diagnostics
+        // clear is suppressed until the handshake completes — nothing was
+        // pushed, and publishDiagnostics may not flow yet.
         auto [path, path_id, session] = resolve_uri(params.text_document.uri);
-        srv.close_session(path_id, this->peer);
+        srv.close_session(path_id, client_ready ? &this->peer : nullptr);
     });
 
     peer.on_notification([this](const protocol::DidSaveTextDocumentParams& params) {
         auto& srv = this->server;
+        // Unlike didOpen/didChange, a save arriving before the server is
+        // ready needs no special handling: BufferSaved only invalidates
+        // derived state, none of which exists yet — the workspace load at
+        // ready reads the saved disk content anyway.
         if(srv.lifecycle != ServerLifecycle::Ready)
             return;
 
@@ -572,6 +636,12 @@ void LSPClient::publish_config_diagnostics() {
 }
 
 void LSPClient::push_output(const Session& session) {
+    // Held back until the handshake completes (the LSP spec forbids
+    // publishDiagnostics before the initialize response); the output stays
+    // materialized on the session and the initialized handler replays it.
+    if(!client_ready) {
+        return;
+    }
     if(!session.output.has_value()) {
         return;
     }
@@ -607,6 +677,12 @@ void LSPClient::report_index_progress() {
         case Stage::Begin: {
             st.round_active = true;
             st.total = static_cast<std::uint32_t>(p.total);
+            // Progress-token creation is a server→client request, forbidden
+            // until the initialize response; a round that begins before the
+            // handshake stays unannounced (the next round announces).
+            if(!client_ready) {
+                break;
+            }
             // Register a fresh work-done token; once the client acknowledges
             // it, announce the round. This is the create()+begin() handshake
             // the indexer used to run inline, now driven from the transport so
@@ -626,11 +702,19 @@ void LSPClient::report_index_progress() {
             // Captureless lambda with the state as a parameter: parameters
             // are copied into the coroutine frame, while captures would live
             // in the closure temporary that dies with this statement.
-            // TODO: an in-flight create() still races connection teardown —
-            // the reporter references the peer while awaiting. This matches
-            // the pre-refactor risk (the reporter captured the peer inside
-            // the indexer coroutine); a real fix needs a cancellation handle
-            // tied to the peer's lifetime.
+            //
+            // Connection teardown mid-handshake needs no cancellation
+            // handle. The only suspension point touching the peer is
+            // create()'s send_request, and the peer fails every pending
+            // outgoing request before its run() returns — that resumption
+            // reads only the request's shared completion state, never the
+            // peer. Both composition sites destroy the LSPClient before the
+            // peer, so once the peer can be gone `abandoned` is already
+            // set and the continuation below drops the token without
+            // another peer access. The timeout path does reach back into
+            // peer internals, but it can only fire while the peer is alive:
+            // teardown completes the wait through the failure path first,
+            // which also stops the timeout timer.
             server.loop.schedule([](std::shared_ptr<IndexProgressState> state) -> kota::task<> {
                 // Timeout prevents the handshake from hanging when the client
                 // never responds.
@@ -672,7 +756,6 @@ void LSPClient::report_index_progress() {
 }
 
 LSPClient::~LSPClient() {
-    logging::set_notify_hook(nullptr);
     // A progress handshake may still be awaiting the client; it holds this
     // state alive and checks the flag before touching the peer.
     index_progress->abandoned = true;

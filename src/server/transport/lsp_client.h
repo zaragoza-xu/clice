@@ -47,7 +47,9 @@ private:
 
     /// Push a session's materialized compile output (diagnostics and
     /// inactive regions) to the client. Invoked by the compiler's
-    /// on_output signal.
+    /// on_output signal, and by the initialized handler to replay outputs
+    /// that materialized before the client was ready. No-op until
+    /// client_ready.
     void push_output(const Session& session);
 
     /// React to a background-indexing progress change: drive the LSP
@@ -56,14 +58,35 @@ private:
     /// background indexer's on_progress_changed signal.
     void report_index_progress();
 
+    /// Send every not-yet-forwarded notify-log message as
+    /// window/logMessage, advancing notify_cursor. Invoked once from the
+    /// constructor (a headless server may have accumulated messages) and
+    /// then by the server's on_notify signal.
+    void forward_notify_messages();
+
     MasterServer& server;
     kota::ipc::JsonPeer& peer;
+
+    /// The client completed the initialized handshake. Until then the LSP
+    /// spec forbids server→client traffic other than window/* messages, so
+    /// diagnostics pushes and progress-token creation are held back;
+    /// compile outputs missed in that window are replayed by the
+    /// initialized handler from the sessions' materialized output state.
+    bool client_ready = false;
 
     /// Subscription to compile outputs; disconnects on destruction.
     Signal<std::shared_ptr<Session>>::Connection output_conn;
 
     /// Subscription to background-index progress; disconnects on destruction.
     Signal<>::Connection progress_conn;
+
+    /// Subscription to guidance/anomaly message wake-ups; disconnects on
+    /// destruction.
+    Signal<>::Connection notify_conn;
+
+    /// Sequence number of the next notify-log message to forward (see
+    /// MasterServer::notify_seq).
+    std::uint64_t notify_cursor = 0;
 
     /// Progress-token lifecycle, split into orthogonal facts so the
     /// asynchronous create() handshake can reconcile against rounds that

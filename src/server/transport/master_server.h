@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,6 +17,8 @@
 #include "server/state/session_store.h"
 #include "server/state/workspace.h"
 #include "server/worker/worker_pool.h"
+#include "support/anomaly.h"
+#include "support/signal.h"
 
 #include "kota/async/async.h"
 #include "kota/deco/deco.h"
@@ -74,6 +77,14 @@ enum class ServerLifecycle : std::uint8_t {
     Exited,
 };
 
+/// A guidance or anomaly message materialized for transport delivery.
+/// The log file is the durable record; this copy exists so a client that
+/// attaches after the message fired can still be shown it.
+struct NotifyMessage {
+    logging::NotifyLevel level;
+    std::string text;
+};
+
 /// Core server state — owns the two-layer state model (Workspace + Sessions),
 /// the worker pool, compilation engine, index query, and background indexer.
 ///
@@ -92,7 +103,11 @@ public:
 
     std::shared_ptr<Session> find_session(std::uint32_t path_id);
     std::shared_ptr<Session> open_session(std::uint32_t path_id);
-    void close_session(std::uint32_t path_id, kota::ipc::JsonPeer& peer);
+
+    /// Close the session and clear its published diagnostics on `peer`.
+    /// Pass null when no handshake-complete client is attached: nothing was
+    /// ever pushed, so there is nothing to clear.
+    void close_session(std::uint32_t path_id, kota::ipc::JsonPeer* peer);
 
     /// The single entry point for file events: fold the batch through the
     /// Invalidator, then execute the resulting effects against the mutable
@@ -129,6 +144,23 @@ public:
     /// workspace-less sessions); its polling loops run in bg_tasks, and the
     /// clice/internal/poll test hook drives ticks directly.
     std::unique_ptr<FileTracker> tracker;
+
+    /// Wakes subscribers after a new message landed in notify_log. Pure
+    /// wake-up per the Signal contract: subscribers keep a sequence cursor
+    /// and read the messages from the log, so a late subscriber (or a
+    /// missed signal) simply catches up on its next drain. The constructor
+    /// owns the process-wide logging notify hook for the server's lifetime
+    /// and forwards every report here; transports subscribe instead of
+    /// touching the hook themselves.
+    Signal<> on_notify;
+
+    /// Recent guidance/anomaly messages (window/logMessage material),
+    /// bounded by dropping the oldest. notify_seq numbers the next message,
+    /// so notify_seq - notify_log.size() is the oldest retained sequence; a
+    /// subscriber lagging further behind than the retention window loses
+    /// the evicted messages (the log file keeps the durable record).
+    std::deque<NotifyMessage> notify_log;
+    std::uint64_t notify_seq = 0;
 
     /// Lifecycle state, advanced by the LSP initialize/shutdown handlers.
     ServerLifecycle lifecycle = ServerLifecycle::Uninitialized;

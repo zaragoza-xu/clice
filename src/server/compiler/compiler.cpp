@@ -283,9 +283,31 @@ std::string uri_to_path(const std::string& uri) {
     return uri;
 }
 
+/// The pch_ref write license: a round may (re)write the session's PCH
+/// reference only while BOTH staleness tokens still hold their takeoff
+/// values. A supersede bumps generation; a Lost-type invalidation (disk or
+/// CDB change behind an in-flight round) bumps only dirty_epoch — either
+/// way the round's resolved directory/arguments may describe a command
+/// that no longer exists, and writing its PCH key back would hand later
+/// incomplete-preamble edits a stale-flag PCH.
+static bool may_write_pch_ref(const Session& session,
+                              std::uint64_t launch_generation,
+                              std::uint64_t launch_epoch) {
+    return session.generation == launch_generation && session.dirty_epoch == launch_epoch;
+}
+
 kota::task<bool> Compiler::ensure_pch(Session& session,
+                                      std::uint64_t launch_generation,
+                                      std::uint64_t launch_epoch,
                                       const std::string& directory,
                                       const std::vector<std::string>& arguments) {
+    // A round invalidated during the caller's earlier awaits (module
+    // dependencies) must not touch pch_ref at all: the reset and cache-hit
+    // branches below write it before the first suspension point.
+    if(!may_write_pch_ref(session, launch_generation, launch_epoch)) {
+        co_return false;
+    }
+
     auto path_id = session.path_id;
     auto path = workspace.path_pool.resolve(path_id);
     auto& text = session.text;
@@ -364,6 +386,12 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
     if(auto it = workspace.pch_cache.find(pch_key);
        it != workspace.pch_cache.end() && it->second.building) {
         co_await it->second.building->wait();
+        // Guard the pch_ref write below against an invalidated round's
+        // continuation: a newer round (or a context switch) may have
+        // established the session's PCH identity while we waited.
+        if(!may_write_pch_ref(session, launch_generation, launch_epoch)) {
+            co_return false;
+        }
         if(auto it2 = workspace.pch_cache.find(pch_key);
            it2 != workspace.pch_cache.end() && !it2->second.path.empty()) {
             session.pch_ref = Session::PCHRef{pch_key, it2->second.bound};
@@ -430,12 +458,17 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
     st.inactive_regions = std::move(result.value().inactive_regions);
     st.open_conditionals = std::move(result.value().open_conditionals);
 
-    session.pch_ref = Session::PCHRef{pch_key, bound};
-
     LOG_INFO("PCH built for {}: {}", path, st.path);
 
     // Persist cache metadata after successful build.
     workspace.save_cache(contexts);
+
+    // The cache entry above is content-keyed and correct regardless; only
+    // the session pointer must not be written by an invalidated round.
+    if(!may_write_pch_ref(session, launch_generation, launch_epoch)) {
+        co_return false;
+    }
+    session.pch_ref = Session::PCHRef{pch_key, bound};
 
     co_return true;
 }
@@ -444,6 +477,8 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
 /// Shared preparation step used by both ensure_compiled() (stateful path)
 /// and forward_stateless() (completion/signatureHelp path).
 kota::task<bool> Compiler::ensure_deps(Session& session,
+                                       std::uint64_t launch_generation,
+                                       std::uint64_t launch_epoch,
                                        const std::string& directory,
                                        const std::vector<std::string>& arguments,
                                        std::pair<std::string, uint32_t>& pch,
@@ -540,7 +575,8 @@ kota::task<bool> Compiler::ensure_deps(Session& session,
     }
 
     // Build or reuse PCH.
-    auto pch_ok = co_await ensure_pch(session, directory, arguments);
+    auto pch_ok =
+        co_await ensure_pch(session, launch_generation, launch_epoch, directory, arguments);
     if(pch_ok && session.pch_ref.has_value()) {
         if(auto pch_it = workspace.pch_cache.find(session.pch_ref->key);
            pch_it != workspace.pch_cache.end()) {
@@ -589,6 +625,11 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
     auto pc = session->compiling;
     auto pid = session->path_id;
     auto gen = session->generation;
+    // Takeoff snapshot for the conditional dirty-flag clear on landing
+    // (see Session::settle_compile). The generation checks below answer
+    // "is the buffer still the same buffer"; this answers "did the world
+    // get dirty again while we were flying".
+    auto epoch = session->dirty_epoch;
 
     auto finish_compile = [&]() {
         if(session->compiling == pc) {
@@ -628,7 +669,17 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
         }
         contexts.append_suffix_include(*session, params.text);
 
+        // Whether this round is the self-containment probe: a header
+        // deliberately compiled without its includer prefix to see if it
+        // stands alone. Decided here, where resolve_command chose to omit
+        // the prefix; the landing gates what the probe may write.
+        bool trial_round = attempt == 0 && !session->trial_done && header_context &&
+                           header_context->preamble_path.empty() &&
+                           contexts.header_mode(file_path, pid) == HeaderMode::Unknown;
+
         bool deps_ok = co_await ensure_deps(*session,
+                                            gen,
+                                            epoch,
                                             params.directory,
                                             params.arguments,
                                             params.pch,
@@ -700,6 +751,18 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
             co_return;
         }
 
+        // A probe invalidated mid-flight is discarded whole: its verdict is
+        // a conditional write like the dirty flag (dispatch reset trial_done
+        // and the header mode for the recompile to re-earn), and its
+        // diagnostics come from a compile deliberately run without includer
+        // context — they are never published, including on this path.
+        // ast_dirty is still set, so the next request re-runs the trial.
+        if(trial_round && session->dirty_epoch != epoch) {
+            LOG_INFO("Discarding invalidated self-containment probe for {}", uri_str);
+            finish_compile();
+            co_return;
+        }
+
         // Self-containment trial verdict. Scored once per settled input
         // state: trial_done is reset whenever compile inputs change for
         // reasons other than buffer edits, so a dependency change re-runs
@@ -707,10 +770,7 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
         // persisted — SelfContained is recorded in memory alone (dependency
         // changes erase it) so queryContext can dedup identical-flag hosts
         // once the verdict is actually earned, never on a guess.
-        auto* trial_context = contexts.header_context(pid);
-        if(attempt == 0 && !session->trial_done && trial_context &&
-           trial_context->preamble_path.empty() &&
-           contexts.header_mode(file_path, pid) == HeaderMode::Unknown) {
+        if(trial_round) {
             std::vector<protocol::Diagnostic> diagnostics;
             if(!result.value().diagnostics.empty()) {
                 [[maybe_unused]] auto status =
@@ -729,7 +789,11 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
             }
         }
 
-        session->ast_dirty = false;
+        // Conditional write: if an invalidation landed mid-flight (a header
+        // was saved, the document was evicted, ...) this product describes
+        // a stale world — record it, publish it (bounded staleness), but do
+        // not declare it fresh; the next request recompiles.
+        session->settle_compile(epoch);
         pc->succeeded = true;
         record_deps(*session, result.value().deps);
 
@@ -802,10 +866,14 @@ kota::task<bool> Compiler::ensure_compiled(std::shared_ptr<Session> session) {
         if(!is_stale(*session)) {
             co_return true;
         }
-        // Dependency change, not a buffer edit: re-run the trial too.
-        session->ast_dirty = true;
-        session->trial_done = false;
-        contexts.forget_self_contained(path_id);
+        // A dependency changed on disk behind this session's back — the
+        // lazy twin of the file tracker's DiskChanged. Route it through
+        // the event pipeline (synchronous) so both share one cascade; for
+        // an open file that dispatch marks the AST dirty, resets the trial
+        // and bumps dirty_epoch. The dispatch re-resolves the session by
+        // path_id; no suspension separates it from this frame, so it finds
+        // the same open session this coroutine holds.
+        on_stale(path_id);
     }
 
     // If an up-to-date compile is already in flight, wait for it.
@@ -947,6 +1015,11 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
     auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
     auto gen = session->generation;
+    // Takeoff snapshot for the pch_ref write license (see
+    // may_write_pch_ref): this request runs concurrently with compiles and
+    // holds no compiling token, so it is the easiest continuation to come
+    // back stale after a disk/CDB change.
+    auto epoch = session->dirty_epoch;
 
     worker::BuildParams wp;
     wp.priority = worker::Priority::High;
@@ -958,7 +1031,7 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
     contexts.append_suffix_include(*session, wp.text);
 
     ScopedTimer timer;
-    if(!co_await ensure_deps(*session, wp.directory, wp.arguments, wp.pch, wp.pcms)) {
+    if(!co_await ensure_deps(*session, gen, epoch, wp.directory, wp.arguments, wp.pch, wp.pcms)) {
         LOG_WARN("forward_build: dependency preparation failed for {}", path);
         co_return kota::outcome_error(kota::ipc::Error{"Dependency preparation failed"});
     }

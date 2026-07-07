@@ -23,6 +23,12 @@
 
 namespace clice {
 
+namespace testing {
+
+struct CompilerFixture;
+
+}
+
 namespace protocol = kota::ipc::protocol;
 
 class ContextResolver;
@@ -98,15 +104,34 @@ public:
     /// Callback invoked when indexing should be scheduled.
     std::function<void()> on_indexing_needed;
 
+    /// Invoked from ensure_compiled's fast path when the pull-side
+    /// staleness check finds a dependency changed on disk. The owner routes
+    /// it into the event pipeline as a DiskChanged (synchronously), so lazy
+    /// detection and the file tracker's polling share one invalidation
+    /// cascade instead of maintaining two.
+    std::function<void(std::uint32_t path_id)> on_stale;
+
     /// Cancel in-flight compile tasks and wait for them to finish.
     kota::task<> stop();
 
 private:
     kota::task<> run_compile(std::shared_ptr<Session> session);
 
+    /// @param launch_generation, launch_epoch  The caller's staleness-token
+    ///               snapshots from the moment its round took off, NOT ones
+    ///               taken on entry: a round invalidated during the
+    ///               dependency phase would otherwise re-snapshot the new
+    ///               values here and slip a stale pch_ref past the write
+    ///               guards. Both tokens are needed — a supersede bumps
+    ///               generation, but a Lost-type invalidation (disk or CDB
+    ///               change behind an in-flight round) bumps only
+    ///               dirty_epoch, and a round that resolved its command
+    ///               before the event must not write pch_ref back either.
     /// @param scope  When set, cancels the module-dependency wait if this
     ///               compile round is superseded by a newer one.
     kota::task<bool> ensure_deps(Session& session,
+                                 std::uint64_t launch_generation,
+                                 std::uint64_t launch_epoch,
                                  const std::string& directory,
                                  const std::vector<std::string>& arguments,
                                  std::pair<std::string, uint32_t>& pch,
@@ -114,6 +139,8 @@ private:
                                  std::optional<kota::cancellation_token> scope = {});
 
     kota::task<bool> ensure_pch(Session& session,
+                                std::uint64_t launch_generation,
+                                std::uint64_t launch_epoch,
                                 const std::string& directory,
                                 const std::vector<std::string>& arguments);
 
@@ -125,6 +152,8 @@ private:
     ContextResolver& contexts;
     WorkerPool& pool;
     kota::task_group<> compile_tasks{loop};
+
+    friend struct testing::CompilerFixture;
 };
 
 }  // namespace clice

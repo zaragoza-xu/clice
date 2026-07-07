@@ -288,9 +288,12 @@ void Indexer::load() {
                     workspace.merged_indices[path_id] = std::move(shard);
                     expected_keys.insert(key);
                 } else {
+                    // No shard survives, so there is nothing stale to keep
+                    // serving; ContentChanged states the truth ("the index
+                    // does not describe this file") without effect.
                     LOG_INFO("Discarding unreadable shard for {}",
                              workspace.path_pool.resolve(path_id));
-                    enqueue(path_id);
+                    enqueue(path_id, ReindexReason::ContentChanged);
                 }
             }
         } else {
@@ -332,10 +335,36 @@ bool Indexer::need_update(llvm::StringRef file_path) {
     return merged_it->second.need_update();
 }
 
-void Indexer::enqueue(std::uint32_t server_path_id) {
-    // Already queued and not yet consumed — a second entry would only be
-    // skipped by need_update later; drop it here.
-    if(!pending_ids.insert(server_path_id).second)
+void Indexer::enqueue(std::uint32_t server_path_id, ReindexReason reason) {
+    // A fresh slot means any prior slot was already consumed (or none
+    // existed); a queued-and-unconsumed slot makes this call a duplicate.
+    bool fresh_slot = pending_ids.insert(server_path_id).second;
+
+    // Record (or refresh) why the file is pending. Within one queued slot
+    // ContentChanged is absorbing: a deps-only cascade cannot downgrade a
+    // file whose own content already changed. Across slots it is not: a
+    // deps-only requeue after the previous slot was consumed is new debt of
+    // its own kind — the in-flight (or finished) pass already covers the
+    // earlier content change, and keeping ContentChanged would suppress the
+    // file's rows past that pass. The fresh ticket invalidates the clear of
+    // any index task already in flight for this file.
+    ++reindex_ticket;
+    auto [it, inserted] =
+        reindex_reasons.try_emplace(server_path_id,
+                                    reason,
+                                    reindex_ticket,
+                                    reason == ReindexReason::ContentChanged ? reindex_ticket : 0);
+    if(!inserted) {
+        if(reason == ReindexReason::ContentChanged) {
+            it->second.reason = ReindexReason::ContentChanged;
+            it->second.content_ticket = reindex_ticket;
+        } else if(fresh_slot) {
+            it->second.reason = ReindexReason::DepsOnly;
+        }
+        it->second.ticket = reindex_ticket;
+    }
+
+    if(!fresh_slot)
         return;
     index_queue.push_back(server_path_id);
 }
@@ -379,6 +408,7 @@ void Indexer::schedule() {
 }
 
 kota::task<> Indexer::index_one(std::uint32_t server_path_id,
+                                std::uint64_t ticket,
                                 std::size_t index,
                                 std::size_t total) {
     auto file_path = std::string(workspace.path_pool.resolve(server_path_id));
@@ -386,8 +416,16 @@ kota::task<> Indexer::index_one(std::uint32_t server_path_id,
     if(sessions.find(server_path_id) != nullptr)
         co_return;
 
-    if(!need_update(file_path))
+    // The engine's own observation is authoritative for content changes:
+    // it saw the event. The dep-hash check below cannot be trusted to see
+    // a file's own edit (it validates the recorded dependencies), so only
+    // deps-only slots — where it exists to deduplicate cascade storms —
+    // may take the shortcut.
+    if(auto it = reindex_reasons.find(server_path_id);
+       (it == reindex_reasons.end() || it->second.reason != ReindexReason::ContentChanged) &&
+       !need_update(file_path)) {
         co_return;
+    }
 
     // For module interface units, compile their PCM (and transitive deps)
     // first so the stateless worker has the artifacts it needs.
@@ -412,6 +450,19 @@ kota::task<> Indexer::index_one(std::uint32_t server_path_id,
     auto result = co_await pool.send_stateless(params);
     if(result.has_value() && result.value().success && !result.value().tu_index_data.empty()) {
         auto index_ms = timer.ms();
+        // Merge guard: a newer content-level invalidation during this build
+        // (or a removal clearing the entry) means this result describes text
+        // that no longer exists — e.g. a compile-command change whose
+        // erase+re-enqueue must not be undone by an in-flight merge of the
+        // old-command rows. Drop the merge; the follow-up slot redoes it.
+        // A deps-only requeue is deliberately NOT superseding: the in-flight
+        // rows are positionally right, and suppressing them would trade a
+        // tolerated semantic drift for a coverage hole.
+        if(auto it = reindex_reasons.find(server_path_id);
+           it == reindex_reasons.end() || it->second.content_ticket > ticket) {
+            LOG_INFO("Discarding superseded index result for {}", file_path);
+            co_return;
+        }
         ScopedTimer merge_timer;
         merge(result.value().tu_index_data.data(), result.value().tu_index_data.size());
         LOG_PERF("index",
@@ -433,6 +484,29 @@ kota::task<> Indexer::index_one(std::uint32_t server_path_id,
                  file_path,
                  result.error().message);
     }
+}
+
+kota::task<> Indexer::run_index_task(std::uint32_t server_path_id,
+                                     std::uint64_t ticket,
+                                     std::size_t index,
+                                     std::size_t total,
+                                     std::size_t& completed) {
+    co_await index_one(server_path_id, ticket, index, total);
+    // The pending window ends with the index attempt, success or not. On
+    // failure the last-known rows resume serving — deliberately: keeping
+    // the gate would hide a file that fails to index (broken compile,
+    // missing command) from every cross-file query with no recovery path,
+    // since only a future event re-enqueues it. Any such event re-judges
+    // staleness by content hash. A re-enqueue during the flight bumped
+    // the ticket: that newer pending state must survive this clear.
+    if(auto it = reindex_reasons.find(server_path_id);
+       it != reindex_reasons.end() && it->second.ticket == ticket) {
+        reindex_reasons.erase(it);
+    }
+    ++completed;
+    progress_data.stage = Progress::Stage::Report;
+    progress_data.completed = completed;
+    on_progress_changed.emit();
 }
 
 kota::task<> Indexer::run_background_indexing() {
@@ -476,20 +550,30 @@ kota::task<> Indexer::run_background_indexing() {
 
         auto server_path_id = index_queue[index_queue_pos++];
         pending_ids.erase(server_path_id);
-        auto file_path = std::string(workspace.path_pool.resolve(server_path_id));
-        if(sessions.find(server_path_id) != nullptr || !need_update(file_path)) {
-            ++completed;
+        // No open-session or hash-freshness shortcut here: index_one is the
+        // single decision point for skipping (it knows the pending reason;
+        // a hash check alone cannot see a file's own edit), and the
+        // completion clear in run_index_task retires the pending state with
+        // the ticket honored. A second, reason-blind copy of these checks
+        // here is exactly what once erased ContentChanged state early and
+        // let a stale shard keep serving.
+
+        // A queued slot with no pending entry was cleared mid-batch: the
+        // file was removed from disk after being enqueued (clear_pending),
+        // so there is nothing to index — skip the slot. Every other slot
+        // has an entry, because enqueue writes it before the queue push.
+        auto pending_it = reindex_reasons.find(server_path_id);
+        if(pending_it == reindex_reasons.end()) {
             continue;
         }
 
         ++dispatched;
-        workers.spawn([&, server_path_id, n = dispatched]() -> kota::task<> {
-            co_await index_one(server_path_id, n, total);
-            ++completed;
-            progress_data.stage = Progress::Stage::Report;
-            progress_data.completed = completed;
-            on_progress_changed.emit();
-        }());
+        auto ticket = pending_it->second.ticket;
+        // A member coroutine, not an immediately-invoked capturing lambda:
+        // a lambda's captures live in the lambda object, which dies at the
+        // end of this statement — anything read after the first suspension
+        // would dangle. Coroutine parameters are copied into the frame.
+        workers.spawn(run_index_task(server_path_id, ticket, dispatched, total, completed));
     }
 
     LOG_DEBUG("Background indexing: all {} tasks spawned, waiting for completion", dispatched);
@@ -509,6 +593,7 @@ kota::task<> Indexer::run_background_indexing() {
     // the next scheduled round.
     if(index_queue_pos >= index_queue.size()) {
         assert(pending_ids.empty() && "drained queue must have no pending ids");
+        assert(reindex_reasons.empty() && "drained queue must have no pending reasons");
         index_queue.clear();
         index_queue_pos = 0;
     }
@@ -520,6 +605,14 @@ kota::task<> Indexer::run_background_indexing() {
              total,
              timer.ms());
     co_await save();
+
+    // Files enqueued while the round was joining its workers saw their
+    // schedule() no-op against indexing_active; without this kick they
+    // would wait for the next external event — and a content-changed
+    // pending file's rows stay skipped for that whole wait.
+    if(index_queue_pos < index_queue.size()) {
+        schedule();
+    }
 }
 
 }  // namespace clice

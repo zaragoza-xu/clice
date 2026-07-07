@@ -3,12 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "server/state/workspace.h"
 #include "support/signal.h"
 
 #include "kota/async/async.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -17,6 +19,22 @@ namespace clice {
 class ContextResolver;
 class WorkerPool;
 struct SessionStore;
+
+/// Why a file awaits re-indexing. The invalidation engine knows the cause
+/// at enqueue time, so queries can decide in O(1) whether a pending file's
+/// existing index rows are still trustworthy (see IndexQuery's freshness
+/// contract).
+enum class ReindexReason : std::uint8_t {
+    /// Enqueued by a dependency cascade (or a bulk sweep of unknown
+    /// staleness): the file's own content is not known to have changed, so
+    /// its index rows are positionally intact — at worst semantically
+    /// behind — and keep serving until the reindex lands.
+    DepsOnly,
+    /// The file's own content changed: its index rows describe text that
+    /// no longer exists, so queries skip this file's contribution until
+    /// the reindex lands.
+    ContentChanged,
+};
 
 /// Background indexing scheduler.
 ///
@@ -71,8 +89,33 @@ public:
         return ScopedPause{*this};
     }
 
-    /// Add a file to the background indexing queue.
-    void enqueue(std::uint32_t server_path_id);
+    /// Add a file to the background indexing queue. A file enqueued twice
+    /// keeps a single queue entry; its reason is upgraded to ContentChanged
+    /// if either enqueue says so (a file both cascaded onto and edited is
+    /// as stale as the edit makes it).
+    void enqueue(std::uint32_t server_path_id, ReindexReason reason);
+
+    /// Why the file awaits re-indexing (queued or currently being indexed),
+    /// or nullopt when its index is not pending an update. O(1), no I/O —
+    /// the query path calls this per candidate file.
+    std::optional<ReindexReason> pending_reason(std::uint32_t server_path_id) const {
+        auto it = reindex_reasons.find(server_path_id);
+        if(it == reindex_reasons.end()) {
+            return std::nullopt;
+        }
+        return it->second.reason;
+    }
+
+    /// Forget a file's pending-reindex state (reason and queue membership):
+    /// used when the file is removed from disk — nothing is left to reindex,
+    /// and a lingering ContentChanged reason would suppress its deliberately
+    /// still-serving shard forever. A queue slot already consumed stays
+    /// consumed; one not yet consumed is skipped at dispatch time (the
+    /// consume loop treats a missing pending entry as a cleared slot).
+    void clear_pending(std::uint32_t server_path_id) {
+        reindex_reasons.erase(server_path_id);
+        pending_ids.erase(server_path_id);
+    }
 
     /// Schedule background indexing (respects idle timeout and dedup).
     void schedule();
@@ -147,6 +190,46 @@ private:
     std::vector<std::uint32_t> index_queue;
     llvm::DenseSet<std::uint32_t> pending_ids;
     std::size_t index_queue_pos = 0;
+
+    /// The pending-reindex state machine, per file. This block is the
+    /// authoritative description; every rule below exists because its
+    /// absence was a concrete bug.
+    ///
+    /// States: absent → queued (slot in index_queue + entry here) →
+    /// in-flight (slot consumed, entry alive) → absent again.
+    ///
+    /// Invariants:
+    /// 1. index_one is the ONLY place that decides to skip work (open
+    ///    session, or hash-fresh shard for deps-only slots). Duplicating
+    ///    those checks elsewhere reintroduces reason-blind skips.
+    /// 2. need_update() may shortcut deps-only slots ONLY: the engine
+    ///    observed content changes itself, and the dep-hash check cannot
+    ///    see a file's own edit.
+    /// 3. The merge lands iff the entry is alive and no ContentChanged
+    ///    enqueue happened after launch (content_ticket <= launch ticket).
+    ///    Deps-only requeues do not discard an in-flight pass.
+    /// 4. Completion erases the entry iff ticket == launch ticket: a
+    ///    requeue during the flight must survive the older task's clear.
+    /// 5. Within a queued slot, ContentChanged absorbs; a fresh slot after
+    ///    consumption carries its own reason (the consumed pass owns the
+    ///    earlier debt).
+    /// 6. clear_pending (file removal) drops entry and queue membership;
+    ///    the orphaned slot is skipped at dispatch.
+    /// 7. Queries suppress a file's contributions iff its entry's reason
+    ///    is ContentChanged (see pending_reason).
+    struct PendingReindex {
+        ReindexReason reason;
+        std::uint64_t ticket;
+        /// Ticket of the newest ContentChanged enqueue. The merge guard
+        /// compares against this, not `ticket`: a deps-only requeue during a
+        /// flight bumps `ticket` (to survive the completion clear) but must
+        /// not discard an in-flight content pass — its rows are positionally
+        /// right and the follow-up slot redoes the semantic drift anyway.
+        std::uint64_t content_ticket;
+    };
+
+    llvm::DenseMap<std::uint32_t, PendingReindex> reindex_reasons;
+    std::uint64_t reindex_ticket = 0;
     bool indexing_active = false;
     bool indexing_scheduled = false;
     std::shared_ptr<kota::timer> index_idle_timer;
@@ -159,7 +242,20 @@ private:
     Progress progress_data;
 
     kota::task<> run_background_indexing();
-    kota::task<> index_one(std::uint32_t server_path_id, std::size_t index, std::size_t total);
+    kota::task<> index_one(std::uint32_t server_path_id,
+                           std::uint64_t ticket,
+                           std::size_t index,
+                           std::size_t total);
+
+    /// One dispatched unit of a background round: index the file, then end
+    /// its pending window (ticket-guarded) and report progress. `completed`
+    /// refers into run_background_indexing's frame, which outlives every
+    /// spawned task (it joins them before returning).
+    kota::task<> run_index_task(std::uint32_t server_path_id,
+                                std::uint64_t ticket,
+                                std::size_t index,
+                                std::size_t total,
+                                std::size_t& completed);
 };
 
 }  // namespace clice

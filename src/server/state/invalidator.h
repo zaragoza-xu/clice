@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -10,6 +11,7 @@
 #include "server/state/workspace.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace clice {
@@ -136,9 +138,52 @@ struct DirtySet {
     /// zero deps.build_at so every chain file is re-validated by hash, plus
     /// the mark_ast_dirty treatment.
     llvm::SmallVector<std::uint32_t> force_revalidate;
-    /// Closed files whose index entries went stale: enqueue for background
-    /// reindexing.
-    llvm::SmallVector<std::uint32_t> enqueue_reindex;
+    /// Closed files whose own content changed: their index rows describe
+    /// text that no longer exists. Enqueue for background reindexing as
+    /// ReindexReason::ContentChanged — queries skip these files'
+    /// contributions until the reindex lands.
+    llvm::SmallVector<std::uint32_t> reindex_content_changed;
+    /// Closed files enqueued only because a dependency changed: their own
+    /// rows are positionally intact. Enqueue as ReindexReason::DepsOnly —
+    /// queries keep serving the previous rows. A file in both lists is
+    /// ContentChanged (the indexer's reason upgrade is absorbing).
+    llvm::SmallVector<std::uint32_t> reindex_deps_only;
+
+    /// Files whose pending-reindex state must be discarded: a removed file
+    /// has nothing left to reindex, and a stale ContentChanged reason would
+    /// otherwise suppress its (deliberately still-serving) shard forever.
+    llvm::SmallVector<std::uint32_t> clear_reindex;
+
+    /// The three reindex effect lists are kept disjoint per file, in event
+    /// order: a batch can hold delete-then-recreate (atomic saves) as well
+    /// as change-then-delete, so neither "clear wins" nor "enqueue wins" is
+    /// right as a fixed rule — the later event for a given file wins. All
+    /// emission goes through these adders to keep that true by construction,
+    /// letting the executor apply the lists in any order.
+    void add_reindex_content_changed(std::uint32_t path_id) {
+        erase_id(clear_reindex, path_id);
+        reindex_content_changed.push_back(path_id);
+    }
+
+    void add_reindex_deps_only(std::uint32_t path_id) {
+        erase_id(clear_reindex, path_id);
+        reindex_deps_only.push_back(path_id);
+    }
+
+    void add_clear_reindex(std::uint32_t path_id) {
+        erase_id(reindex_content_changed, path_id);
+        erase_id(reindex_deps_only, path_id);
+        if(llvm::find(clear_reindex, path_id) == clear_reindex.end()) {
+            clear_reindex.push_back(path_id);
+        }
+    }
+
+private:
+    static void erase_id(llvm::SmallVector<std::uint32_t>& ids, std::uint32_t path_id) {
+        ids.erase(std::remove(ids.begin(), ids.end(), path_id), ids.end());
+    }
+
+public:
     /// Headers whose resolved context borrows a compile command that no
     /// longer exists in that form (the host's CDB entry changed): drop the
     /// context so the next use re-resolves. Content validation cannot see
@@ -159,9 +204,10 @@ struct DirtySet {
 
     bool empty() const {
         return mark_ast_dirty.empty() && mark_lost.empty() && reset_trial.empty() &&
-               reset_header_mode.empty() && force_revalidate.empty() && enqueue_reindex.empty() &&
-               drop_context.empty() && !recheck_contexts && !save_cache && !reschedule_indexing &&
-               !ensure_compile_graph;
+               reset_header_mode.empty() && force_revalidate.empty() &&
+               reindex_content_changed.empty() && reindex_deps_only.empty() &&
+               clear_reindex.empty() && drop_context.empty() && !recheck_contexts && !save_cache &&
+               !reschedule_indexing && !ensure_compile_graph;
     }
 };
 

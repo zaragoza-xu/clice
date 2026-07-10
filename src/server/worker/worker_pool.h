@@ -241,6 +241,10 @@ private:
     /// and triggers dynamic scaling checks.
     kota::task<> monitor_memory();
 
+    /// SIGKILL any worker still alive after the SIGTERM grace period, so a
+    /// wedged worker can't block stop()'s join forever.
+    kota::task<> kill_stragglers();
+
     /// Handle worker crash: update state, fire on_crash callback.
     /// Returns true if the worker should be restarted.
     bool process_crash(std::size_t index, bool stateful, int exit_code, int exit_signal);
@@ -281,13 +285,18 @@ private:
     /// is in flight.
     llvm::SmallVector<std::shared_ptr<kota::cancellation_source>> slot_cancel_sources;
 
-    bool shutting_down = false;
+    /// Cancelled by stop(). Unwinds monitor_memory() at its poll sleep
+    /// instead of waiting out the 3s interval, and lets
+    /// monitor_worker() attribute the SIGTERM-induced exits that follow to
+    /// intentional shutdown (no anomaly, no respawn).
+    kota::cancellation_source stop_scope;
 
-    /// Runs monitor_worker() and monitor_memory() coroutines.
-    kota::task_group<> monitor_group{loop};
-
-    /// Runs peer->run() and drain_stderr() coroutines.
-    kota::task_group<> io_group{loop};
+    /// All long-lived pool coroutines: monitor_worker() exit observers, the
+    /// peer->run() / drain_stderr() IO pumps, and the wrapped memory poller.
+    /// Never cancelled as a group — stop() joins it, so shutdown waits until
+    /// every worker process actually exited and its final output (crash
+    /// stacktraces, sanitizer reports) was drained to EOF.
+    kota::task_group<> worker_tasks{loop};
     WorkerPoolOptions options;
     std::string log_dir;
 

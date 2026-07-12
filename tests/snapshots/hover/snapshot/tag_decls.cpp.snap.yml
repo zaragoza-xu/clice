@@ -481,4 +481,24 @@ input_file: tag_decls.cpp
     }
     ```
 
+23_large_record_initializer:
+  name: "Tables"
+  kind: Struct
+  namespace_scope: "large_record_initializer::"
+  definition: "struct Tables {\n  int large_field[256];\n  static int large_static[256];\n  int small_field = 1;\n  static int small_static = 2;\n}"
+  symbol_range: "[3923, 3929)"
+  markdown: |
+    ### struct `Tables`  
+
+    ---
+    ```cpp
+    // In namespace large_record_initializer
+    struct Tables {
+      int large_field[256];
+      static int large_static[256];
+      int small_field = 1;
+      static int small_static = 2;
+    }
+    ```
+
 

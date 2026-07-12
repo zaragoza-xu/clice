@@ -233,3 +233,21 @@ void foo() {
   $(22_top_level_enum)Value value = v01;
 }
 }
+
+#define HOVER_REPEAT_4(x) x, x, x, x
+#define HOVER_REPEAT_256(x) HOVER_REPEAT_4(HOVER_REPEAT_4(HOVER_REPEAT_4(HOVER_REPEAT_4(x))))
+
+namespace large_record_initializer {
+struct Tables {
+  int large_field[256] = { HOVER_REPEAT_256(0) };
+  inline static int large_static[256] = { HOVER_REPEAT_256(0) };
+  int small_field = 1;
+  inline static int small_static = 2;
+};
+void foo() {
+  $(23_large_record_initializer)Tables tables;
+}
+}
+
+#undef HOVER_REPEAT_256
+#undef HOVER_REPEAT_4

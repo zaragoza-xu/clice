@@ -120,6 +120,21 @@ auto namespace_scope(const clang::Decl* decl) -> std::string {
 
 constexpr std::size_t max_record_members = 20;
 constexpr std::size_t max_nested_enumerators = 8;
+constexpr std::size_t max_initializer_tokens = 200;
+
+bool has_large_initializer(const clang::Expr* init, const clang::syntax::TokenBuffer& tb) {
+    return init && tb.expandedTokens(init->getSourceRange()).size() > max_initializer_tokens;
+}
+
+auto member_initializer(const clang::Decl& decl) -> const clang::Expr* {
+    if(const auto* field = llvm::dyn_cast<clang::FieldDecl>(&decl)) {
+        return field->getInClassInitializer();
+    }
+    if(const auto* var = llvm::dyn_cast<clang::VarDecl>(&decl)) {
+        return var->getInit();
+    }
+    return nullptr;
+}
 
 auto print_decl_head(const clang::Decl& decl, clang::PrintingPolicy policy) -> std::string {
     std::string definition;
@@ -201,8 +216,9 @@ bool is_included_member_definition(const clang::Decl& decl) {
     return llvm::isa<clang::TagDecl, clang::ClassTemplateDecl>(decl);
 }
 
-auto print_record_definition(const clang::RecordDecl& decl, clang::PrintingPolicy policy)
-    -> std::string {
+auto print_record_definition(const clang::RecordDecl& decl,
+                             clang::PrintingPolicy policy,
+                             const clang::syntax::TokenBuffer& tb) -> std::string {
     std::string definition = print_decl_head(decl, policy);
 
     llvm::raw_string_ostream os(definition);
@@ -238,7 +254,11 @@ auto print_record_definition(const clang::RecordDecl& decl, clang::PrintingPolic
             continue;
         }
 
-        member->print(os, policy);
+        clang::PrintingPolicy member_policy = policy;
+        if(has_large_initializer(member_initializer(*member), tb)) {
+            member_policy.SuppressInitializers = true;
+        }
+        member->print(os, member_policy);
         os << ';';
     }
     os << "\n}";
@@ -250,17 +270,15 @@ auto print_definition(const clang::Decl* decl,
                       clang::PrintingPolicy policy,
                       const clang::syntax::TokenBuffer& tb) -> std::string {
     if(auto* var = llvm::dyn_cast<clang::VarDecl>(decl)) {
-        if(auto* init = var->getInit()) {
-            /// Initializers might be huge and result in lots of memory allocations
-            /// in some catastrophic cases. Such long lists are not useful in hover
-            /// cards anyway.
-            if(tb.expandedTokens(init->getSourceRange()).size() > 200) {
-                policy.SuppressInitializers = true;
-            }
+        /// Initializers might be huge and result in lots of memory allocations
+        /// in some catastrophic cases. Such long lists are not useful in hover
+        /// cards anyway.
+        if(has_large_initializer(var->getInit(), tb)) {
+            policy.SuppressInitializers = true;
         }
     } else if(auto* record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
         if(auto* definition = record->getDefinition()) {
-            return print_record_definition(*definition, policy);
+            return print_record_definition(*definition, policy, tb);
         }
     } else if(auto* enum_decl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
         if(auto* definition = enum_decl->getDefinition()) {

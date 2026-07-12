@@ -118,6 +118,134 @@ auto namespace_scope(const clang::Decl* decl) -> std::string {
     return "";
 }
 
+constexpr std::size_t max_record_members = 20;
+constexpr std::size_t max_nested_enumerators = 8;
+
+auto print_decl_head(const clang::Decl& decl, clang::PrintingPolicy policy) -> std::string {
+    std::string definition;
+    llvm::raw_string_ostream os(definition);
+    decl.print(os, policy);
+
+    /// TerseOutput leaves tag definitions with an empty body. Keep Clang's rendering of the
+    /// template prefix, attributes and bases, then replace that body with our summary.
+    auto body = definition.rfind('{');
+    if(body != std::string::npos) {
+        definition.resize(body);
+    }
+    return definition;
+}
+
+auto print_enum_definition(const clang::EnumDecl& decl,
+                           clang::PrintingPolicy policy,
+                           std::optional<std::size_t> limit = std::nullopt) -> std::string {
+    std::string definition = print_decl_head(decl, policy);
+
+    llvm::raw_string_ostream os(definition);
+    os << " {";
+    std::size_t count = 0;
+    for(const clang::EnumConstantDecl* enumerator: decl.enumerators()) {
+        if(limit && count == *limit) {
+            os << "\n...";
+            break;
+        }
+        ++count;
+        os << '\n';
+        enumerator->print(os, policy);
+        if(!enumerator->getInitExpr() && !enumerator->getType()->isDependentType()) {
+            os << " = " << llvm::toString(enumerator->getInitVal(), 10);
+        }
+        os << ',';
+    }
+    os << "\n}";
+
+    return definition;
+}
+
+void print_nested_type(const clang::Decl& decl,
+                       const clang::PrintingPolicy& policy,
+                       llvm::raw_ostream& os) {
+    /// Enumerators remain useful in a type summary, but cap them independently from members.
+    if(const auto* enum_decl = llvm::dyn_cast<clang::EnumDecl>(&decl)) {
+        if(enum_decl->isCompleteDefinition()) {
+            os << print_enum_definition(*enum_decl, policy, max_nested_enumerators) << ';';
+        } else {
+            decl.print(os, policy);
+            os << ';';
+        }
+        return;
+    }
+
+    /// Preserve forward declarations. Collapse definitions so deeply nested types do not
+    /// dominate the hover card.
+    const auto* record = llvm::dyn_cast<clang::RecordDecl>(&decl);
+    if(const auto* template_decl = llvm::dyn_cast<clang::ClassTemplateDecl>(&decl)) {
+        record = template_decl->getTemplatedDecl();
+    }
+    if(record && !record->isCompleteDefinition()) {
+        decl.print(os, policy);
+        os << ';';
+        return;
+    }
+
+    os << print_decl_head(decl, policy) << " { ... };";
+}
+
+bool is_included_member_definition(const clang::Decl& decl) {
+    /// Methods are intentionally omitted: this is a compact data/type summary, not a member list.
+    if(llvm::isa<clang::FieldDecl, clang::TypedefNameDecl, clang::TypeAliasTemplateDecl>(decl)) {
+        return true;
+    }
+    if(const auto* var = llvm::dyn_cast<clang::VarDecl>(&decl)) {
+        return var->isStaticDataMember();
+    }
+    return llvm::isa<clang::TagDecl, clang::ClassTemplateDecl>(decl);
+}
+
+auto print_record_definition(const clang::RecordDecl& decl, clang::PrintingPolicy policy)
+    -> std::string {
+    std::string definition = print_decl_head(decl, policy);
+
+    llvm::raw_string_ostream os(definition);
+    os << " {";
+    std::size_t count = 0;
+    const clang::AccessSpecDecl* pending_access = nullptr;
+    for(const clang::Decl* member: decl.decls()) {
+        if(member->isImplicit()) {
+            continue;
+        }
+        if(const auto* access = llvm::dyn_cast<clang::AccessSpecDecl>(member)) {
+            pending_access = access;
+            continue;
+        }
+        if(!is_included_member_definition(*member)) {
+            continue;
+        }
+        if(count++ == max_record_members) {
+            os << "\n// ...";
+            break;
+        }
+
+        /// Delay the label until a visible member follows it. This avoids a dangling `private:`
+        /// section when that section contains methods only.
+        if(pending_access) {
+            os << '\n' << clang::getAccessSpelling(pending_access->getAccess()) << ':';
+            pending_access = nullptr;
+        }
+        os << '\n';
+
+        if(llvm::isa<clang::TagDecl, clang::ClassTemplateDecl>(*member)) {
+            print_nested_type(*member, policy, os);
+            continue;
+        }
+
+        member->print(os, policy);
+        os << ';';
+    }
+    os << "\n}";
+
+    return definition;
+}
+
 auto print_definition(const clang::Decl* decl,
                       clang::PrintingPolicy policy,
                       const clang::syntax::TokenBuffer& tb) -> std::string {
@@ -129,6 +257,14 @@ auto print_definition(const clang::Decl* decl,
             if(tb.expandedTokens(init->getSourceRange()).size() > 200) {
                 policy.SuppressInitializers = true;
             }
+        }
+    } else if(auto* record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+        if(auto* definition = record->getDefinition()) {
+            return print_record_definition(*definition, policy);
+        }
+    } else if(auto* enum_decl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
+        if(auto* definition = enum_decl->getDefinition()) {
+            return print_enum_definition(*definition, policy);
         }
     }
 

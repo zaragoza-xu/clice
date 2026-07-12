@@ -37,7 +37,7 @@ input_file: tag_decls.cpp
   name: "MyUnion"
   kind: Union
   namespace_scope: "union_decl::ns1::"
-  definition: "union MyUnion {}"
+  definition: "union MyUnion {\n  int x;\n  int y;\n}"
   symbol_range: "[541, 548)"
   markdown: |
     ### union `MyUnion`  
@@ -45,7 +45,10 @@ input_file: tag_decls.cpp
     ---
     ```cpp
     // In namespace union_decl::ns1
-    union MyUnion {}
+    union MyUnion {
+      int x;
+      int y;
+    }
     ```
 
 04_forward_class:
@@ -72,7 +75,7 @@ input_file: tag_decls.cpp
   kind: Enum
   namespace_scope: "enum_def::"
   documentation: "Enum declaration"
-  definition: "enum Hello {}"
+  definition: "enum Hello {\n  ONE = 0,\n  TWO = 1,\n  THREE = 2,\n}"
   symbol_range: "[747, 752)"
   markdown: |
     ### enum `Hello`  
@@ -83,7 +86,11 @@ input_file: tag_decls.cpp
     ---
     ```cpp
     // In namespace enum_def
-    enum Hello {}
+    enum Hello {
+      ONE = 0,
+      TWO = 1,
+      THREE = 2,
+    }
     ```
 
 06_enumerator:
@@ -333,6 +340,145 @@ input_file: tag_decls.cpp
     // In namespace nested_templates_class
     template <>
     struct cls<nested_templates_class::cls<nested_templates_class::cls<int>>> {}
+    ```
+
+18_inherited_class:
+  name: "Point"
+  kind: Class
+  namespace_scope: "inherited_class::"
+  definition: "class Point : public first, virtual protected second {\n  int value;\n}"
+  symbol_range: "[2452, 2457)"
+  markdown: |
+    ### class `Point`  
+
+    ---
+    ```cpp
+    // In namespace inherited_class
+    class Point : public first, virtual protected second {
+      int value;
+    }
+    ```
+
+19_template_fields:
+  name: "Box<int>"
+  kind: Struct
+  namespace_scope: "template_fields::"
+  definition: "template <> struct Box<int> {\n  using value_type = int;\n  int value;\n}"
+  symbol_range: "[2586, 2589)"
+  markdown: |
+    ### struct `Box<int>`  
+
+    ---
+    ```cpp
+    // In namespace template_fields
+    template <> struct Box<int> {
+      using value_type = int;
+      int value;
+    }
+    ```
+
+20_record_members:
+  name: "Traits"
+  kind: Struct
+  namespace_scope: "record_members::"
+  definition: "struct Traits {\npublic:\n  static constexpr int extent = 4;\n  using value_type = int;\n  template <typename T> using pointer = T *;\n  enum class Kind : int {\n    first = 0,\n    second = 1,\n    third = 2,\n    fourth = 3,\n    fifth = 4,\n    sixth = 5,\n    seventh = 6,\n    eighth = 7,\n    ...\n  };\n  struct Node {\n    ...\n  };\n  struct Forward;\n  template <typename T> struct Nested {\n    ...\n  };\n\nprivate:\n  static int instances;\n  int value = [] {}();\n}"
+  symbol_range: "[3081, 3087)"
+  markdown: |
+    ### struct `Traits`  
+
+    ---
+    ```cpp
+    // In namespace record_members
+    struct Traits {
+    public:
+      static constexpr int extent = 4;
+      using value_type = int;
+      template <typename T> using pointer = T *;
+      enum class Kind : int {
+        first = 0,
+        second = 1,
+        third = 2,
+        fourth = 3,
+        fifth = 4,
+        sixth = 5,
+        seventh = 6,
+        eighth = 7,
+        ...
+      };
+      struct Node {
+        ...
+      };
+      struct Forward;
+      template <typename T> struct Nested {
+        ...
+      };
+
+    private:
+      static int instances;
+      int value = [] {}();
+    }
+    ```
+
+21_record_member_limit:
+  name: "Values"
+  kind: Struct
+  namespace_scope: "record_member_limit::"
+  definition: "struct Values {\n  int v01;\n  int v02;\n  int v03;\n  int v04;\n  int v05;\n  int v06;\n  int v07;\n  int v08;\n  int v09;\n  int v10;\n  int v11;\n  int v12;\n  int v13;\n  int v14;\n  int v15;\n  int v16;\n  int v17;\n  int v18;\n  int v19;\n  int v20;\n  // ...\n}"
+  symbol_range: "[3398, 3404)"
+  markdown: |
+    ### struct `Values`  
+
+    ---
+    ```cpp
+    // In namespace record_member_limit
+    struct Values {
+      int v01;
+      int v02;
+      int v03;
+      int v04;
+      int v05;
+      int v06;
+      int v07;
+      int v08;
+      int v09;
+      int v10;
+      int v11;
+      int v12;
+      int v13;
+      int v14;
+      int v15;
+      int v16;
+      int v17;
+      int v18;
+      int v19;
+      int v20;
+      // ...
+    }
+    ```
+
+22_top_level_enum:
+  name: "Value"
+  kind: Enum
+  namespace_scope: "top_level_enum::"
+  definition: "enum Value {\n  v01 = 0,\n  v02 = 1,\n  v03 = 2,\n  v04 = 3,\n  v05 = 4,\n  v06 = 5,\n  v07 = 6,\n  v08 = 7,\n  v09 = 8,\n}"
+  symbol_range: "[3520, 3525)"
+  markdown: |
+    ### enum `Value`  
+
+    ---
+    ```cpp
+    // In namespace top_level_enum
+    enum Value {
+      v01 = 0,
+      v02 = 1,
+      v03 = 2,
+      v04 = 3,
+      v05 = 4,
+      v06 = 5,
+      v07 = 6,
+      v08 = 7,
+      v09 = 8,
+    }
     ```
 
 

@@ -153,6 +153,11 @@ TEST_CASE(HasIncludeFromLineStart) {
     EXPECT_RANGE(src, 0, "<vector>");
 }
 
+TEST_CASE(HasIncludeFromFilename) {
+    llvm::StringRef src = "#if __has_include(\"test.h\")";
+    EXPECT_RANGE(src, src.find("test.h"), "\"test.h\"");
+}
+
 TEST_CASE(HasEmbedFromLineStart) {
     llvm::StringRef src = R"(#if __has_embed("data.bin"))";
     EXPECT_RANGE(src, 0, R"("data.bin")");

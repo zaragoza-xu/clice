@@ -150,7 +150,7 @@ std::optional<LocalSourceRange> find_directive_argument(llvm::StringRef content,
             continue;
         }
 
-        if(abs_begin < offset || !ready)
+        if(abs_end <= offset || !ready)
             continue;
 
         if(tok.is_header_name() || tok.kind == clang::tok::string_literal)

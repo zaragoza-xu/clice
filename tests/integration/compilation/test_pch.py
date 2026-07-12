@@ -63,6 +63,23 @@ async def test_hover_on_local_symbol(client, workspace):
 
 
 @pytest.mark.workspace("pch_test")
+async def test_hover_on_preamble_include(client, workspace):
+    """Hover on an include compiled into the PCH should resolve its target."""
+    uri, _ = await client.open_and_wait(workspace / "main.cpp")
+
+    result = await client.text_document_hover_async(
+        HoverParams(text_document=doc(uri), position=Position(line=0, character=12))
+    )
+
+    assert result is not None
+    assert "common.h" in result.contents.value
+    assert result.range is not None
+    assert result.range.start == Position(line=0, character=9)
+    assert result.range.end == Position(line=0, character=19)
+    client.text_document_did_close(DidCloseTextDocumentParams(text_document=doc(uri)))
+
+
+@pytest.mark.workspace("pch_test")
 async def test_completion_with_pch(client, workspace):
     """Completion should see symbols from PCH headers."""
     uri, content = await client.open_and_wait(workspace / "main.cpp")

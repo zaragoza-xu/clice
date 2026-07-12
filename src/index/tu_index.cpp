@@ -77,6 +77,17 @@ public:
         auto& index = result.file_indices[fid];
 
         auto symbol_id = unit.getSymbolID(def);
+        // Macros get a symbol-table entry like declarations do; without it
+        // build() would default-construct a nameless entry when recording
+        // reference files, and every name lookup for the macro would come
+        // back empty.
+        auto [it, success] = result.symbols.try_emplace(symbol_id.hash);
+        if(success) {
+            auto& symbol = it->second;
+            symbol.name = unit.token_spelling(location).str();
+            symbol.kind = SymbolKind::Macro;
+            symbol.scope = SymbolScope::External;
+        }
         index.occurrences.emplace_back(range, symbol_id.hash);
 
         Relation relation{
@@ -84,6 +95,17 @@ public:
             .range = range,
             .target_symbol = 0,
         };
+
+        // Definition relations carry the macro's full extent (name through
+        // last body token), like declarations do — definition-text
+        // consumers decode it out of target_symbol.
+        if(kind.isDeclOrDef() && def) {
+            auto [def_fid, def_range] = unit.decompose_range(
+                clang::SourceRange(def->getDefinitionLoc(), def->getDefinitionEndLoc()));
+            if(def_fid == fid) {
+                relation.set_definition_range(def_range);
+            }
+        }
 
         index.relations[symbol_id.hash].emplace_back(relation);
     }

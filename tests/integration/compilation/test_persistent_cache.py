@@ -7,6 +7,7 @@ server restarts via cache.json, and are properly reused across sessions.
 
 import asyncio
 import json
+import os
 
 import pytest
 from lsprotocol.types import (
@@ -75,9 +76,11 @@ async def test_cache_json_persisted(client, tmp_path):
     # Verify the entry has expected fields.
     entry = cache["pch"][0]
     assert "key" in entry
-    assert "build_at" in entry
     assert "deps" in entry
     assert "bound" in entry
+    for dep in entry["deps"]:
+        assert dep["hash"] != 0
+        assert "mtime_ns" in dep and "size" in dep
 
 
 async def test_pch_reused_on_close_reopen(client, tmp_path):
@@ -158,6 +161,146 @@ async def test_pch_survives_server_restart(executable, tmp_path):
 
     assert_no_anomaly(c2, tmp_path)
     await shutdown_client(c2)
+
+
+async def test_old_cache_json_upgrades(executable, tmp_path):
+    """A cache.json written before the per-dep stat baselines (entry-level
+    build_at, deps as bare {path, hash}) must still load: unknown fields are
+    skipped, absent ones read back zeroed, and the entry revalidates by hash
+    instead of being dropped."""
+    pin_cache_to_workspace(tmp_path)
+    (tmp_path / "header.h").write_text("#pragma once\nstruct Old { int v; };\n")
+    (tmp_path / "main.cpp").write_text(
+        '#include "header.h"\nint main() { Old o; return o.v; }\n'
+    )
+    write_cdb(tmp_path, ["main.cpp"])
+
+    c1 = await make_client(executable, tmp_path)
+    uri, _ = await c1.open_and_wait(tmp_path / "main.cpp")
+    assert_clean_compile(c1, uri)
+    pch_mtime_s1 = list_pch_files(tmp_path)[0].stat().st_mtime
+    await shutdown_client(c1)
+
+    # Rewrite cache.json into the pre-baseline shape.
+    cache_path = cache_root(tmp_path) / "cache.json"
+    cache = json.loads(cache_path.read_text())
+    for entry in cache["pch"] + cache.get("pcm", []):
+        entry["build_at"] = 0
+        entry["deps"] = [{"path": d["path"], "hash": d["hash"]} for d in entry["deps"]]
+    cache_path.write_text(json.dumps(cache))
+
+    c2 = await make_client(executable, tmp_path)
+    uri2, _ = await c2.open_and_wait(tmp_path / "main.cpp")
+    assert_clean_compile(c2, uri2)
+    # Loaded, hash-validated, reused — not rebuilt.
+    assert list_pch_files(tmp_path)[0].stat().st_mtime == pch_mtime_s1
+    await shutdown_client(c2)
+
+
+async def test_pcm_offline_edit_invalidates(executable, test_data_dir, tmp_path):
+    """Editing a module interface while the server is down must invalidate
+    the cached PCM on restart: the PCM key embeds no content, so only its
+    deps snapshot can see the change."""
+    import shutil
+
+    from tests.tools.compile_commands import generate_cdb
+    from tests.tools.checks import assert_has_errors
+
+    src = test_data_dir / "modules" / "save_recompile"
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, tmp_path / f.name)
+    pin_cache_to_workspace(tmp_path)
+    generate_cdb(tmp_path)
+
+    # Session 1: importer compiles clean, PCM cached.
+    c1 = await make_client(executable, tmp_path)
+    mid_uri, _ = await c1.open_and_wait(tmp_path / "mid.cppm")
+    assert_clean_compile(c1, mid_uri)
+    assert len(list_pcm_files(tmp_path)) >= 1
+    assert_no_anomaly(c1, tmp_path)
+    await shutdown_client(c1)
+
+    # Offline: rename the export the importer calls.
+    (tmp_path / "leaf.cppm").write_text(
+        "export module Leaf;\n\nexport int renamed_leaf() {\n    return 1;\n}\n"
+    )
+
+    # Session 2: mid.cppm calls leaf(), which no longer exists — a stale
+    # PCM would compile it clean.
+    c2 = await make_client(executable, tmp_path)
+    mid_uri2, _ = await c2.open_and_wait(tmp_path / "mid.cppm")
+    assert_has_errors(c2, mid_uri2, "Expected errors after offline interface edit")
+    await shutdown_client(c2)
+
+
+async def test_depless_pcm_entry_dropped(executable, test_data_dir, tmp_path):
+    """A PCM cache entry with an empty deps list (written before deps were
+    populated) is unvalidatable and must be dropped at load, not trusted."""
+    import shutil
+
+    from tests.tools.compile_commands import generate_cdb
+    from tests.tools.checks import assert_has_errors
+
+    src = test_data_dir / "modules" / "save_recompile"
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, tmp_path / f.name)
+    pin_cache_to_workspace(tmp_path)
+    generate_cdb(tmp_path)
+
+    c1 = await make_client(executable, tmp_path)
+    mid_uri, _ = await c1.open_and_wait(tmp_path / "mid.cppm")
+    assert_clean_compile(c1, mid_uri)
+    await shutdown_client(c1)
+
+    # Simulate a pre-upgrade cache: strip the PCM deps, then break the
+    # interface offline. A trusted dep-less entry would compile mid clean.
+    cache_path = cache_root(tmp_path) / "cache.json"
+    cache = json.loads(cache_path.read_text())
+    for entry in cache["pcm"]:
+        entry["deps"] = []
+    cache_path.write_text(json.dumps(cache))
+    (tmp_path / "leaf.cppm").write_text(
+        "export module Leaf;\n\nexport int renamed_leaf() {\n    return 1;\n}\n"
+    )
+
+    c2 = await make_client(executable, tmp_path)
+    mid_uri2, _ = await c2.open_and_wait(tmp_path / "mid.cppm")
+    assert_has_errors(c2, mid_uri2, "Expected errors after offline interface edit")
+    await shutdown_client(c2)
+
+
+async def test_pcm_cache_entry_has_deps(client, test_data_dir, tmp_path):
+    """cache.json PCM entries must record dependencies, including the module
+    source file itself — an empty list is permanently blind."""
+    import shutil
+
+    from tests.tools.compile_commands import generate_cdb
+
+    src = test_data_dir / "modules" / "save_recompile"
+    for f in src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, tmp_path / f.name)
+    pin_cache_to_workspace(tmp_path)
+    generate_cdb(tmp_path)
+    await client.initialize(tmp_path)
+
+    mid_uri, _ = await client.open_and_wait(tmp_path / "mid.cppm")
+    assert_clean_compile(client, mid_uri)
+
+    cache = read_cache_json(tmp_path)
+    assert cache is not None and cache.get("pcm"), "Expected PCM cache entries"
+    paths = cache["paths"]
+    for entry in cache["pcm"]:
+        deps = entry.get("deps", [])
+        assert deps, f"PCM entry {entry.get('module_name')} has no deps"
+        # Deps are canonicalized through real_path; compare resolved forms
+        # (on macOS the pytest tmp dir sits behind the /var symlink).
+        source = os.path.realpath(paths[entry["source_file"]])
+        dep_paths = {os.path.realpath(paths[d["path"]]) for d in deps}
+        assert source in dep_paths, "Module source must be its own dependency"
+        assert all(d["hash"] != 0 for d in deps)
 
 
 async def test_shared_preamble_shares_pch(client, tmp_path):

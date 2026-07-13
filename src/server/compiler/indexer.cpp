@@ -32,9 +32,40 @@ void Indexer::merge(const void* tu_index_data, std::size_t size) {
         LOG_WARN("Ignoring TUIndex with empty path graph");
         return;
     }
-    auto file_ids_map = workspace.project_index.merge(tu_index, workspace.path_pool);
     auto main_tu_path_id = static_cast<std::uint32_t>(tu_index.graph.paths.size() - 1);
     llvm::StringRef main_tu_path = tu_index.graph.paths[main_tu_path_id];
+
+    // Shards pair the worker's rows with content read from disk here; if the
+    // disk moved on since the worker read it, the rows' offsets describe
+    // bytes that no longer exist and merging would misplace every position
+    // until the next reindex. The worker's consumed-content hash arbitrates.
+    // A missing hash (0) proceeds as before.
+    auto content_matches = [&](std::uint32_t tu_path_id, llvm::StringRef disk_content) {
+        auto consumed = tu_index.graph.path_hashes[tu_path_id];
+        return consumed == 0 || llvm::xxh3_64bits(disk_content) == consumed;
+    };
+
+    // The main file's verdict gates the WHOLE result: its per-header shards
+    // and the trailing sweep all describe this one compile, so applying any
+    // of it against a moved-on main file would mix two generations (and the
+    // sweep would strip contributions the stale result merely no longer
+    // mentions). Skipping everything keeps the last-known state consistent;
+    // the changed file fails the next staleness check (or is already
+    // pending), and a follow-up pass redoes the merge against settled
+    // content.
+    auto main_buf = llvm::MemoryBuffer::getFile(main_tu_path);
+    if(!main_buf) {
+        LOG_WARN("Skip merge for {}: cannot read content: {}",
+                 main_tu_path,
+                 main_buf.getError().message());
+        return;
+    }
+    if(!content_matches(main_tu_path_id, (*main_buf)->getBuffer())) {
+        LOG_INFO("Skip merge for {}: disk moved on since it was indexed", main_tu_path);
+        return;
+    }
+
+    auto file_ids_map = workspace.project_index.merge(tu_index, workspace.path_pool);
 
     // Collect non-External symbols referenced in a FileIndex.  Each file's
     // MergedIndex shard stores exactly the local symbols its occurrences
@@ -60,27 +91,23 @@ void Indexer::merge(const void* tu_index_data, std::size_t size) {
         auto& shard = workspace.merged_indices[global_path_id];
 
         if(tu_path_id == main_tu_path_id) {
+            auto& path_hashes = tu_index.graph.path_hashes;
             llvm::SmallVector<index::DepLocation> deps;
             deps.reserve(tu_index.graph.locations.size() + 1);
             // The TU's own content is a dependency of its shard too: without
             // it, a closed TU edited on disk with unchanged includes would
             // never look stale.
-            deps.push_back({main_tu_path, 0, 0});
+            deps.push_back({main_tu_path, 0, 0, path_hashes[main_tu_path_id]});
             for(auto& loc: tu_index.graph.locations) {
-                deps.push_back({tu_index.graph.paths[loc.path_id], loc.line, loc.include});
+                deps.push_back({tu_index.graph.paths[loc.path_id],
+                                loc.line,
+                                loc.include,
+                                path_hashes[loc.path_id]});
             }
-            auto file_path = workspace.path_pool.resolve(global_path_id);
-            auto buf = llvm::MemoryBuffer::getFile(file_path);
-            if(!buf) {
-                // Overwriting the shard's stored content with nothing would
-                // silently break every position mapping for this TU; keep the
-                // old snapshot, the staleness check re-enqueues it later.
-                LOG_WARN("Skip merge for {}: cannot read content: {}",
-                         file_path,
-                         buf.getError().message());
-                return;
-            }
-            shard.merge(main_tu_path, tu_index.built_at, deps, file_idx, (*buf)->getBuffer());
+            // Read and verified against the consumed hash before anything
+            // was merged: an unreadable or moved-on main file skips this
+            // whole result up front.
+            shard.merge(main_tu_path, tu_index.built_at, deps, file_idx, (*main_buf)->getBuffer());
             shard.merge_symbols(collect_local_symbols(file_idx));
             touched.insert(global_path_id);
         } else {
@@ -102,6 +129,14 @@ void Indexer::merge(const void* tu_index_data, std::size_t size) {
             if(header_buf) {
                 header_content_storage = (*header_buf)->getBuffer().str();
                 header_content = header_content_storage;
+            }
+            // Unconditional, unlike the read above: an unreadable or
+            // truncated-to-empty header must not slip past the arbitration
+            // and pair the rows with content they were not built from.
+            if(!content_matches(tu_path_id, header_content)) {
+                LOG_INFO("Skip merge for {}: disk moved on since it was indexed", header_path);
+                touched.insert(global_path_id);
+                return;
             }
             // Keyed by the including TU so a reindex of that TU replaces its
             // prior contribution to this header's shard.

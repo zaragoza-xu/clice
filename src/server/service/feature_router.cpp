@@ -215,9 +215,17 @@ kota::task<kota::codec::RawValue, kota::ipc::Error>
 
 FeatureRouter::RawResult FeatureRouter::hover(std::shared_ptr<Session> session,
                                               const protocol::Position& position) {
+    if(!session) {
+        co_return kota::outcome_error(document_not_open());
+    }
+
     /// Like document_links, the preamble and the worker's AST are disjoint, so merge the two
     /// sources.
+    auto gen = session->generation;
     auto raw = co_await compiler.forward_query(worker::QueryKind::Hover, session, position);
+    if(session->generation != gen) {
+        co_return serde_raw{"null"};
+    }
     if(raw.has_value() && raw.value().data == "null" && !session->ast_dirty) {
         if(auto hover = resolve_preamble_hover(*session, position)) {
             co_return to_raw(*hover);

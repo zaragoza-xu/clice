@@ -393,6 +393,10 @@ void Indexer::enqueue(std::uint32_t server_path_id, ReindexReason reason) {
         if(reason == ReindexReason::ContentChanged) {
             it->second.reason = ReindexReason::ContentChanged;
             it->second.content_ticket = reindex_ticket;
+            // New content starts a fresh poison budget: the crashes the
+            // old bytes caused say nothing about the fixed ones, and a
+            // stale ledger would abandon the file on its first hiccup.
+            it->second.requeue_attempts = 0;
         } else if(fresh_slot) {
             it->second.reason = ReindexReason::DepsOnly;
         }
@@ -517,6 +521,53 @@ kota::task<> Indexer::index_one(std::uint32_t server_path_id,
         LOG_WARN("[{}/{}] Index failed for {}: {}", index, total, file_path, result.value().error);
     } else if(result.has_value() && result.value().tu_index_data.empty()) {
         LOG_WARN("[{}/{}] Index returned empty TUIndex for {}", index, total, file_path);
+    } else if(result.error().code == worker::dispatch_errc::cancelled ||
+              result.error().code == worker::dispatch_errc::worker_crashed ||
+              (result.error().code == worker::dispatch_errc::worker_unavailable &&
+               pool.revives_slots())) {
+        // Preempted under memory pressure or lost to a worker crash: the
+        // work itself is fine — requeue the file with its original reason so
+        // the next round redoes it instead of silently dropping coverage.
+        // worker_unavailable requeues (budget-free, like a preemption) only
+        // when the pool revives dead slots: the outage is then a window, not
+        // a verdict, and each retry round waits out the idle timer rather
+        // than spinning. Without revival a requeue could never succeed.
+        bool crashed = result.error().code == worker::dispatch_errc::worker_crashed;
+        switch(note_dispatch_failure(server_path_id, ticket, crashed)) {
+            case RequeueVerdict::Dropped: {
+                LOG_INFO("[{}/{}] Index dropped for removed file {}", index, total, file_path);
+                break;
+            }
+            case RequeueVerdict::Superseded: {
+                LOG_INFO("[{}/{}] Index failure for superseded content of {}",
+                         index,
+                         total,
+                         file_path);
+                break;
+            }
+            case RequeueVerdict::GaveUp: {
+                // Log-only by design: the file is usually not open (open
+                // documents are served by their session, not the shard),
+                // so there is no diagnostic surface. Cross-file references
+                // into this file stay stale until its content changes.
+                LOG_WARN(
+                    "[{}/{}] Index giving up on {} after {} crash requeues; " "its cross-file data stays stale until it is edited: {}",
+                    index,
+                    total,
+                    file_path,
+                    max_requeue_attempts,
+                    result.error().message);
+                break;
+            }
+            case RequeueVerdict::Requeued: {
+                LOG_INFO("[{}/{}] Index requeued for {}: {}",
+                         index,
+                         total,
+                         file_path,
+                         result.error().message);
+                break;
+            }
+        }
     } else {
         LOG_WARN("[{}/{}] Index IPC error for {}: {}",
                  index,
@@ -524,6 +575,58 @@ kota::task<> Indexer::index_one(std::uint32_t server_path_id,
                  file_path,
                  result.error().message);
     }
+}
+
+auto Indexer::note_dispatch_failure(std::uint32_t server_path_id,
+                                    std::uint64_t ticket,
+                                    bool crashed) -> RequeueVerdict {
+    // Only while the pending entry survives: a file removed from disk
+    // mid-flight was cleared and has nothing to redo.
+    auto it = reindex_reasons.find(server_path_id);
+    if(it == reindex_reasons.end()) {
+        return RequeueVerdict::Dropped;
+    }
+
+    // The failed dispatch carried bytes a ContentChanged enqueue has since
+    // replaced: its crash says nothing about the fixed content, so it
+    // neither spends the fresh budget nor requeues — the newer content's
+    // own slot redoes the work.
+    if(it->second.content_ticket > ticket) {
+        return RequeueVerdict::Superseded;
+    }
+
+    // The budget both counts and gates crashes only: a preemption under
+    // memory pressure says nothing about the file, so it requeues even
+    // when the crash budget is already spent — giving up on it would
+    // clear the pending state and serve the stale shard as fresh.
+    if(crashed) {
+        if(it->second.requeue_attempts >= max_requeue_attempts) {
+            // Giving up accepts the staleness, so clear the pending slot
+            // here rather than relying on run_index_task's ticket-guarded
+            // clear: a deps-only enqueue that landed mid-flight bumped the
+            // ticket, and the guard would leave that downgraded entry
+            // queued — a doomed retry that spends one more worker.
+            clear_pending(server_path_id);
+            return RequeueVerdict::GaveUp;
+        }
+        it->second.requeue_attempts += 1;
+    }
+    // Requeue with the debt class this dispatch carried, not the entry's
+    // current one: a deps-only enqueue that landed mid-flight downgraded
+    // the reason betting on this content pass to land — a failed pass
+    // leaves the edit uncovered, and only a ContentChanged pending entry
+    // keeps suppressing the stale shard.
+    auto reason =
+        it->second.content_ticket == ticket ? ReindexReason::ContentChanged : it->second.reason;
+    // The enqueue bumps the entry's ticket, which shields it from the
+    // in-flight task's pending-state clear. It also resets the poison
+    // budget on ContentChanged — right for a user edit, wrong for this
+    // requeue of the same bytes — so restore the ledger afterwards
+    // (try_emplace on the existing key keeps `it` valid).
+    auto attempts = it->second.requeue_attempts;
+    enqueue(server_path_id, reason);
+    it->second.requeue_attempts = attempts;
+    return RequeueVerdict::Requeued;
 }
 
 kota::task<> Indexer::run_index_task(std::uint32_t server_path_id,

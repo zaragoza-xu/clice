@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <format>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -32,13 +33,53 @@ constexpr inline protocol::integer cancelled =
 /// No live worker could take the request (crash/restart window or pool stop).
 constexpr inline protocol::integer worker_unavailable = -33000;
 
+/// The worker process died while serving the request. The pool does not
+/// retry: it marks the slot dead and surfaces this code so the caller can
+/// decide — stateless build tasks are idempotent and safe to resend, while
+/// e.g. the indexer prefers to requeue the file instead.
+constexpr inline protocol::integer worker_crashed = -33001;
+
+/// The assigned worker is mid-restart after a crash: the request was never
+/// dispatched. Distinct from worker_crashed so crash accounting (document
+/// quarantine) does not blame a document for a window it merely hit.
+constexpr inline protocol::integer worker_restarting = -33002;
+
 }  // namespace dispatch_errc
 
 /// True when a dispatch failure is an expected operational condition rather
 /// than clice infrastructure breakage.
 inline bool is_operational_error(const protocol::Error& error) {
     return error.code == dispatch_errc::cancelled ||
-           error.code == dispatch_errc::worker_unavailable;
+           error.code == dispatch_errc::worker_unavailable ||
+           error.code == dispatch_errc::worker_crashed ||
+           error.code == dispatch_errc::worker_restarting;
+}
+
+/// Identity of the worker incarnation a crashed request died with, carried
+/// in Error::data. One process death fails every request in flight on it;
+/// per-content blame (Quarantine) dedups by this identity so a single death
+/// is counted at most once per document.
+inline protocol::Value death_identity(std::size_t index, unsigned generation, bool stateful) {
+    return std::format("{}:{}:{}", stateful ? "sf" : "sl", index, generation);
+}
+
+/// The death identity attached to a worker_crashed error; empty when the
+/// error carries none (locally synthesized failures).
+inline std::string_view death_of(const protocol::Error& error) {
+    if(error.data.has_value()) {
+        if(auto* id = std::get_if<std::string>(&*error.data)) {
+            return *id;
+        }
+    }
+    return {};
+}
+
+/// True for errors produced by the IPC transport itself (broken pipe, closed
+/// peer) as opposed to errors returned by the remote handler. kota surfaces
+/// transport failures with the default RequestFailed code; clice worker
+/// handlers never return that code, so it identifies a dead worker link.
+inline bool is_transport_error(const protocol::Error& error) {
+    return error.code == static_cast<protocol::integer>(protocol::ErrorCode::RequestFailed);
 }
 
 /// Kind of AST query dispatched to a stateful worker.

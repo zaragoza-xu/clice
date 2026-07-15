@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "index/tu_index.h"
+#include "server/state/quarantine.h"
 #include "server/state/workspace.h"
 
 #include "kota/async/async.h"
@@ -77,6 +78,12 @@ struct Session {
     /// Monotonic generation counter, incremented on every didChange and on close.
     /// Used to detect stale compilation results (ABA prevention).
     std::uint64_t generation = 0;
+
+    /// Crash containment for this document's content: the crash budget
+    /// lives on pool slots, but the poison lives in documents — without
+    /// the cut one document burns slot after slot until the whole pool is
+    /// dead. All transitions go through the type; see quarantine.h.
+    Quarantine quarantine;
 
     /// Whether the AST needs to be rebuilt before serving queries.
     bool ast_dirty = true;

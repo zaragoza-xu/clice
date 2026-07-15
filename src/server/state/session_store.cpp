@@ -50,6 +50,7 @@ void SessionStore::apply_open(Session& session, std::string text, int version) {
     session.text = std::move(text);
     session.line_starts = lsp::build_line_starts(session.text);
     session.generation++;
+    session.quarantine.reset();
 }
 
 void SessionStore::apply_change(Session& session,
@@ -57,19 +58,26 @@ void SessionStore::apply_change(Session& session,
                                 int version) {
     session.version = version;
 
+    bool applied = false;
     for(auto& change: changes) {
         std::visit(
             [&](auto& c) {
                 using T = std::remove_cvref_t<decltype(c)>;
                 if constexpr(std::is_same_v<T, protocol::TextDocumentContentChangeWholeDocument>) {
-                    session.text = c.text;
+                    if(session.text != c.text) {
+                        session.text = c.text;
+                        applied = true;
+                    }
                 } else {
                     auto& range = c.range;
                     auto map = session.line_map();
                     auto start = map.to_offset(range.start);
                     auto end = map.to_offset(range.end);
                     if(start && end && *start <= *end) {
-                        session.text.replace(*start, *end - *start, c.text);
+                        if(llvm::StringRef(session.text).substr(*start, *end - *start) != c.text) {
+                            session.text.replace(*start, *end - *start, c.text);
+                            applied = true;
+                        }
                     } else {
                         // The client's view has drifted from ours (or the
                         // client is buggy). Drop the edit but keep serving:
@@ -88,6 +96,10 @@ void SessionStore::apply_change(Session& session,
             },
             change);
     }
+
+    // A real content change re-arms a quarantined document with one probe
+    // attempt; dropped or no-op edits grant none (see Quarantine::on_edit).
+    session.quarantine.on_edit(applied);
 
     session.generation++;
     session.ast_dirty = true;

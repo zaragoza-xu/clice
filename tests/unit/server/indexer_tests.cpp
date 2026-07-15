@@ -1,3 +1,5 @@
+#include <limits>
+
 #include "test/temp_dir.h"
 #include "test/test.h"
 #include "command/argument_parser.h"
@@ -12,6 +14,52 @@
 #include "llvm/Support/raw_ostream.h"
 
 namespace clice::testing {
+
+/// Test fixture with friend access to Indexer internals.
+struct IndexerFixture {
+    using Verdict = Indexer::RequeueVerdict;
+
+    constexpr static unsigned budget = Indexer::max_requeue_attempts;
+
+    kota::event_loop loop;
+    Workspace workspace;
+    WorkerPool pool{loop};
+    ContextResolver contexts{workspace};
+    SessionStore sessions;
+    Indexer indexer{loop, workspace, pool, contexts, sessions};
+
+    /// Fail the entry's current dispatch: the launch ticket matches.
+    Verdict fail(std::uint32_t id, bool crashed) {
+        return indexer.note_dispatch_failure(id, ticket(id), crashed);
+    }
+
+    /// Fail a dispatch launched with an explicit (possibly stale) ticket.
+    Verdict fail_at(std::uint32_t id, std::uint64_t ticket, bool crashed) {
+        return indexer.note_dispatch_failure(id, ticket, crashed);
+    }
+
+    std::uint64_t ticket(std::uint32_t id) {
+        auto it = indexer.reindex_reasons.find(id);
+        return it == indexer.reindex_reasons.end() ? std::numeric_limits<std::uint64_t>::max()
+                                                   : it->second.ticket;
+    }
+
+    unsigned attempts(std::uint32_t id) {
+        auto it = indexer.reindex_reasons.find(id);
+        return it == indexer.reindex_reasons.end() ? 0u : it->second.requeue_attempts;
+    }
+
+    void set_attempts(std::uint32_t id, unsigned n) {
+        indexer.reindex_reasons.find(id)->second.requeue_attempts = n;
+    }
+
+    /// Consume the queued slot as a dispatch would, so a later enqueue
+    /// takes the fresh-slot (mid-flight) path.
+    void consume(std::uint32_t id) {
+        indexer.pending_ids.erase(id);
+    }
+};
+
 namespace {
 
 TEST_SUITE(IndexerMerge) {
@@ -83,6 +131,123 @@ TEST_CASE(MergeSkipsMovedDisk) {
 }
 
 };  // TEST_SUITE(IndexerMerge)
+
+TEST_SUITE(IndexerRequeue) {
+
+TEST_CASE(PreemptionKeepsBudget) {
+    IndexerFixture f;
+    auto id = f.workspace.path_pool.intern("/proj/a.cpp");
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+
+    // A preemption under memory pressure requeues without spending the
+    // crash budget, no matter how often it repeats.
+    for(unsigned i = 0; i < 2 * IndexerFixture::budget; ++i) {
+        ASSERT_EQ(int(f.fail(id, /*crashed=*/false)), int(IndexerFixture::Verdict::Requeued));
+    }
+    ASSERT_EQ(f.attempts(id), 0u);
+    ASSERT_TRUE(f.indexer.pending_reason(id).has_value());
+}
+
+TEST_CASE(CrashSpendsBudget) {
+    IndexerFixture f;
+    auto id = f.workspace.path_pool.intern("/proj/poison.cpp");
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+
+    for(unsigned i = 0; i < IndexerFixture::budget; ++i) {
+        ASSERT_EQ(int(f.fail(id, /*crashed=*/true)), int(IndexerFixture::Verdict::Requeued));
+    }
+    ASSERT_EQ(f.attempts(id), IndexerFixture::budget);
+
+    // A preemption still requeues a file whose crash budget is spent:
+    // dropping it would erase the pending state and serve the stale
+    // shard as fresh. Only the next crash gives up.
+    ASSERT_EQ(int(f.fail(id, /*crashed=*/false)), int(IndexerFixture::Verdict::Requeued));
+    ASSERT_EQ(f.attempts(id), IndexerFixture::budget);
+
+    // Giving up clears the pending slot: nothing is left to requeue, and
+    // the stale shard serves as fresh — the accepted cost of abandoning.
+    ASSERT_EQ(int(f.fail(id, /*crashed=*/true)), int(IndexerFixture::Verdict::GaveUp));
+    ASSERT_FALSE(f.indexer.pending_reason(id).has_value());
+    ASSERT_EQ(int(f.fail(id, /*crashed=*/true)), int(IndexerFixture::Verdict::Dropped));
+}
+
+TEST_CASE(StaleCrashKeepsBudget) {
+    IndexerFixture f;
+    auto id = f.workspace.path_pool.intern("/proj/edited.cpp");
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+    auto stale = f.ticket(id);
+
+    // The user fixes the file while the old bytes' dispatch is in flight:
+    // the stale crash must not spend the fixed content's budget or touch
+    // its pending slot.
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+    ASSERT_EQ(int(f.fail_at(id, stale, /*crashed=*/true)),
+              int(IndexerFixture::Verdict::Superseded));
+    ASSERT_EQ(f.attempts(id), 0u);
+    ASSERT_TRUE(f.indexer.pending_reason(id).has_value());
+}
+
+TEST_CASE(DepsDowngradeKeepsDebt) {
+    IndexerFixture f;
+    auto id = f.workspace.path_pool.intern("/proj/c.cpp");
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+    auto launch = f.ticket(id);
+
+    // The content pass is dispatched; a deps-only cascade lands mid-flight
+    // and downgrades the pending reason, betting on that pass to cover the
+    // edit. The pass fails — the requeue must restore the ContentChanged
+    // debt or the stale shard stops being suppressed.
+    f.consume(id);
+    f.indexer.enqueue(id, ReindexReason::DepsOnly);
+    ASSERT_EQ(int(*f.indexer.pending_reason(id)), int(ReindexReason::DepsOnly));
+
+    ASSERT_EQ(int(f.fail_at(id, launch, /*crashed=*/true)), int(IndexerFixture::Verdict::Requeued));
+    ASSERT_EQ(int(*f.indexer.pending_reason(id)), int(ReindexReason::ContentChanged));
+    ASSERT_EQ(f.attempts(id), 1u);
+}
+
+TEST_CASE(GaveUpClearsDowngraded) {
+    IndexerFixture f;
+    auto id = f.workspace.path_pool.intern("/proj/d.cpp");
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+    auto launch = f.ticket(id);
+    f.set_attempts(id, IndexerFixture::budget);
+
+    // A deps-only enqueue lands mid-flight, then the content pass spends
+    // its last life. The downgraded entry must not stay queued: its retry
+    // is doomed, and the give-up already accepted the staleness.
+    f.consume(id);
+    f.indexer.enqueue(id, ReindexReason::DepsOnly);
+    ASSERT_EQ(int(f.fail_at(id, launch, /*crashed=*/true)), int(IndexerFixture::Verdict::GaveUp));
+    ASSERT_FALSE(f.indexer.pending_reason(id).has_value());
+}
+
+TEST_CASE(DroppedWithoutPending) {
+    IndexerFixture f;
+    auto id = f.workspace.path_pool.intern("/proj/gone.cpp");
+    ASSERT_EQ(int(f.fail(id, /*crashed=*/true)), int(IndexerFixture::Verdict::Dropped));
+}
+
+TEST_CASE(ContentChangeResetsBudget) {
+    IndexerFixture f;
+    auto id = f.workspace.path_pool.intern("/proj/fixed.cpp");
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+
+    ASSERT_EQ(int(f.fail(id, /*crashed=*/true)), int(IndexerFixture::Verdict::Requeued));
+    ASSERT_EQ(int(f.fail(id, /*crashed=*/true)), int(IndexerFixture::Verdict::Requeued));
+    ASSERT_EQ(f.attempts(id), 2u);
+
+    // The user fixes the file: new content starts a fresh poison budget.
+    f.indexer.enqueue(id, ReindexReason::ContentChanged);
+    ASSERT_EQ(f.attempts(id), 0u);
+
+    // A deps-only cascade is not new content and keeps the ledger.
+    ASSERT_EQ(int(f.fail(id, /*crashed=*/true)), int(IndexerFixture::Verdict::Requeued));
+    f.indexer.enqueue(id, ReindexReason::DepsOnly);
+    ASSERT_EQ(f.attempts(id), 1u);
+}
+
+};  // TEST_SUITE(IndexerRequeue)
 
 }  // namespace
 }  // namespace clice::testing

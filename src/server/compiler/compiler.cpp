@@ -146,13 +146,15 @@ void Compiler::publish_recovered(const std::shared_ptr<Session>& session) {
 /// workers spends two strikes. Callers must count ONLY through it: the
 /// returned error is the retry's status, which may not be a crash.
 template <typename Params, typename OnCrash>
-static kota::ipc::RequestResult<Params> send_stateless_retrying(WorkerPool& pool,
-                                                                Params params,
-                                                                OnCrash on_crash) {
-    auto result = co_await pool.send_stateless(params);
+static kota::ipc::RequestResult<Params>
+    send_stateless_retrying(WorkerPool& pool,
+                            Params params,
+                            OnCrash on_crash,
+                            kota::ipc::request_options opts = {}) {
+    auto result = co_await pool.send_stateless(params, opts);
     if(!result.has_value() && result.error().code == worker::dispatch_errc::worker_crashed) {
         on_crash(result.error());
-        result = co_await pool.send_stateless(params);
+        result = co_await pool.send_stateless(params, opts);
         if(!result.has_value() && result.error().code == worker::dispatch_errc::worker_crashed) {
             on_crash(result.error());
         }
@@ -168,14 +170,18 @@ static kota::ipc::RequestResult<Params> send_stateless_retrying(WorkerPool& pool
 /// launder evidence the new content recorded meanwhile. Grep for
 /// build_for to enumerate every such site.
 template <typename Params>
-static kota::ipc::RequestResult<Params>
-    build_for(WorkerPool& pool, Session& session, std::uint8_t kind, Params params) {
-    return send_stateless_retrying(pool,
-                                   std::move(params),
-                                   [&session, kind](const kota::ipc::protocol::Error& error) {
-                                       session.quarantine.on_kind_crash(kind,
-                                                                        worker::death_of(error));
-                                   });
+static kota::ipc::RequestResult<Params> build_for(WorkerPool& pool,
+                                                  Session& session,
+                                                  std::uint8_t kind,
+                                                  Params params,
+                                                  kota::ipc::request_options opts) {
+    return send_stateless_retrying(
+        pool,
+        std::move(params),
+        [&session, kind](const kota::ipc::protocol::Error& error) {
+            session.quarantine.on_kind_crash(kind, worker::death_of(error));
+        },
+        opts);
 }
 
 /// Evidence-kind discriminators for Quarantine's per-kind ledgers. Queries
@@ -911,7 +917,6 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
                                             params.pch,
                                             params.pcms,
                                             pc->deps_scope.token());
-        pc->deps_done = true;
         if(!deps_ok) {
             LOG_WARN("Dependency preparation failed for {}, skipping compile", uri_str);
             co_return;
@@ -964,6 +969,13 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
         if(recovery) {
             session->quarantine.spend_probe();
         }
+        // The send deliberately does NOT run under the supersede scope: the
+        // master must observe the request's real outcome — the crash
+        // accounting below depends on it (a wire cancel racing a worker
+        // death would resume with RequestCancelled and the death would
+        // dodge the document's ledger). A supersede interrupts the worker
+        // with a CancelCompile notification instead, and the stale reply is
+        // discarded at the generation gate below.
         auto result = co_await pool.send_stateful(pid, params, {}, suspect);
 
         // Crash accounting runs even for superseded compiles: the crash came
@@ -1175,13 +1187,13 @@ kota::task<bool> Compiler::ensure_compiled(std::shared_ptr<Session> session) {
     // detached compile task keeps running independently.
     while(session->compiling) {
         auto pending = session->compiling;
-        if(pending->generation != session->generation && !pending->deps_done) {
-            // The in-flight compile is stale (user edited since it started)
-            // and still holds interest in the module graph — supersede it.
-            // A stale compile already past its dependency phase is left to
-            // finish instead: superseding it gains nothing (the worker send
-            // is not cancellable), and waiting coalesces rapid edits into a
-            // single follow-up compile at the latest generation.
+        if(pending->generation != session->generation) {
+            // The in-flight compile is stale (user edited since it started):
+            // supersede it. The launch below interrupts the worker's parse
+            // with a CancelCompile notification and cancels deps_scope to
+            // release the module-graph interest; the round itself still runs
+            // to its (incomplete) reply so crash accounting sees the real
+            // outcome.
             break;
         }
         co_await pending->done.wait();
@@ -1207,6 +1219,12 @@ kota::task<bool> Compiler::ensure_compiled(std::shared_ptr<Session> session) {
     }
 
     auto superseded = session->compiling;
+
+    // Interrupt the stale parse before the replacement can enter the pipe:
+    // FIFO order guarantees the cancel reaches the worker ahead of the new
+    // Compile request, so it can only ever hit the stale round's stop flag.
+    interrupt_superseded(*session);
+
     auto pending_compile = std::make_shared<Session::PendingCompile>();
     pending_compile->generation = session->generation;
     session->compiling = pending_compile;
@@ -1229,10 +1247,38 @@ kota::task<bool> Compiler::ensure_compiled(std::shared_ptr<Session> session) {
     co_return !session->ast_dirty;
 }
 
+void Compiler::interrupt_superseded(Session& session) {
+    if(!session.compiling || session.compiling->generation == session.generation) {
+        return;
+    }
+    // Not a wire cancel: the notification flips the compile's stop flag and
+    // the request still completes into run_compile's crash accounting (see
+    // the send site). A stale set is impossible — every emitter runs before
+    // the replacement Compile can enter the pipe.
+    pool.notify_stateful(
+        session.path_id,
+        worker::CancelCompileParams{std::string(workspace.path_pool.resolve(session.path_id))});
+}
+
+void Compiler::abandon_superseded(Session& session) {
+    if(!session.compiling || session.compiling->generation == session.generation) {
+        return;
+    }
+    interrupt_superseded(session);
+    // The round may still be in dependency prep, where the notification
+    // cannot reach it (nothing dispatched yet): cancel its waits so it
+    // unwinds now instead of after the module graph settles. The cancel
+    // cascade can finish the round synchronously — session.compiling may
+    // be null when this returns. (A round inside its PCH build stays until
+    // the shared build replies: that send is deliberately scope-free.)
+    session.compiling->deps_scope.cancel();
+}
+
 Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
                                             std::shared_ptr<Session> session,
                                             std::optional<protocol::Position> position,
-                                            std::optional<protocol::Range> range) {
+                                            std::optional<protocol::Range> range,
+                                            std::optional<kota::cancellation_token> token) {
     auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
     auto gen = session->generation;
@@ -1284,7 +1330,7 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
     if(recovery) {
         probe_guard.emplace(session->quarantine);
     }
-    auto result = co_await pool.send_stateful(path_id, wp, {}, suspect);
+    auto result = co_await pool.send_stateful(path_id, wp, {.token = std::move(token)}, suspect);
     if(!result.has_value()) {
         // A query that kills the worker is this document's doing even
         // though its compile landed: per-kind ledger, since only this query
@@ -1317,7 +1363,8 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
 }
 
 kota::task<std::vector<feature::DocumentLink>, kota::ipc::Error>
-    Compiler::forward_document_links(std::shared_ptr<Session> session) {
+    Compiler::forward_document_links(std::shared_ptr<Session> session,
+                                     std::optional<kota::cancellation_token> token) {
     auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
     auto gen = session->generation;
@@ -1342,8 +1389,10 @@ kota::task<std::vector<feature::DocumentLink>, kota::ipc::Error>
     if(recovery) {
         probe_guard.emplace(session->quarantine);
     }
-    auto result =
-        co_await pool.send_stateful(path_id, worker::DocumentLinkParams{path}, {}, suspect);
+    auto result = co_await pool.send_stateful(path_id,
+                                              worker::DocumentLinkParams{path},
+                                              {.token = std::move(token)},
+                                              suspect);
     if(!result.has_value()) {
         if(result.error().code == worker::dispatch_errc::worker_crashed) {
             session->quarantine.on_kind_crash(document_link_evidence,
@@ -1380,7 +1429,8 @@ kota::task<std::vector<feature::DocumentLink>, kota::ipc::Error>
 
 Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
                                             const protocol::Position& position,
-                                            std::shared_ptr<Session> session) {
+                                            std::shared_ptr<Session> session,
+                                            std::optional<kota::cancellation_token> token) {
     auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
     auto gen = session->generation;
@@ -1458,7 +1508,8 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
     if(recovery) {
         probe_guard.emplace(session->quarantine);
     }
-    auto result = co_await build_for(pool, *session, evidence_kind(kind), wp);
+    auto result =
+        co_await build_for(pool, *session, evidence_kind(kind), wp, {.token = std::move(token)});
     if(!result.has_value()) {
         if(!worker::is_operational_error(result.error())) {
             LOG_ANOMALY(WorkerRequestFail,
@@ -1485,7 +1536,8 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
 }
 
 Compiler::RawResult Compiler::forward_format(std::shared_ptr<Session> session,
-                                             std::optional<protocol::Range> range) {
+                                             std::optional<protocol::Range> range,
+                                             std::optional<kota::cancellation_token> token) {
     auto path_id = session->path_id;
     auto path = std::string(workspace.path_pool.resolve(path_id));
     auto gen = session->generation;
@@ -1524,7 +1576,11 @@ Compiler::RawResult Compiler::forward_format(std::shared_ptr<Session> session,
     if(recovery) {
         probe_guard.emplace(session->quarantine);
     }
-    auto result = co_await build_for(pool, *session, evidence_kind(worker::BuildKind::Format), wp);
+    auto result = co_await build_for(pool,
+                                     *session,
+                                     evidence_kind(worker::BuildKind::Format),
+                                     wp,
+                                     {.token = std::move(token)});
     if(!result.has_value()) {
         if(!worker::is_operational_error(result.error())) {
             LOG_ANOMALY(WorkerRequestFail,

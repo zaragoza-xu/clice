@@ -68,32 +68,62 @@ public:
     /// file_index, pch_key, ast_deps, and publishes diagnostics.
     kota::task<bool> ensure_compiled(std::shared_ptr<Session> session);
 
+    /// Interrupt the in-flight compile if the buffer moved past it
+    /// (generation mismatch): the worker abandons the stale parse at the
+    /// next declaration, while the request still runs to its reply — crash
+    /// accounting keeps observing the real outcome. Deliberately does NOT
+    /// touch deps_scope: the supersede point orders that cancel after the
+    /// replacement spawn so module interest never dips to zero across the
+    /// swap. A no-op when nothing is in flight or the round is current.
+    void interrupt_superseded(Session& session);
+
+    /// The edit path's whole supersede: interrupt the worker's parse AND
+    /// cancel the stale round's dependency waits. With no replacement
+    /// round coming there is no interest hand-off to order against, and a
+    /// round parked in dependency prep (module graph waits) would
+    /// otherwise hold its waiters until the graph settles. A no-op when
+    /// nothing is in flight or the round is current.
+    void abandon_superseded(Session& session);
+
     using RawResult = kota::task<kota::codec::RawValue, kota::ipc::Error>;
 
     /// Forward a query to the stateful worker that holds this file's AST.
     /// Ensures compilation first.  For position-sensitive queries (hover,
     /// goto-definition), pass a Position.  For range-sensitive queries
     /// (inlay hints), pass a Range.
+    /// `token`, on every forward: the LSP request's cancellation token.
+    /// Passing it into the worker send turns a client $/cancelRequest into
+    /// a wire cancel — the worker stops the parse at the next top-level
+    /// declaration instead of computing a result nobody will read. The
+    /// shared compile a query waits on is deliberately NOT cancelled: it
+    /// serves every waiter, not this request.
     RawResult forward_query(worker::QueryKind kind,
                             std::shared_ptr<Session> session,
                             std::optional<protocol::Position> position = {},
-                            std::optional<protocol::Range> range = {});
+                            std::optional<protocol::Range> range = {},
+                            std::optional<kota::cancellation_token> token = {});
 
     /// Forward a build request (signature help, etc.) to a stateless worker.
-    /// Sends the full buffer content and compile arguments.
+    /// Sends the full buffer content and compile arguments. `token`: see
+    /// forward_query.
     RawResult forward_build(worker::BuildKind kind,
                             const protocol::Position& position,
-                            std::shared_ptr<Session> session);
+                            std::shared_ptr<Session> session,
+                            std::optional<kota::cancellation_token> token = {});
 
     /// Forward a document-link query to the stateful worker holding this
     /// file's AST. Covers the main-file region only: the preamble's links
     /// live in the PCH's PreambleState blob (see PCHState::load_state).
+    /// `token`: see forward_query.
     kota::task<std::vector<feature::DocumentLink>, kota::ipc::Error>
-        forward_document_links(std::shared_ptr<Session> session);
+        forward_document_links(std::shared_ptr<Session> session,
+                               std::optional<kota::cancellation_token> token = {});
 
-    /// Forward a formatting request to a stateless worker.
+    /// Forward a formatting request to a stateless worker. `token`: see
+    /// forward_query.
     RawResult forward_format(std::shared_ptr<Session> session,
-                             std::optional<protocol::Range> range = {});
+                             std::optional<protocol::Range> range = {},
+                             std::optional<kota::cancellation_token> token = {});
 
     /// Emitted after a compile round materializes its publishable products
     /// into the session's `output` field (both success and the failure/

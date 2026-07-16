@@ -1,3 +1,4 @@
+#include <format>
 #include <string>
 #include <vector>
 
@@ -345,6 +346,303 @@ TEST_CASE(StopUnblocksCompileWaiters) {
         EXPECT_TRUE(waiter_done);
         EXPECT_TRUE(session->compiling == nullptr);
 
+        co_await pool.stop();
+        done = true;
+    };
+    auto task = body();
+    loop.schedule(task);
+    loop.run();
+    EXPECT_TRUE(done);
+
+    logging::reset_anomaly_for_testing();
+}
+
+TEST_CASE(AbandonCancelsDepsScope) {
+    // The two supersede entry points differ on deps_scope by design:
+    // abandon_superseded (the edit path, no replacement round) cancels the
+    // stale round's dependency waits; interrupt_superseded (the supersede
+    // point) must not — its deps cancel is ordered after the replacement
+    // spawn so module interest never dips to zero across the swap.
+    TempDir tmp;
+    tmp.touch("scoped.cpp", "");
+
+    kota::event_loop loop;
+    Workspace workspace;
+    ContextResolver contexts(workspace);
+    WorkerPool pool(loop);
+    Compiler compiler(loop, workspace, contexts, pool);
+
+    auto session = std::make_shared<Session>();
+    session->path_id = workspace.path_pool.intern(tmp.path("scoped.cpp"));
+    session->compiling = std::make_shared<Session::PendingCompile>();
+    session->compiling->generation = session->generation;
+
+    // Current round: both are no-ops.
+    compiler.abandon_superseded(*session);
+    EXPECT_FALSE(session->compiling->deps_scope.cancelled());
+
+    session->generation += 1;
+
+    compiler.interrupt_superseded(*session);
+    EXPECT_FALSE(session->compiling->deps_scope.cancelled());
+
+    compiler.abandon_superseded(*session);
+    EXPECT_TRUE(session->compiling->deps_scope.cancelled());
+}
+
+TEST_CASE(EditInterruptsStaleCompile) {
+    // The didChange path: an edit with NO follow-up request interrupts the
+    // in-flight parse via interrupt_superseded. The superseded round's
+    // waiter resolves false (its result is for a buffer that no longer
+    // exists — the editor re-requests after an edit) instead of sitting
+    // behind a stale 200k-declaration parse, and the next request compiles
+    // the fresh content. Liveness pin; the interruption content is pinned
+    // by StatefulWorker.CancelNotificationInterruptsCompile.
+    logging::set_anomaly_trap_for_testing([](logging::AnomalyId) {});
+
+    TempDir tmp;
+    tmp.touch("edited_only.cpp", "");
+    auto src = tmp.path("edited_only.cpp");
+
+    kota::event_loop loop;
+    Workspace workspace;
+    ContextResolver contexts(workspace);
+    WorkerPool pool(loop);
+    Compiler compiler(loop, workspace, contexts, pool);
+
+    auto session = std::make_shared<Session>();
+    session->path_id = workspace.path_pool.intern(src);
+    std::string text;
+    text.reserve(1 << 22);
+    for(int i = 0; i < 200'000; ++i) {
+        text += std::format("int v{};\n", i);
+    }
+    session->text = std::move(text);
+
+    bool waiter_done = false;
+    bool waiter_ok = false;
+    bool done = false;
+    auto body = [&]() -> kota::task<> {
+        WorkerPoolOptions opts;
+        opts.self_path = clice_binary();
+        opts.stateless_count = 0;
+        opts.stateful_count = 1;
+        CO_ASSERT_TRUE(pool.start(opts));
+        co_await kota::sleep(500);
+
+        kota::task_group<> group(loop);
+        auto waiter = [&]() -> kota::task<> {
+            waiter_ok = co_await compiler.ensure_compiled(session);
+            waiter_done = true;
+        };
+        group.spawn(waiter());
+
+        for(int i = 0; i < 100 && session->compiling == nullptr; ++i) {
+            co_await kota::sleep(10);
+        }
+        CO_ASSERT_TRUE(session->compiling != nullptr);
+
+        // What the didChange handler does: fold the edit in, then interrupt.
+        session->text = "int fixed;\n";
+        session->generation += 1;
+        session->ast_dirty = true;
+        compiler.interrupt_superseded(*session);
+
+        for(int i = 0; i < 600 && !waiter_done; ++i) {
+            co_await kota::sleep(100);
+        }
+        if(!waiter_done) {
+            group.cancel();
+        }
+        co_await group.join();
+
+        CO_ASSERT_TRUE(waiter_done);
+        EXPECT_FALSE(waiter_ok);
+        EXPECT_TRUE(session->compiling == nullptr);
+
+        // The next request (the editor re-queries after an edit) compiles
+        // the fresh content.
+        bool second_ok = co_await compiler.ensure_compiled(session);
+        EXPECT_TRUE(second_ok);
+        EXPECT_FALSE(session->ast_dirty);
+
+        co_await compiler.stop();
+        co_await pool.stop();
+        done = true;
+    };
+    auto task = body();
+    loop.schedule(task);
+    loop.run();
+    EXPECT_TRUE(done);
+
+    logging::reset_anomaly_for_testing();
+}
+
+TEST_CASE(SupersededCompileCancelled) {
+    // An edit mid-compile supersedes the in-flight round: the waiter breaks
+    // out, the supersede point interrupts the worker's parse with a
+    // CancelCompile notification, and the replacement compiles the new
+    // content. This pins the supersede path's liveness (both waiters
+    // resolve, the fresh AST lands); the interruption itself is pinned
+    // content-wise by StatefulWorker.CancelNotificationInterruptsCompile.
+    logging::set_anomaly_trap_for_testing([](logging::AnomalyId) {});
+
+    TempDir tmp;
+    tmp.touch("edited.cpp", "");
+    auto src = tmp.path("edited.cpp");
+
+    kota::event_loop loop;
+    Workspace workspace;
+    ContextResolver contexts(workspace);
+    WorkerPool pool(loop);
+    Compiler compiler(loop, workspace, contexts, pool);
+
+    auto session = std::make_shared<Session>();
+    session->path_id = workspace.path_pool.intern(src);
+    std::string text;
+    text.reserve(1 << 22);
+    for(int i = 0; i < 200'000; ++i) {
+        text += std::format("int v{};\n", i);
+    }
+    session->text = std::move(text);
+
+    bool first_done = false;
+    bool second_ok = false;
+    bool done = false;
+    auto body = [&]() -> kota::task<> {
+        WorkerPoolOptions opts;
+        opts.self_path = clice_binary();
+        opts.stateless_count = 0;
+        opts.stateful_count = 1;
+        CO_ASSERT_TRUE(pool.start(opts));
+        co_await kota::sleep(500);
+
+        kota::task_group<> group(loop);
+        auto first = [&]() -> kota::task<> {
+            [[maybe_unused]] bool ok = co_await compiler.ensure_compiled(session);
+            first_done = true;
+        };
+        group.spawn(first());
+
+        for(int i = 0; i < 100 && session->compiling == nullptr; ++i) {
+            co_await kota::sleep(10);
+        }
+        CO_ASSERT_TRUE(session->compiling != nullptr);
+
+        // The edit lands while the slow compile is in flight.
+        session->text = "int fixed;\n";
+        session->generation += 1;
+
+        auto second = [&]() -> kota::task<> {
+            second_ok = co_await compiler.ensure_compiled(session);
+        };
+        group.spawn(second());
+
+        for(int i = 0; i < 600 && !(first_done && second_ok); ++i) {
+            co_await kota::sleep(100);
+        }
+        if(!(first_done && second_ok)) {
+            group.cancel();
+        }
+        co_await group.join();
+
+        EXPECT_TRUE(first_done);
+        EXPECT_TRUE(second_ok);
+        EXPECT_TRUE(session->compiling == nullptr);
+        EXPECT_FALSE(session->ast_dirty);
+
+        co_await compiler.stop();
+        co_await pool.stop();
+        done = true;
+    };
+    auto task = body();
+    loop.schedule(task);
+    loop.run();
+    EXPECT_TRUE(done);
+
+    logging::reset_anomaly_for_testing();
+}
+
+TEST_CASE(ClientCancelSparesCompile) {
+    // A client's $/cancelRequest tears down one request's frame, never the
+    // shared compile it waits on: the detached round serves every waiter.
+    // A regression that threads the request token into the shared round
+    // would kill waiter B's result along with waiter A's frame.
+    logging::set_anomaly_trap_for_testing([](logging::AnomalyId) {});
+
+    TempDir tmp;
+    tmp.touch("shared.cpp", "");
+    auto src = tmp.path("shared.cpp");
+
+    kota::event_loop loop;
+    Workspace workspace;
+    ContextResolver contexts(workspace);
+    WorkerPool pool(loop);
+    Compiler compiler(loop, workspace, contexts, pool);
+
+    auto session = std::make_shared<Session>();
+    session->path_id = workspace.path_pool.intern(src);
+    std::string text;
+    text.reserve(1 << 21);
+    for(int i = 0; i < 50'000; ++i) {
+        text += std::format("int v{};\n", i);
+    }
+    session->text = std::move(text);
+    session->line_starts = kota::ipc::lsp::build_line_starts(session->text);
+
+    bool cancelled_returned = false;
+    bool other_answered = false;
+    bool done = false;
+    auto body = [&]() -> kota::task<> {
+        WorkerPoolOptions opts;
+        opts.self_path = clice_binary();
+        opts.stateless_count = 0;
+        opts.stateful_count = 1;
+        CO_ASSERT_TRUE(pool.start(opts));
+        co_await kota::sleep(500);
+
+        kota::cancellation_source source;
+        kota::task_group<> group(loop);
+        auto cancelled_waiter = [&]() -> kota::task<> {
+            auto hover = [&]() -> Compiler::RawResult {
+                co_return co_await compiler.forward_query(worker::QueryKind::Hover,
+                                                          session,
+                                                          protocol::Position{0, 4},
+                                                          {},
+                                                          source.token());
+            };
+            auto r = co_await kota::with_token(hover(), source.token());
+            cancelled_returned = r.is_cancelled();
+        };
+        auto other_waiter = [&]() -> kota::task<> {
+            auto result = co_await compiler.forward_query(worker::QueryKind::Hover,
+                                                          session,
+                                                          protocol::Position{0, 4});
+            other_answered = result.has_value();
+        };
+        group.spawn(cancelled_waiter());
+        group.spawn(other_waiter());
+
+        for(int i = 0; i < 100 && session->compiling == nullptr; ++i) {
+            co_await kota::sleep(10);
+        }
+        CO_ASSERT_TRUE(session->compiling != nullptr);
+        source.cancel();
+
+        for(int i = 0; i < 600 && !other_answered; ++i) {
+            co_await kota::sleep(100);
+        }
+        if(!other_answered) {
+            group.cancel();
+        }
+        co_await group.join();
+
+        EXPECT_TRUE(cancelled_returned);
+        EXPECT_TRUE(other_answered);
+        EXPECT_FALSE(session->ast_dirty);
+        EXPECT_TRUE(session->compiling == nullptr);
+
+        co_await compiler.stop();
         co_await pool.stop();
         done = true;
     };

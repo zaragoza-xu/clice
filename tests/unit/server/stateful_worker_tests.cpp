@@ -1,3 +1,4 @@
+#include <format>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,132 @@ TEST_CASE(CompileRequest) {
         auto result = co_await w.peer->send_request(params);
         CO_ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value().version, 1);
+        test_done = true;
+        w.peer->close_output();
+    });
+
+    ASSERT_TRUE(test_done);
+}
+
+TEST_CASE(CancelledCompileFreesStrand) {
+    TempDir tmp;
+    tmp.touch("cancel_test.cpp", "");
+    auto src = tmp.path("cancel_test.cpp");
+
+    WorkerHandle w;
+    ASSERT_TRUE(w.spawn(4ULL * 1024 * 1024 * 1024));
+
+    bool test_done = false;
+
+    w.run([&]() -> kota::task<> {
+        // A deterministically slow TU: two hundred thousand trivial
+        // declarations keep the parse far past the cancellation tick on any
+        // hardware — two consecutive macOS runners completed a whole
+        // four-STL-header compile roundtrip inside 20ms — while the
+        // per-declaration stop poll keeps the cancelled remainder cheap.
+        std::string text;
+        text.reserve(1 << 22);
+        for(int i = 0; i < 200'000; ++i) {
+            text += std::format("int v{};\n", i);
+        }
+
+        worker::CompileParams cp;
+        cp.path = src;
+        cp.version = 1;
+        cp.text = std::move(text);
+        cp.directory = "/tmp";
+        cp.arguments = make_args(src);
+        cp.pch = {"", 0};
+        cp.pcms = {};
+
+        kota::cancellation_source source;
+        kota::ipc::request_options opts;
+        opts.token = source.token();
+
+        bool first_failed = false;
+        kota::task_group<> group(w.loop);
+        auto sender = [&]() -> kota::task<> {
+            auto result = co_await w.peer->send_request(cp, opts);
+            first_failed = !result.has_value();
+        };
+        group.spawn(sender());
+        // One short tick: enough for the request bytes to flush, far below
+        // any parse of four STL headers. The $/cancelRequest then chases
+        // the request down the same pipe, and the single-threaded worker
+        // processes it while the handler is parked on the pool await — the
+        // compile cannot have replied first, so the cancel deterministically
+        // lands mid-flight (a 150ms window lost this race on a warm macOS
+        // runner that compiled the TU faster).
+        co_await kota::sleep(20, w.loop);
+        source.cancel();
+        co_await group.join();
+        EXPECT_TRUE(first_failed);
+
+        // The strand must be free again: a second compile of the same
+        // document completes instead of hanging behind the cancelled one's
+        // never-released lock (the guard releases it when the cancelled
+        // handler's frame unwinds). Bounded so a regression is a clean,
+        // attributable failure instead of a CI-wide timeout.
+        cp.version = 2;
+        kota::ipc::request_options retry_opts;
+        retry_opts.timeout = std::chrono::milliseconds(30'000);
+        auto retry = co_await w.peer->send_request(cp, retry_opts);
+        CO_ASSERT_TRUE(retry.has_value());
+        EXPECT_EQ(retry.value().version, 2);
+
+        test_done = true;
+        w.peer->close_output();
+    });
+
+    ASSERT_TRUE(test_done);
+}
+
+TEST_CASE(CancelledQueryFreesStrand) {
+    TempDir tmp;
+    tmp.touch("query_cancel.cpp", "");
+    auto src = tmp.path("query_cancel.cpp");
+
+    WorkerHandle w;
+    ASSERT_TRUE(w.spawn(4ULL * 1024 * 1024 * 1024));
+
+    bool test_done = false;
+
+    w.run([&]() -> kota::task<> {
+        worker::CompileParams cp;
+        cp.path = src;
+        cp.version = 1;
+        cp.text = "int value() { return 42; }\n";
+        cp.directory = "/tmp";
+        cp.arguments = make_args(src);
+        cp.pch = {"", 0};
+        cp.pcms = {};
+        auto compiled = co_await w.peer->send_request(cp);
+        CO_ASSERT_TRUE(compiled.has_value());
+
+        // Queries take the strand through with_ast_or: a cancelled query
+        // must release it on unwind like a cancelled compile does.
+        worker::QueryParams qp;
+        qp.kind = worker::QueryKind::SemanticTokens;
+        qp.path = src;
+
+        kota::cancellation_source source;
+        kota::ipc::request_options opts;
+        opts.token = source.token();
+
+        kota::task_group<> group(w.loop);
+        auto sender = [&]() -> kota::task<> {
+            [[maybe_unused]] auto result = co_await w.peer->send_request(qp, opts);
+        };
+        group.spawn(sender());
+        source.cancel();
+        co_await group.join();
+
+        // Bounded: a still-locked strand fails this cleanly via timeout.
+        kota::ipc::request_options retry_opts;
+        retry_opts.timeout = std::chrono::milliseconds(30'000);
+        auto retry = co_await w.peer->send_request(qp, retry_opts);
+        CO_ASSERT_TRUE(retry.has_value());
+
         test_done = true;
         w.peer->close_output();
     });

@@ -95,18 +95,44 @@ TEST_CASE(StoreAndLookup) {
     ASSERT_TRUE(llvm::StringRef(path).ends_with("k1.pch"));
 }
 
-TEST_CASE(AbortRemovesTmp) {
+TEST_CASE(DropRemovesTmp) {
     TempDir tmp;
     auto store = open_store(tmp);
     register_lru(store);
 
-    auto pending = store.begin_store("pch", "k1");
-    ASSERT_TRUE(fs::write(pending.tmp_path, "junk").has_value());
-    auto tmp_path = pending.tmp_path;
-    store.abort(pending);
+    // Self-cleaning is the abort: an entry destroyed without being
+    // committed removes its tmp file — including when a cancellation
+    // destroys the owning coroutine frame without resuming it.
+    std::string tmp_path;
+    {
+        auto pending = store.begin_store("pch", "k1");
+        ASSERT_TRUE(fs::write(pending.tmp_path, "junk").has_value());
+        tmp_path = pending.tmp_path;
+    }
 
     ASSERT_FALSE(llvm::sys::fs::exists(tmp_path));
     ASSERT_FALSE(store.lookup("pch", "k1").has_value());
+
+    // A moved-from entry no longer owns the tmp file.
+    auto pending = store.begin_store("pch", "k2");
+    ASSERT_TRUE(fs::write(pending.tmp_path, "junk").has_value());
+    auto second = pending.tmp_path;
+    {
+        auto moved = std::move(pending);
+        ASSERT_TRUE(llvm::sys::fs::exists(second));
+    }
+    ASSERT_FALSE(llvm::sys::fs::exists(second));
+
+    // Move assignment cleans the destination's own tmp before adopting.
+    auto lhs = store.begin_store("pch", "k3");
+    auto rhs = store.begin_store("pch", "k4");
+    ASSERT_TRUE(fs::write(lhs.tmp_path, "junk").has_value());
+    ASSERT_TRUE(fs::write(rhs.tmp_path, "junk").has_value());
+    auto third = lhs.tmp_path;
+    auto fourth = rhs.tmp_path;
+    lhs = std::move(rhs);
+    ASSERT_FALSE(llvm::sys::fs::exists(third));
+    ASSERT_TRUE(llvm::sys::fs::exists(fourth));
 }
 
 TEST_CASE(CommitWithoutWriteFails) {

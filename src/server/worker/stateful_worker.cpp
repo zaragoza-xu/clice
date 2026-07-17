@@ -1,5 +1,6 @@
 #include "server/worker/stateful_worker.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <list>
@@ -246,6 +247,34 @@ void StatefulWorker::register_handlers() {
 
                 worker::CompileResult result;
                 result.version = doc->version;
+
+                // A failed parse that blames the consumed PCH: either a
+                // diagnostic names the blob's path outright, or it is an
+                // AST-deserialization error naming no other prebuilt input
+                // (that family's messages do not reliably carry the path —
+                // "malformed or corrupted precompiled file: 'Blob ends too
+                // soon'"). User-code failures (missing include, modified
+                // header, bad flags) match neither, so the master never
+                // rebuilds an innocent shared PCH over a failure it did
+                // not cause. An anonymous read error with PCMs in play is
+                // ambiguous; blaming the PCH costs at most one retracted
+                // pair per round and self-corrects on the retry.
+                if(!doc->unit.completed() && !doc->pch.first.empty()) {
+                    result.pch_suspect =
+                        std::ranges::any_of(doc->unit.diagnostics(), [&](auto& diag) {
+                            llvm::StringRef message = diag.message;
+                            if(message.contains(doc->pch.first)) {
+                                return true;
+                            }
+                            if(!diag.id.is_deserialization_error()) {
+                                return false;
+                            }
+                            return std::ranges::none_of(doc->pcms, [&](auto& entry) {
+                                return message.contains(entry.getValue());
+                            });
+                        });
+                }
+
                 if(doc->unit.completed() || doc->unit.fatal_error()) {
                     auto diags = feature::diagnostics(doc->unit);
                     auto json = kota::codec::json::to_json<kota::ipc::lsp_config>(diags);
@@ -256,8 +285,13 @@ void StatefulWorker::register_handlers() {
                              diags.size(),
                              doc->unit.fatal_error());
                 } else {
+                    result.status = doc->unit.setup_fail() ? worker::CompileStatus::SetupFail
+                                                           : worker::CompileStatus::Cancelled;
                     result.diagnostics = kota::codec::RawValue{"[]"};
-                    LOG_WARN("Compile incomplete: path={}, {}ms", params.path, timer.ms());
+                    LOG_WARN("Compile incomplete: path={}, {}ms, setup_fail={}",
+                             params.path,
+                             timer.ms(),
+                             doc->unit.setup_fail());
                 }
                 result.memory_usage = 0;  // TODO: query actual memory
                 if(doc->unit.completed() && !stop->load(std::memory_order_relaxed)) {
@@ -272,6 +306,19 @@ void StatefulWorker::register_handlers() {
                     auto tu_index = index::TUIndex::build(doc->unit, true);
                     llvm::raw_string_ostream os(result.tu_index_data);
                     tu_index.serialize(os);
+                }
+
+                // A unit that is neither complete nor a fatal-error result
+                // can never serve a query (with_ast_or refuses it), yet it
+                // pins the consumed artifacts — on Windows a mapped PCH
+                // cannot be replaced on disk, so holding it would block
+                // the master's rebuild of a retracted pair. Drop it last,
+                // after every use of the unit above; queries observe
+                // has_ast == false and return their missing value until a
+                // compile lands.
+                if(!doc->unit.completed() && !doc->unit.fatal_error()) {
+                    doc->unit = CompilationUnit(nullptr);
+                    doc->has_ast = false;
                 }
                 return result;
             },

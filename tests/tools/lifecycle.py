@@ -8,17 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.tools.checks import assert_no_anomaly
-from tests.tools.client import CliceClient
-
-SANITIZER_MARKERS = (
-    "AddressSanitizer",
-    "LeakSanitizer",
-    "MemorySanitizer",
-    "ThreadSanitizer",
-    "UndefinedBehaviorSanitizer",
-    "==ERROR:",
-    "runtime error:",
-)
+from tests.tools.client import SANITIZER_MARKERS, CliceClient
 
 next_port_offset = 0
 
@@ -48,11 +38,17 @@ def find_free_port() -> int:
     raise RuntimeError(f"no free port in range {base}-{base + 99}")
 
 
-async def make_client(executable: Path, workspace: Path) -> CliceClient:
+async def make_client(
+    executable: Path,
+    workspace: Path,
+    *,
+    drain_stderr: bool = True,
+    initialization_options: dict | None = None,
+) -> CliceClient:
     """Spawn a fresh clice server and initialize it. For multi-session tests."""
     c = CliceClient()
-    await c.start_io(str(executable), "serve")
-    await c.initialize(workspace)
+    await c.start_io(str(executable), "serve", drain_stderr=drain_stderr)
+    await c.initialize(workspace, initialization_options=initialization_options)
     return c
 
 
@@ -78,7 +74,9 @@ def server_stderr_excerpt(stderr_text: str) -> str:
     return "\n".join(interesting[-80:])
 
 
-async def assert_server_exited_cleanly(server, timeout: float = 10.0) -> None:
+async def assert_server_exited_cleanly(
+    server, timeout: float = 10.0, client: CliceClient | None = None
+) -> None:
     failures: list[str] = []
 
     if server is None:
@@ -94,13 +92,29 @@ async def assert_server_exited_cleanly(server, timeout: float = 10.0) -> None:
 
     print(f"[server] exit code: {server.returncode}", flush=True)
 
+    # Collect stderr AFTER the exit wait: exit-time output (sanitizer
+    # reports, late crash text) must reach the scan below. When a pump is
+    # running it owns the stream — wait for it to see EOF instead of
+    # racing it with a second reader.
     stderr_text = ""
-    if server.stderr:
+    pump = client.stderr_pump if client else None
+    if pump is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(pump), timeout=2.0)
+        except Exception as exc:
+            # A pump that never saw EOF means the transcript below may be
+            # partial — the sanitizer scan must not silently pass on it.
+            failures.append(f"stderr pump did not complete: {exc!r}")
+    elif server.stderr:
         try:
             stderr_data = await asyncio.wait_for(server.stderr.read(), timeout=2.0)
             stderr_text = stderr_data.decode("utf-8", errors="replace")
         except Exception as exc:
             failures.append(f"failed to collect server stderr: {exc!r}")
+    if client is not None:
+        stderr_text = (
+            client.drained_stderr().decode("utf-8", errors="replace") + stderr_text
+        )
 
     for line in server_stderr_excerpt(stderr_text).splitlines():
         print(f"[server] {line}", flush=True)
@@ -108,7 +122,20 @@ async def assert_server_exited_cleanly(server, timeout: float = 10.0) -> None:
     if server.returncode != 0:
         failures.append(f"server exited with code {server.returncode}")
 
-    if any(marker in stderr_text for marker in SANITIZER_MARKERS):
+    # A client that drained continuously must never see the drop report:
+    # shedding under a live reader would mean ordinary tests silently lose
+    # parts of the stderr transcript they later assert on.
+    if client is not None and client.stderr_drained_from_start:
+        if "client not draining" in stderr_text:
+            failures.append("stderr mirror shed lines despite a draining client")
+
+    marker_hit = client.stderr_marker_hit if client else None
+    if marker_hit is not None:
+        excerpt = marker_hit.decode("utf-8", errors="replace")
+        failures.append(
+            f"server stderr contains sanitizer/runtime error output:\n{excerpt}"
+        )
+    elif any(marker in stderr_text for marker in SANITIZER_MARKERS):
         failures.append("server stderr contains sanitizer/runtime error output")
 
     if failures:
@@ -136,7 +163,7 @@ async def shutdown_client(c: CliceClient, *, verbose: bool = False) -> None:
             print(f"[logMessage/{level}] {msg.message}", flush=True)
 
     try:
-        await assert_server_exited_cleanly(c.server)
+        await assert_server_exited_cleanly(c.server, client=c)
     finally:
         try:
             await c.stop_io()

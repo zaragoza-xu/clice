@@ -602,6 +602,25 @@ void LSPClient::register_extensions() {
             }
             co_return to_raw(ext::PollResult{static_cast<std::uint32_t>(events.size())});
         });
+
+    peer.on_request("clice/internal/logFlood",
+                    [this](RequestContext& ctx, const ext::LogFloodParams& params) -> RawResult {
+                        // Load-generating hook: a stray client must not be able to
+                        // bloat the file log, so it only exists when the harness asked
+                        // for it at initialize time.
+                        if(!this->server.workspace.config.project.test_hooks.value_or(false)) {
+                            co_return kota::outcome_error(
+                                kota::ipc::Error{protocol::ErrorCode::InvalidRequest,
+                                                 "test hooks are not enabled"});
+                        }
+                        auto count = std::min<std::uint32_t>(params.count, 100'000);
+                        auto size = std::clamp<std::uint32_t>(params.size, 16, 4096);
+                        std::string padding(size, 'f');
+                        for(std::uint32_t i = 0; i < count; ++i) {
+                            LOG_INFO("[stderr-flood {}] {}", i, padding);
+                        }
+                        co_return to_raw(ext::LogFloodResult{count});
+                    });
 }
 
 /// Publish clice.toml load problems as diagnostics, each on its own file's

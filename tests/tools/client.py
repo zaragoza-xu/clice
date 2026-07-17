@@ -49,6 +49,21 @@ from lsprotocol.types import (
 )
 from pygls.lsp.client import BaseLanguageClient
 
+# Sanitizer/crash fingerprints scanned in server stderr. Detection happens
+# incrementally in the pump: a mid-session report (e.g. relayed from a
+# crashed worker) must survive the retention cap's eviction.
+SANITIZER_MARKERS = (
+    "AddressSanitizer",
+    "LeakSanitizer",
+    "MemorySanitizer",
+    "ThreadSanitizer",
+    "UndefinedBehaviorSanitizer",
+    "==ERROR:",
+    "runtime error:",
+)
+
+SANITIZER_MARKER_BYTES = tuple(m.encode() for m in SANITIZER_MARKERS)
+
 
 class CliceClient(BaseLanguageClient):
     """Language client that tracks server-sent notifications and provides
@@ -63,6 +78,12 @@ class CliceClient(BaseLanguageClient):
         self.progress_events: list[dict] = []
         self.init_result: InitializeResult | None = None
         self.workspace: Path | None = None
+        self.stderr_chunks: list[bytes] = []
+        self.stderr_retained = 0
+        self.stderr_pump: asyncio.Task | None = None
+        self.stderr_drained_from_start = True
+        self.stderr_marker_hit: bytes | None = None
+        self.stderr_scan_carry = b""
 
         @self.feature(TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS)
         def on_diagnostics(params: PublishDiagnosticsParams) -> None:
@@ -138,6 +159,66 @@ class CliceClient(BaseLanguageClient):
 
     # Single home for the pygls internals these wrap; tests must not poke
     # at _server/_stop_event/_async_tasks directly.
+
+    async def start_io(self, *args, drain_stderr: bool = True, **kwargs) -> None:
+        await super().start_io(*args, **kwargs)
+        # The server treats stderr as best-effort, but a client that never
+        # reads it forfeits the full mirror (lines are dropped once the
+        # pipe fills). Drain it continuously so long tests keep the whole
+        # transcript; backpressure tests opt out to play the hostile client.
+        self.stderr_drained_from_start = drain_stderr
+        if drain_stderr and self._server and self._server.stderr:
+            self.spawn_stderr_pump()
+
+    def spawn_stderr_pump(self) -> None:
+        """Start the continuous stderr drain if none is running.
+        Backpressure tests spawn it late: asyncio pauses an undrained
+        stderr transport at its buffer limit, and Process.wait() cannot
+        observe pipe EOF — hence process exit — until reading resumes."""
+        if self.stderr_pump is not None and not self.stderr_pump.done():
+            return
+        self.stderr_pump = asyncio.get_running_loop().create_task(
+            self.pump_server_stderr()
+        )
+        self._async_tasks.append(self.stderr_pump)
+
+    # Retention cap for drained stderr: long stress runs mirror the whole
+    # server log, and the teardown scans only need the tail (sanitizer
+    # reports and crash text arrive at exit).
+    STDERR_RETAIN_BYTES = 8 * 1024 * 1024
+
+    async def pump_server_stderr(self) -> None:
+        assert self._server is not None and self._server.stderr is not None
+        while True:
+            data = await self._server.stderr.read(65536)
+            if not data:
+                return
+            self.scan_for_markers(data)
+            self.stderr_chunks.append(data)
+            self.stderr_retained += len(data)
+            while (
+                self.stderr_retained > self.STDERR_RETAIN_BYTES
+                and len(self.stderr_chunks) > 1
+            ):
+                self.stderr_retained -= len(self.stderr_chunks.pop(0))
+
+    def scan_for_markers(self, data: bytes) -> None:
+        """Latch the earliest sanitizer fingerprint and keep appending
+        context from later reads; the carry covers markers split across
+        read boundaries."""
+        if self.stderr_marker_hit is not None:
+            if len(self.stderr_marker_hit) < 4096:
+                self.stderr_marker_hit += data[: 4096 - len(self.stderr_marker_hit)]
+            return
+        window = self.stderr_scan_carry + data
+        hits = [at for m in SANITIZER_MARKER_BYTES if (at := window.find(m)) >= 0]
+        if hits:
+            self.stderr_marker_hit = window[min(hits) : min(hits) + 4096]
+            return
+        self.stderr_scan_carry = window[-64:]
+
+    def drained_stderr(self) -> bytes:
+        return b"".join(self.stderr_chunks)
 
     @property
     def server(self) -> asyncio.subprocess.Process | None:

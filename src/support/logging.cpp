@@ -6,11 +6,10 @@
 #include <string>
 
 #include "support/filesystem.h"
+#include "support/stderr_sink.h"
 
 #include "spdlog/sinks/basic_file_sink.h"
 #include "spdlog/sinks/ringbuffer_sink.h"
-#include "spdlog/sinks/stdout_color_sinks.h"
-#include "spdlog/sinks/stdout_sinks.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Signals.h"
 
@@ -25,7 +24,7 @@ constexpr static auto pattern = "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] [%s
 void stderr_logger(std::string_view name, const Options& options) {
     std::shared_ptr<spdlog::logger> logger;
 
-    auto console_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>(options.color);
+    auto console_sink = std::make_shared<StderrSink>();
     if(options.replay_console) {
         ringbuffer_sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(128);
         std::array<spdlog::sink_ptr, 2> sinks = {console_sink, ringbuffer_sink};
@@ -64,14 +63,23 @@ void file_logger(std::string_view name,
     auto replay_buffer = ringbuffer_sink;
 
     llvm::SmallVector<spdlog::sink_ptr, 2> sinks = {file_sink};
+    std::shared_ptr<StderrSink> mirror;
     if(mirror_stderr) {
-        sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>(options.color));
+        mirror = std::make_shared<StderrSink>();
+        sinks.push_back(mirror);
     }
     auto logger = std::make_shared<spdlog::logger>(std::string(name), sinks.begin(), sinks.end());
     logger->set_level(options.level);
     logger->set_pattern(pattern);
     logger->flush_on(Level::trace);
     spdlog::set_default_logger(std::move(logger));
+
+    if(mirror && mirror->inoperative()) {
+        // The mirror fails closed (drops everything) rather than risk the
+        // caller blocking on an unswitchable pipe; say so where it can be
+        // seen — the file log.
+        LOG_WARN("stderr mirror disabled: pipe could not be switched to non-blocking");
+    }
 
     // Replay buffered logs after swapping the default logger, so no messages
     // emitted between the snapshot and the swap are lost.
@@ -113,6 +121,10 @@ void install_crash_handler(std::string_view log_path, bool stderr_trace) {
     llvm::sys::AddSignalHandler(crash_handler, nullptr);
     // Workers skip the stderr backtrace: their crash traces belong in their
     // own log file only, not relayed into the master log via the stderr pipe.
+    // Crash-only exception to the never-blocked-by-the-client rule: LLVM's
+    // raw_ostream spins on a full non-blocking pipe, so a crash trace to an
+    // undrained stderr can stall the dying process. The same trace already
+    // reached the log file above, unaffected by fd 2's state.
     if(stderr_trace) {
         llvm::sys::PrintStackTraceOnErrorSignal("clice");
     }

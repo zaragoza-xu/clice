@@ -235,6 +235,7 @@ FeatureRouter::RawResult FeatureRouter::code_action(std::shared_ptr<Session> ses
 
 FeatureRouter::RawResult FeatureRouter::completion(std::shared_ptr<Session> session,
                                                    const protocol::Position& position,
+                                                   llvm::StringRef trigger_character,
                                                    std::optional<kota::cancellation_token> token) {
     auto pause = indexer.scoped_pause();
 
@@ -252,8 +253,21 @@ FeatureRouter::RawResult FeatureRouter::completion(std::shared_ptr<Session> sess
 
     auto map = session->line_map();
     auto offset = map.to_offset(position);
+
+    PreambleCompletionContext pctx;
     if(offset) {
-        auto pctx = detect_completion_context(session->text, *offset);
+        pctx = detect_completion_context(session->text, *offset);
+    }
+
+    // Space is advertised as a trigger character only so that `import `
+    // opens module suggestions. Clients without request-side gating
+    // (nvim, zed) forward every space keystroke; answer everything else
+    // with an empty list before any include scanning or completion build.
+    if(trigger_character == " " && pctx.kind != CompletionContext::Import) {
+        co_return serde_raw{"[]"};
+    }
+
+    if(offset) {
         if(pctx.kind == CompletionContext::IncludeQuoted ||
            pctx.kind == CompletionContext::IncludeAngled) {
             std::string directory;

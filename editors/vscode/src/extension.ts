@@ -83,6 +83,23 @@ export async function activate(context: ExtensionContext) {
         synchronize: {
             fileEvents: workspace.createFileSystemWatcher("**/.clientrc"),
         },
+        middleware: {
+            // Space triggers exist only for `import ` module completion.
+            // This guard is intentionally stricter than the server-side
+            // detection (exact single-space forms only): it merely avoids
+            // request round-trips, while the server independently answers
+            // space triggers outside import contexts with an empty list.
+            provideCompletionItem: async (document, position, context, token, next) => {
+                if (context.triggerCharacter === " ") {
+                    const line = document.lineAt(position.line).text.slice(0, position.character);
+                    const trimmed = line.trimStart();
+                    if (trimmed !== "import " && trimmed !== "export import ") {
+                        return [];
+                    }
+                }
+                return next(document, position, context, token);
+            },
+        },
     };
 
     client = new LanguageClient("clice", "clice", serverOptions, clientOptions);

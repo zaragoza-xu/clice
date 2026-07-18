@@ -148,6 +148,37 @@ class ContextTreeProvider implements vscode.TreeDataProvider<ContextTreeItem> {
     }
 }
 
+/** Re-sync an open document with the server (didClose + didOpen) so the
+ * editor re-requests every language feature — tokens, links, hints — and
+ * the recompile publishes fresh diagnostics. Used after a context switch:
+ * the pull-based server only re-targets the session. The language-id
+ * round-trip is the only stable way to force a full re-sync; buffer
+ * content and unsaved edits survive it. */
+export async function resyncDocument(uri: string) {
+    const doc = vscode.workspace.textDocuments.find(
+        (candidate) => candidate.uri.toString() === uri,
+    );
+    if (!doc) {
+        return;
+    }
+    const language = doc.languageId;
+    resyncing.add(uri);
+    try {
+        await vscode.languages.setTextDocumentLanguage(doc, "plaintext");
+        await vscode.languages.setTextDocumentLanguage(doc, language);
+    } catch {
+        // The document was closed mid-round-trip; nothing left to resync,
+        // and the caller's UI refresh must still run.
+    } finally {
+        resyncing.delete(uri);
+    }
+}
+
+/** Documents mid-resync: their transient plaintext hop must not be
+ * mistaken by detectCxxFragment for a fragment awaiting detection — the
+ * detector would race the restore and pin a c/cuda-cpp file to cpp. */
+const resyncing = new Set<string>();
+
 export function registerCompilationContext(client: LanguageClient, ext: vscode.ExtensionContext) {
     const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     status.command = "clice.switchContext";
@@ -204,9 +235,12 @@ export function registerCompilationContext(client: LanguageClient, ext: vscode.E
         } else if (!switched?.success) {
             vscode.window.showWarningMessage("clice: failed to switch compilation context");
         } else {
-            // The switch only marks the session dirty (pull-based server);
-            // fire a cheap feature request so diagnostics and inactive
-            // regions refresh without waiting for user interaction.
+            // The server is pull-based: the switch only re-targets the
+            // session, and the refresh is the client's job.
+            await resyncDocument(uri);
+            // Editors with automatic feature pulls disabled stop at the
+            // reopen (didOpen alone compiles nothing); one cheap explicit
+            // pull guarantees diagnostics come back regardless.
             void vscode.commands.executeCommand(
                 "vscode.executeDocumentSymbolProvider",
                 vscode.Uri.parse(uri),
@@ -279,7 +313,7 @@ export function registerCompilationContext(client: LanguageClient, ext: vscode.E
     // by some C++ TU (it has compilation contexts), flip its language so
     // the whole toolchain attaches.
     async function detectCxxFragment(document: vscode.TextDocument) {
-        if (document.languageId !== "plaintext") {
+        if (document.languageId !== "plaintext" || resyncing.has(document.uri.toString())) {
             return;
         }
         if (!/\.(def|inc|inl|tpp|ipp)$/.test(document.uri.fsPath)) {

@@ -20,7 +20,7 @@ option(CLICE_OFFLINE_BUILD "Disable network downloads during configuration" OFF)
 option(CLICE_ENABLE_TEST "Build unit tests" OFF)
 option(CLICE_CI_ENVIRONMENT "Enable CI-specific configuration" OFF)
 option(CLICE_ENABLE_BENCHMARK "Build benchmarks" OFF)
-option(CLICE_RELEASE "Enable release packaging (LTO + strip + pack)" OFF)
+option(CLICE_RELEASE "Enable release packaging (strip + pack + link optimizations)" OFF)
 
 # Global flags that apply to all targets (including FetchContent dependencies).
 if(NOT MSVC)
@@ -32,8 +32,10 @@ if(APPLE)
     add_compile_definitions(_LIBCPP_DISABLE_AVAILABILITY=1)
 endif()
 
-if(MSVC OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
-            CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+# Keyed on the target OS, not the compiler frontend: CI links Windows with
+# GNU-driver clang++ + lld-link, where the frontend variant is "GNU" but the
+# linker still speaks MSVC-style /OPT flags (see the Debug /OPT:NOICF below).
+if(WIN32)
     string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,/OPT:REF")
     string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,/OPT:REF")
 elseif(APPLE)
@@ -50,9 +52,11 @@ if(CLICE_USE_LIBCXX)
     string(APPEND CMAKE_SHARED_LINKER_FLAGS " -stdlib=libc++")
 endif()
 
-if(CLICE_RELEASE)
-    set(CLICE_ENABLE_LTO ON)
-endif()
+# Releases deliberately do NOT enable LTO yet: ThinLTO's cross-TU inlining
+# defeats kota's out-of-line workaround for llvm-project#105595 (clang < 21
+# drops coroutine promise policy writes under -O3), which silently breaks
+# cancellation — six cancellation unit tests fail on any ThinLTO build.
+# Re-enable together with the clang 21 toolchain upgrade.
 
 if(CLICE_ENABLE_LTO)
     string(APPEND CMAKE_C_FLAGS " -flto=thin")
@@ -60,6 +64,21 @@ if(CLICE_ENABLE_LTO)
     string(APPEND CMAKE_EXE_LINKER_FLAGS " -flto=thin")
     string(APPEND CMAKE_SHARED_LINKER_FLAGS " -flto=thin")
     string(APPEND CMAKE_MODULE_LINKER_FLAGS " -flto=thin")
+endif()
+
+if(CLICE_RELEASE)
+    # Identical code folding is release-only: folded functions share one
+    # address, which hurts debugging and profiling in dev builds. icf=safe
+    # (not =all) so address-taken functions keep C++ pointer identity.
+    if(WIN32)
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,/OPT:ICF")
+    elseif(APPLE)
+        # --keep-icf-stabs: without it dsymutil cannot see ICF-folded symbols,
+        # so they would be missing from the dSYM (and thus from GSYM).
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--icf=safe -Wl,--keep-icf-stabs")
+    else()
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--icf=safe -Wl,-O2")
+    endif()
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")

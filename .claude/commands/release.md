@@ -4,7 +4,7 @@ Operate the three-tier release process: instant builds, nightlies, and stable re
 
 One version number everywhere: git tag `vX.Y.Z` == extension version == release
 page. Odd minor = pre-release channel, even minor = stable (the VS Code
-Marketplace convention). Nightlies compute `X.<odd>.YYMMDDHH` (UTC hour) on the
+Marketplace convention). Nightlies compute `X.<odd>.YYYYMMDDHH` (UTC hour) on the
 odd minor above the newest release — `0.1.*` today, `0.3.*` after stable
 `v0.2.0` — so nobody edits version numbers by hand. The versions in `CMakeLists.txt`, `pixi.toml`,
 and `editors/vscode/package.json` are permanent placeholders (`0.1.0`); the
@@ -23,41 +23,57 @@ have them set `clice.executable` to the extracted binary.
 ## Tier 2 — Nightly (pre-release channel)
 
 `nightly.yml` runs daily (cron) or via `gh workflow run nightly.yml`:
-skips when main has no new commits, otherwise tags the nightly version, builds the
-full release matrix (ICF + strip + GSYM symbols), publishes a GitHub
-pre-release and Marketplace `--pre-release`, and prunes odd-minor pre-releases
-older than 30 days. A failed nightly just means no nightly that day — fix main
-and rerun via dispatch.
+skips when main has no new commits, otherwise tags the nightly version and
+**promotes** — nothing is rebuilt. Every main CI run already packages the
+binaries its test suites validated (strip + GSYM happen in the build jobs);
+nightly picks the newest main commit whose green run still has live
+package artifacts (path-filtered runs such as docs-only commits build
+nothing), tags exactly that commit, downloads its packages, attaches them
+to a GitHub pre-release plus the Marketplace `--pre-release` channel, and
+prunes odd-minor pre-releases older than 30 days. Promotion fails loudly
+if no packaged green run exists. A failed nightly just means no nightly
+that day — fix main and rerun via dispatch.
+
+The binary embeds its build identity (`git describe`: nearest tag + commit
+hash), not the release tag — the tag is applied after the build. Match crash
+logs to releases by the commit hash; the release notes state the hash.
 
 ## Tier 3 — Stable release (manual, even minor)
 
 1. Freeze: stop merging features; the last nightlies of the freeze are the RCs.
 2. When a nightly is judged good, tag its commit: `git tag v0.2.0 <commit> && git push origin v0.2.0`.
-   The tag push runs the release path of `main.yml` (packages + extensions,
-   Marketplace without `--pre-release`).
+   The tag push runs the release path of `main.yml`, which promotes the
+   already-tested packages from that commit's green CI run and publishes the
+   extensions (Marketplace without `--pre-release`). The promote path
+   creates the GitHub release if the tag push did not. Package artifacts
+   expire 30 days after the CI run, so the tagged commit's run must be
+   less than a month old — for an older commit, rerun its main workflow
+   first to regenerate the packages.
 3. Write the release notes on the GitHub release page (the download table
    format from the nightly notes is a good template).
 4. Verify: assets present (6 packages + 4 symbol archives + 2 PDB zips +
    6 vsix), Marketplace shows the new stable version.
 
-## Dry run / plumbing changes
+## Plumbing changes
 
-PRs touching release plumbing (publish workflows, `cmake/release.cmake`,
-`cmake/archive.cmake`, `CMakeLists.txt`) automatically run the full 6+6 dry
-run via the `release-check-*` jobs; `gh workflow run main.yml --ref <branch>`
-does the same on demand. Uploads stay tag-gated, so nothing publishes.
+There is no separate dry run: packaging runs on every CI build (the
+`Package release artifacts` steps in native-test/cross-pair) and the vsix
+path runs as `instant-vscode`, so release plumbing is exercised by every
+code-touching PR. Only the promote/upload glue (`publish-clice.yml`,
+nightly orchestration) is release-time-only.
 
 ## Crash log support
 
 Ask the user for the log (worker `.log` from the workspace `.clice/logs/` or
 the cache dir). The crash section starts with `clice <version> <target>` —
-download that release's `*-symbol.tar.xz` (GSYM) and run:
+download that release's `*.symbols.tar.xz` (GSYM) and run:
 
 ```bash
 python scripts/symbolize.py crash.log --symbols clice.gsym
 ```
 
-For core-dump-level debugging, fetch the full DWARF from the release run's
-`debug-info-*` workflow artifact (90-day retention). If the log predates the
+For core-dump-level debugging, fetch the full DWARF from the `debug-info-*`
+artifact of the main CI run that built the release (90-day retention; find
+it via the commit hash in the release notes). If the log predates the
 version line or the release was pruned, symbolization is not possible — ask
 the user to reproduce on a current nightly.

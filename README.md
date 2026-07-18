@@ -29,19 +29,26 @@ Download the latest binary from the [releases page](https://github.com/clice-io/
 
 **Release channels:**
 
-- **Stable** (even minor, e.g. `v0.2.0`) — regular releases on the releases page and the VS Code Marketplace.
-- **Nightly** (odd minor, e.g. `v0.1.26071802`) — built daily from `main`, published as GitHub pre-releases and on the Marketplace pre-release channel (`Switch to Pre-Release Version` on the extension page). Nightlies older than 30 days are removed.
+| Channel        | Version                           | Where to get it                                                                                                                                             |
+| -------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stable**     | even minor, e.g. `v0.2.0`         | [releases page](https://github.com/clice-io/clice/releases) + [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=clice-io.clice)     |
+| **Nightly**    | odd minor, e.g. `v0.1.2026071902` | [GitHub pre-releases](https://github.com/clice-io/clice/releases) + Marketplace pre-release channel (`Switch to Pre-Release Version` on the extension page) |
+| **Per-commit** | untagged                          | artifacts on the [latest green `main` CI runs](https://github.com/clice-io/clice/actions/workflows/main.yml?query=branch%3Amain+is%3Asuccess)               |
 
-Each release also ships `*-symbol` packages: if clice crashes, attach the log from your workspace's `.clice/logs/` to an issue and the matching symbols let us reconstruct the stack.
+The versioning rule is the VS Code Marketplace convention: **even minor = stable, odd minor = pre-release**. Nightly patch numbers encode the UTC build time as `YYYYMMDDHH` (year, month, day, hour — e.g. `2026071902` is 2026-07-19 02:00 UTC), so newer is always higher; a nightly is published only when `main` gained commits, and nightlies older than 30 days are removed. Every published binary is the exact one that passed the full test suites — releases promote CI builds rather than rebuilding.
+
+For the freshest bits, every green [`main` CI run](https://github.com/clice-io/clice/actions/workflows/main.yml?query=branch%3Amain+is%3Asuccess) attaches installable artifacts (binaries and platform vsix) to its run page, so a fix can be tried the moment it merges (GitHub login required for artifact downloads).
+
+Each release also ships `*.symbols` packages: if clice crashes, attach the newest log from your workspace's `.clice/logs/` to an issue and the matching symbols let us reconstruct the exact stack.
 
 ### Editor Setup
 
-| Editor      | Setup                                                                                                                      |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------- |
-| **VS Code** | Install the [clice extension](https://marketplace.visualstudio.com/items?itemName=ykiko.clice-vscode) from the Marketplace |
-| **Neovim**  | Add `editors/nvim` to your runtime path: `vim.opt.rtp:append("/path/to/clice/editors/nvim")`                               |
-| **Zed**     | Load `editors/zed` as a local extension                                                                                    |
-| **Other**   | Any LSP client works — point it at `clice serve`                                                                           |
+| Editor      | Setup                                                                                                                  |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **VS Code** | Install the [clice extension](https://marketplace.visualstudio.com/items?itemName=clice-io.clice) from the Marketplace |
+| **Neovim**  | Add `editors/nvim` to your runtime path: `vim.opt.rtp:append("/path/to/clice/editors/nvim")`                           |
+| **Zed**     | Load `editors/zed` as a local extension                                                                                |
+| **Other**   | Any LSP client works — point it at `clice serve`                                                                       |
 
 ### Project Setup
 
@@ -54,7 +61,7 @@ cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 By default clice searches the workspace root and its immediate subdirectories (e.g. `build/`) for `compile_commands.json`. See [configuration](https://docs.clice.io/clice/guide/configuration) for custom paths and other build systems.
 
 > [!NOTE]
-> clice is approaching its first stable release. Most features work well, but some edge cases remain. Bug reports via [issues](https://github.com/clice-io/clice/issues) are welcome.
+> clice is in beta on the road to its first stable release: nightlies are ready to try today. Bug reports via [issues](https://github.com/clice-io/clice/issues) are welcome.
 
 ## Documentation
 

@@ -20,7 +20,6 @@ option(CLICE_OFFLINE_BUILD "Disable network downloads during configuration" OFF)
 option(CLICE_ENABLE_TEST "Build unit tests" OFF)
 option(CLICE_CI_ENVIRONMENT "Enable CI-specific configuration" OFF)
 option(CLICE_ENABLE_BENCHMARK "Build benchmarks" OFF)
-option(CLICE_RELEASE "Enable release packaging (strip + pack + link optimizations)" OFF)
 
 # Global flags that apply to all targets (including FetchContent dependencies).
 if(NOT MSVC)
@@ -66,18 +65,31 @@ if(CLICE_ENABLE_LTO)
     string(APPEND CMAKE_MODULE_LINKER_FLAGS " -flto=thin")
 endif()
 
-if(CLICE_RELEASE)
-    # Identical code folding is release-only: folded functions share one
-    # address, which hurts debugging and profiling in dev builds. icf=safe
-    # (not =all) so address-taken functions keep C++ pointer identity.
+# Link optimizations are the default for optimized builds: what the test
+# suites run is byte-for-byte what releases ship. Debug keeps the ASan
+# friendly flags below instead. icf=safe (not =all) so address-taken
+# functions keep C++ pointer identity.
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     if(WIN32)
-        string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,/OPT:ICF")
+        # SAFEICF, not ICF: plain /OPT:ICF folds address-taken functions.
+        set(CLICE_LINK_OPT_FLAGS "-Wl,/OPT:SAFEICF")
     elseif(APPLE)
         # --keep-icf-stabs: without it dsymutil cannot see ICF-folded symbols,
         # so they would be missing from the dSYM (and thus from GSYM).
-        string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--icf=safe -Wl,--keep-icf-stabs")
+        set(CLICE_LINK_OPT_FLAGS "-Wl,--icf=safe" "-Wl,--keep-icf-stabs")
     else()
-        string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--icf=safe -Wl,-O2")
+        set(CLICE_LINK_OPT_FLAGS "-Wl,--icf=safe" "-Wl,-O2")
+    endif()
+
+    # Only lld understands these; manual builds on the system linker
+    # (ld.bfd, Apple ld64) build fine without them.
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "${CLICE_LINK_OPT_FLAGS}" CLICE_LINKER_OPT_SUPPORTED)
+    if(CLICE_LINKER_OPT_SUPPORTED)
+        string(JOIN " " CLICE_LINK_OPT_FLAGS ${CLICE_LINK_OPT_FLAGS})
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " ${CLICE_LINK_OPT_FLAGS}")
+    else()
+        message(STATUS "Linker rejects ${CLICE_LINK_OPT_FLAGS}; skipping link optimizations")
     endif()
 endif()
 
@@ -171,24 +183,22 @@ set(CLICE_VERSION_HEADER "${PROJECT_BINARY_DIR}/generated/version.h")
 # cross builds (see cmake/toolchain.cmake); native builds compose the same
 # arch-os-abi form the release asset names use, so a crash log names the
 # exact downloadable artifact.
-if(CLICE_TARGET_TRIPLE STREQUAL "x86_64-apple-darwin")
-    set(CLICE_TARGET_STRING "x86_64-macos-darwin")
-elseif(CLICE_TARGET_TRIPLE STREQUAL "aarch64-pc-windows-msvc")
-    set(CLICE_TARGET_STRING "aarch64-windows-msvc")
-elseif(DEFINED CLICE_TARGET_TRIPLE)
-    set(CLICE_TARGET_STRING "${CLICE_TARGET_TRIPLE}")
+if(DEFINED CLICE_TARGET_TRIPLE)
+    string(TOLOWER "${CLICE_TARGET_TRIPLE}" CLICE_TARGET_RAW)
 else()
-    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CLICE_TARGET_ARCH)
-    if(CLICE_TARGET_ARCH STREQUAL "amd64")
-        set(CLICE_TARGET_ARCH "x64")
-    endif()
-    if(WIN32)
-        set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-windows-msvc")
-    elseif(APPLE)
-        set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-macos-darwin")
-    else()
-        set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-linux-gnu")
-    endif()
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}-${CMAKE_SYSTEM_NAME}" CLICE_TARGET_RAW)
+endif()
+if(CLICE_TARGET_RAW MATCHES "^(x86_64|amd64|x64)")
+    set(CLICE_TARGET_ARCH "x64")
+else()
+    set(CLICE_TARGET_ARCH "arm64")
+endif()
+if(CLICE_TARGET_RAW MATCHES "windows")
+    set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-windows-msvc")
+elseif(CLICE_TARGET_RAW MATCHES "darwin|apple|macos")
+    set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-macos-darwin")
+else()
+    set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-linux-gnu")
 endif()
 add_custom_target(generate_version_header
     COMMAND ${CMAKE_COMMAND}
@@ -274,6 +284,4 @@ if(CLICE_ENABLE_BENCHMARK)
     target_link_libraries(scan_benchmark PRIVATE clice::core kota::deco)
 endif()
 
-if(CLICE_RELEASE)
-    include("${PROJECT_SOURCE_DIR}/cmake/release.cmake")
-endif()
+include("${PROJECT_SOURCE_DIR}/cmake/release.cmake")

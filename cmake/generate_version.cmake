@@ -23,13 +23,37 @@ if(CLICE_TOPLEVEL_RESULT EQUAL 0 AND NOT CLICE_GIT_TOPLEVEL STREQUAL "")
     file(REAL_PATH "${CLICE_GIT_TOPLEVEL}" CLICE_GIT_TOPLEVEL)
     file(REAL_PATH "${SOURCE_DIR}" CLICE_SOURCE_REAL)
     if(CLICE_GIT_TOPLEVEL STREQUAL CLICE_SOURCE_REAL)
+        # A commit can carry several tags (a stable tag placed on a nightly's
+        # commit); describe alone picks one nondeterministically, so prefer
+        # the highest exact tag by version sort.
         execute_process(
-            COMMAND git -C "${SOURCE_DIR}" describe --tags --always --dirty
-            OUTPUT_VARIABLE CLICE_GIT_DESCRIBE
+            COMMAND git -C "${SOURCE_DIR}" tag --points-at HEAD --sort=-v:refname
+            OUTPUT_VARIABLE CLICE_HEAD_TAGS
             OUTPUT_STRIP_TRAILING_WHITESPACE
             ERROR_QUIET
-            RESULT_VARIABLE CLICE_GIT_RESULT
         )
+        if(NOT CLICE_HEAD_TAGS STREQUAL "")
+            string(REGEX REPLACE "\n.*" "" CLICE_GIT_DESCRIBE "${CLICE_HEAD_TAGS}")
+            # Keep parity with describe --dirty: a modified tree must not
+            # claim to be the pristine tagged artifact.
+            execute_process(
+                COMMAND git -C "${SOURCE_DIR}" diff-index --quiet HEAD --
+                RESULT_VARIABLE CLICE_DIRTY_RESULT
+                ERROR_QUIET
+            )
+            if(NOT CLICE_DIRTY_RESULT EQUAL 0)
+                string(APPEND CLICE_GIT_DESCRIBE "-dirty")
+            endif()
+            set(CLICE_GIT_RESULT 0)
+        else()
+            execute_process(
+                COMMAND git -C "${SOURCE_DIR}" describe --tags --always --dirty
+                OUTPUT_VARIABLE CLICE_GIT_DESCRIBE
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+                RESULT_VARIABLE CLICE_GIT_RESULT
+            )
+        endif()
     endif()
 endif()
 
@@ -46,5 +70,7 @@ else()
     # A tag without the v prefix: use the describe output verbatim.
     set(CLICE_VERSION_STRING "${CLICE_GIT_DESCRIBE}")
 endif()
+
+set(CLICE_TARGET_STRING "${TARGET_STRING}")
 
 configure_file("${TEMPLATE}" "${OUTPUT_FILE}" @ONLY)

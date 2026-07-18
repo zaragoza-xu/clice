@@ -167,10 +167,34 @@ add_custom_target(generate_flatbuffers_schema DEPENDS "${GENERATED_HEADER}")
 # Version header, regenerated on every build so the embedded git describe
 # tracks the checked-out commit (content-unchanged writes are elided).
 set(CLICE_VERSION_HEADER "${PROJECT_BINARY_DIR}/generated/version.h")
+# Target identifier stamped next to the version: the explicit triple for
+# cross builds (see cmake/toolchain.cmake); native builds compose the same
+# arch-os-abi form the release asset names use, so a crash log names the
+# exact downloadable artifact.
+if(CLICE_TARGET_TRIPLE STREQUAL "x86_64-apple-darwin")
+    set(CLICE_TARGET_STRING "x86_64-macos-darwin")
+elseif(CLICE_TARGET_TRIPLE STREQUAL "aarch64-pc-windows-msvc")
+    set(CLICE_TARGET_STRING "aarch64-windows-msvc")
+elseif(DEFINED CLICE_TARGET_TRIPLE)
+    set(CLICE_TARGET_STRING "${CLICE_TARGET_TRIPLE}")
+else()
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CLICE_TARGET_ARCH)
+    if(CLICE_TARGET_ARCH STREQUAL "amd64")
+        set(CLICE_TARGET_ARCH "x64")
+    endif()
+    if(WIN32)
+        set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-windows-msvc")
+    elseif(APPLE)
+        set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-macos-darwin")
+    else()
+        set(CLICE_TARGET_STRING "${CLICE_TARGET_ARCH}-linux-gnu")
+    endif()
+endif()
 add_custom_target(generate_version_header
     COMMAND ${CMAKE_COMMAND}
         -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
         -DFALLBACK_VERSION=${PROJECT_VERSION}
+        -DTARGET_STRING=${CLICE_TARGET_STRING}
         -DTEMPLATE=${PROJECT_SOURCE_DIR}/cmake/version.h.in
         -DOUTPUT_FILE=${CLICE_VERSION_HEADER}
         -P "${PROJECT_SOURCE_DIR}/cmake/generate_version.cmake"

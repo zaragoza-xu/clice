@@ -43,9 +43,25 @@ static std::string resolve_xdg_cache_dir(llvm::StringRef workspace_root) {
         return {};
     }
 
-    // Use a hash of workspace_root to create a unique subdirectory.
+    // "<basename>-<hash>": the basename lets users map cache directories
+    // back to their workspaces, the hash keeps same-named workspaces apart.
     auto hash = llvm::xxh3_64bits(workspace_root);
-    auto dir = path::join(base, "clice", std::format("{:016x}", hash));
+    llvm::StringRef name = path::filename(workspace_root.rtrim("/\\"));
+    if(name.empty() || name == "." || name == "..")
+        name = "workspace";
+    // Keep the leaf well under filesystem name limits (255 bytes on common
+    // filesystems) without splitting a UTF-8 sequence mid-codepoint.
+    if(name.size() > 64) {
+        name = name.take_front(64);
+        while(!name.empty() && (static_cast<unsigned char>(name.back()) & 0xC0) == 0x80)
+            name = name.drop_back();
+        // A complete trailing character loses its continuation bytes above;
+        // drop its lead byte too rather than keep invalid UTF-8.
+        if(!name.empty() && static_cast<unsigned char>(name.back()) >= 0xC0)
+            name = name.drop_back();
+    }
+    auto dir =
+        path::join(base, "clice", std::format("{}-{:08x}", name, static_cast<std::uint32_t>(hash)));
 
     if(auto ec = llvm::sys::fs::create_directories(dir)) {
         LOG_WARN("Failed to create XDG cache directory {}: {}", dir, ec.message());

@@ -74,6 +74,16 @@ void MasterServer::initialize() {
                                                    &config_issues,
                                                    &config_path,
                                                    /*with_defaults=*/false);
+    // Capture the raw sources now: the configuration dump below can only run
+    // once the merged config has named the log directory.
+    std::string raw_toml;
+    if(!config_path.empty()) {
+        if(auto content = fs::read(config_path)) {
+            raw_toml = std::move(*content);
+        }
+    }
+    std::string raw_init_options = init_options_json;
+
     if(!init_options_json.empty()) {
         if(auto ov = kota::codec::json::parse(init_options_json, workspace.config); !ov) {
             LOG_GUIDANCE("Failed to apply initializationOptions: {}", ov.error().to_string());
@@ -91,8 +101,30 @@ void MasterServer::initialize() {
         auto pid = llvm::sys::Process::getProcessId();
         session_log_dir =
             path::join(cfg.logging_dir, std::format("{:%Y-%m-%d_%H-%M-%S}_{}", now, pid));
-        logging::file_logger("master", session_log_dir, logging::options);
-        LOG_INFO("Session log directory: {}", session_log_dir);
+        if(logging::file_logger("master", session_log_dir, logging::options)) {
+            LOG_INFO("Session log directory: {}", session_log_dir);
+        }
+    }
+
+    // Dump every configuration layer — the config file verbatim, the
+    // client's initializationOptions overlay, and the merged result after
+    // defaults. Absence is stated explicitly so "was my config even read?"
+    // never needs a support round-trip; the stderr mirror puts all of it in
+    // the editor's output panel.
+    if(config_path.empty()) {
+        LOG_INFO("Configuration file: Missing");
+    } else {
+        LOG_INFO("Configuration file {}:\n{}", config_path, raw_toml);
+    }
+    if(raw_init_options.empty()) {
+        LOG_INFO("initializationOptions: Missing");
+    } else {
+        auto pretty = kota::codec::json::prettify(raw_init_options);
+        LOG_INFO("initializationOptions:\n{}", pretty ? *pretty : raw_init_options);
+    }
+    if(auto json = kota::codec::json::to_string(workspace.config)) {
+        auto pretty = kota::codec::json::prettify(*json);
+        LOG_INFO("Effective configuration:\n{}", pretty ? *pretty : *json);
     }
 
     LOG_INFO("Server ready (stateful={}, stateless={}, idle={}ms)",

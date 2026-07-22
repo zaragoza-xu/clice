@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "test/fixture.h"
 #include "test/test.h"
 #include "test/tester.h"
 #include "feature/feature.h"
@@ -437,6 +438,16 @@ TEST_CASE(snapshot) {
         test_dir + "/folding_range",
         "**/*.cpp",
         [&](std::string_view path) -> std::string {
+            // `status: unsupported` fixtures are pinned to an explicit
+            // UNSUPPORTED marker instead of being compiled: zest's glob
+            // has no per-file skip. Everything else compiles verbatim —
+            // the frontmatter is an ordinary comment to the compiler.
+            auto buffer = llvm::MemoryBuffer::getFile(path);
+            if(!buffer)
+                return "COMPILE_ERROR";
+            if(fixture_frontmatter((*buffer)->getBuffer(), "status") == "unsupported")
+                return "UNSUPPORTED";
+
             if(!compile_file(path))
                 return "COMPILE_ERROR";
             auto ranges = feature::folding_ranges(*unit);

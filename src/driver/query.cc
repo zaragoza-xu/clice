@@ -9,7 +9,6 @@ import :project.configuration;
 import :project.open_index;
 import :server.counterparts;
 import :server.query_commands;
-import :support.text;
 
 namespace clice::driver {
 
@@ -41,37 +40,23 @@ struct QueryOptions {
     <std::string> method;
 
     DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "File the question is about (relative to the workspace)",
+           help =
+               "File a file question is about (relative to the workspace): compileCommand, "
+               "fileDeps, impactAnalysis, counterparts, documentSymbols",
            required = false)
     <std::string> path;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate, help = "Symbol name", required = false)
-    <std::string> name;
-
     DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Symbol id (the #<hex> of an earlier answer)",
+           help =
+               "Symbol a symbol question is about, or the symbols symbolSearch lists, as a "
+               "locator: a name, an answer's symbol, or file:line[:column]",
            required = false)
     <std::string> symbol;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "1-based line, with --path, naming the symbol defined there",
-           required = false)
-    <int> line;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "symbolSearch: text to search",
-           required = false)
-    <std::string> query;
 
     DecoKV(style = KVStyle::JoinedOrSeparate,
            help = "symbolSearch: at most this many symbols (default 100)",
            required = false)
     <int> limit;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "symbolSearch: comma-separated symbol kinds to keep (Function, Struct, ...)",
-           required = false)
-    <std::string> kind;
 
     DecoKV(style = KVStyle::JoinedOrSeparate,
            help = "projectFiles: all (default), source, header or module",
@@ -110,6 +95,8 @@ constexpr llvm::StringLiteral build_methods[] = {"compileCommand",
                                                  "fileDeps",
                                                  "impactAnalysis",
                                                  "counterparts"};
+constexpr llvm::StringLiteral symbol_methods[] =
+    {"symbolSearch", "readSymbol", "definition", "references", "callGraph", "typeHierarchy"};
 constexpr llvm::StringLiteral index_methods[] = {"symbolSearch",
                                                  "readSymbol",
                                                  "documentSymbols",
@@ -160,25 +147,15 @@ Reply answer(Project& project,
                 render_json(Answer{.result = std::move(*outcome), .stale = std::move(stale)});
         } else {
             reply.exit_code = 1;
-            reply.json = render_json(
-                Failure{.error = std::move(outcome.error()), .stale = std::move(stale)});
+            reply.json =
+                render_json(symbol_failure(std::move(outcome.error()), ctx, std::move(stale)));
         }
-    };
-    // A file named by --path that the index holds no rows for is reported
-    // next to the rows the query withheld.
-    auto locator = [&]() -> std::expected<index::SymbolQuery, std::string> {
-        auto query = locator_of(opts, absolute);
-        if(query && opts.path) {
-            auto file = project.file_table.intern(absolute);
-            if(!project.project_index.shard(file)) {
-                ctx.unindexed.emplace_back(project.file_table.display(file));
-                return std::unexpected("symbol not found");
-            }
-        }
-        return query;
     };
 
-    if(method == "compileCommand") {
+    if(opts.path && llvm::is_contained(symbol_methods, method)) {
+        emit(query::Outcome<int>(std::unexpected(
+            "--path names the file of a file question; narrow a symbol with path: in --symbol")));
+    } else if(method == "compileCommand") {
         emit(query::compile_command(ctx, absolute));
     } else if(method == "projectFiles") {
         emit(query::project_files(ctx, opts.filter.value_or("all")));
@@ -191,12 +168,11 @@ Reply answer(Project& project,
     } else if(method == "symbolSearch") {
         auto limit = opts.limit.value_or(100);
         emit(query::symbol_search(ctx,
-                                  opts.query.value_or(""),
-                                  static_cast<std::size_t>(std::max(limit, 0)),
-                                  comma_list(opts.kind.value_or(""))));
+                                  opts.symbol.value_or(""),
+                                  static_cast<std::size_t>(std::max(limit, 0))));
     } else if(method == "documentSymbols") {
         emit(query::document_symbols(ctx, absolute));
-    } else if(auto query = locator(); !query) {
+    } else if(auto query = locator_of(opts.symbol.as_optional()); !query) {
         emit(query::Outcome<int>(std::unexpected(query.error())));
     } else if(method == "readSymbol") {
         emit(query::read_symbol(ctx, std::move(*query)));

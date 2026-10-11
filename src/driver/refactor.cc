@@ -34,22 +34,11 @@ struct RefactorOptions {
     <std::string> configuration;
 
     DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "File of the symbol (relative to the workspace)",
-           required = false)
-    <std::string> path;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate, help = "Symbol name", required = false)
-    <std::string> name;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Symbol id (the #<hex> of an earlier answer)",
+           help =
+               "rename: the symbol, as a locator: its whole name, an answer's symbol, or "
+               "file:line[:column]",
            required = false)
     <std::string> symbol;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "1-based line, with --path, naming the symbol defined there",
-           required = false)
-    <int> line;
 
     DecoKV(style = KVStyle::JoinedOrSeparate, help = "rename: the new name", required = false)
     <std::string> to;
@@ -140,6 +129,11 @@ int run_rename(const RefactorOptions& opts, const char* self_path) {
         print_json(Failure{.error = "--to names the new name"});
         return 1;
     }
+    auto locator = locator_of(opts.symbol.as_optional());
+    if(!locator) {
+        print_json(Failure{.error = locator.error()});
+        return 1;
+    }
     auto spelling = workspace_spelling(opts.workspace.value_or(""));
     CanonicalPath root(spelling);
     auto configuration = opts.configuration.value_or("");
@@ -174,7 +168,6 @@ int run_rename(const RefactorOptions& opts, const char* self_path) {
     index::FreshnessGate gate(files, {.check_disk = true});
     index::IndexQuery index_query(project.project_index, files, &gate, nullptr);
     query::Context ctx{.project = project, .contexts = contexts, .query = index_query};
-    auto absolute = opts.path ? inspected_path(project, *opts.path) : Spelling();
 
     auto stale = [&](llvm::ArrayRef<std::string> listed) {
         std::vector<std::string> all(listed.begin(), listed.end());
@@ -192,15 +185,9 @@ int run_rename(const RefactorOptions& opts, const char* self_path) {
         return all;
     };
 
-    auto locator = locator_of(opts, absolute);
-    if(!locator) {
-        print_json(Failure{.error = locator.error(), .stale = stale({})});
-        return 1;
-    }
-
     auto planned = query::rename(ctx, std::move(*locator), *opts.to);
     if(!planned) {
-        print_json(Failure{.error = planned.error(), .stale = stale({})});
+        print_json(symbol_failure(std::move(planned.error()), ctx, stale({})));
         return 1;
     }
 

@@ -14,7 +14,7 @@ namespace clice::index {
 
 /// How a blob encodes its variant masks, a strict function of the variant
 /// count.
-enum class MaskTier : std::uint8_t {
+enum class MaskEncoding : std::uint8_t {
     /// One variant: no mask columns at all.
     Single,
     U32,
@@ -28,19 +28,19 @@ using BlobView = kota::codec::fbs::table_view<ShardBlob>;
 
 /// Load-time verification outcome: the violated invariant, spelled for the
 /// log, or success.
-using Verdict = std::expected<void, llvm::StringRef>;
+using CheckResult = std::expected<void, llvm::StringRef>;
 
-MaskTier tier_of(std::size_t variant_count) {
+MaskEncoding encoding_of(std::size_t variant_count) {
     if(variant_count <= 1) {
-        return MaskTier::Single;
+        return MaskEncoding::Single;
     }
     if(variant_count <= 32) {
-        return MaskTier::U32;
+        return MaskEncoding::U32;
     }
     if(variant_count <= 64) {
-        return MaskTier::U64;
+        return MaskEncoding::U64;
     }
-    return MaskTier::Roaring;
+    return MaskEncoding::Roaring;
 }
 
 /// The blob was fully verified at load; per-query views skip that cost.
@@ -60,8 +60,8 @@ std::size_t variant_count_of(BlobView root) {
     return stored.empty() ? 1 : stored.size();
 }
 
-MaskTier tier_of(BlobView root) {
-    return tier_of(variant_count_of(root));
+MaskEncoding encoding_of(BlobView root) {
+    return encoding_of(variant_count_of(root));
 }
 
 /// The no-range sentinel of pair relations: the default LocalSourceRange.
@@ -69,7 +69,7 @@ bool is_no_range(std::uint32_t begin, std::uint32_t end) {
     return LocalSourceRange{begin, end} == LocalSourceRange{};
 }
 
-/// The symbol-id column of one row table in whichever width the blob
+/// The symbol-id column of one entry table in whichever width the blob
 /// stores; validation proves exactly one width is present.
 struct SymIds {
     llvm::ArrayRef<std::uint8_t> ids8;
@@ -93,14 +93,14 @@ struct SymIds {
 
 }  // namespace
 
-/// One side of the blob's row storage as contiguous column refs,
-/// tier-agnostic: the range accessors read whichever range tier the blob
-/// stores, the mask columns whichever mask tier.
-struct RowColumns {
+/// One side of the blob's entry storage as contiguous column refs,
+/// encoding-agnostic: the range accessors read whichever range encoding the
+/// blob stores, the mask columns whichever mask encoding.
+struct RangeColumnsView {
     llvm::ArrayRef<std::uint32_t> packed;
     llvm::ArrayRef<std::uint32_t> begins;
     llvm::ArrayRef<std::uint8_t> lengths;
-    llvm::ArrayRef<std::uint32_t> long_rows;
+    llvm::ArrayRef<std::uint32_t> long_entries;
     llvm::ArrayRef<std::uint32_t> long_ends;
     llvm::ArrayRef<std::uint32_t> masks32;
     llvm::ArrayRef<std::uint64_t> masks64;
@@ -111,64 +111,65 @@ struct RowColumns {
         return packed.empty() ? begins.size() : packed.size();
     }
 
-    std::uint32_t begin_of(std::uint32_t row) const {
+    std::uint32_t begin_of(std::uint32_t entry) const {
         if(packed.empty()) {
-            return begins[row];
+            return begins[entry];
         }
-        return packed[row] == packed_sentinel ? ~std::uint32_t(0) : packed[row] >> 8;
+        return packed[entry] == packed_sentinel ? ~std::uint32_t(0) : packed[entry] >> 8;
     }
 
-    std::uint32_t end_of(std::uint32_t row) const {
-        if(!packed.empty() && packed[row] == packed_sentinel) {
+    std::uint32_t end_of(std::uint32_t entry) const {
+        if(!packed.empty() && packed[entry] == packed_sentinel) {
             return ~std::uint32_t(0);
         }
-        auto length = packed.empty() ? lengths[row] : static_cast<std::uint8_t>(packed[row] & 0xff);
+        auto length =
+            packed.empty() ? lengths[entry] : static_cast<std::uint8_t>(packed[entry] & 0xff);
         if(length == length_escape) {
             // validate() proves every sentinel owns exactly one escape
-            // entry, so the search always lands.
-            auto it = std::ranges::lower_bound(long_rows, row);
-            return long_ends[it - long_rows.begin()];
+            // entry, so the search always finds it.
+            auto it = std::ranges::lower_bound(long_entries, entry);
+            return long_ends[it - long_entries.begin()];
         }
-        return begin_of(row) + length;
+        return begin_of(entry) + length;
     }
 
-    LocalSourceRange range_of(std::uint32_t row) const {
-        return {begin_of(row), end_of(row)};
+    LocalSourceRange range_of(std::uint32_t entry) const {
+        return {begin_of(entry), end_of(entry)};
     }
 
     /// The slice bounds were validated monotonic and in-bounds at load, and
     /// every slice proven to decode, so this cannot fail.
-    Bitmap bitmap_of(std::uint32_t row) const {
-        auto begin = roaring_offsets[row];
-        return *view_bitmap(roaring.data() + begin, roaring_offsets[row + 1] - begin);
+    Bitmap bitmap_of(std::uint32_t entry) const {
+        auto begin = roaring_offsets[entry];
+        return *view_bitmap(roaring.data() + begin, roaring_offsets[entry + 1] - begin);
     }
 };
 
 /// The live mask against one side's mask columns, resolved once per query.
 struct LiveFilter {
-    /// Fast path: every stored variant is live, no per-row filtering.
+    /// Fast path: every stored variant is live, no per-entry filtering.
     bool all;
-    MaskTier tier;
+    MaskEncoding encoding;
     std::uint64_t bits;
     const Bitmap* big;
-    const RowColumns* columns;
+    const RangeColumnsView* columns;
 
-    bool operator()(std::uint32_t row) const {
+    bool operator()(std::uint32_t entry) const {
         if(all) {
             return true;
         }
-        switch(tier) {
-            case MaskTier::Single: {
+        switch(encoding) {
+            case MaskEncoding::Single: {
                 return (bits & 1) != 0;
             }
-            case MaskTier::U32: {
-                return (columns->masks32[row] & static_cast<std::uint32_t>(bits)) != 0;
+            case MaskEncoding::U32: {
+                return (columns->masks32[entry] & static_cast<std::uint32_t>(bits)) != 0;
             }
-            case MaskTier::U64: {
-                return (columns->masks64[row] & bits) != 0;
+            case MaskEncoding::U64: {
+                return (columns->masks64[entry] & bits) != 0;
             }
-            case MaskTier::Roaring: {
-                return columns->bitmap_of(row).intersect(*big);
+            case MaskEncoding::Roaring: {
+                return columns->bitmap_of(entry).intersect(*big);
             }
         }
         std::unreachable();
@@ -177,32 +178,32 @@ struct LiveFilter {
 
 namespace {
 
-RowColumns columns_of(kota::codec::fbs::table_view<RowRanges> view) {
+RangeColumnsView columns_of(kota::codec::fbs::table_view<RangeColumns> view) {
     if(!view.valid()) {
         return {};
     }
     return {
-        to_array_ref(view[&RowRanges::packed]),
-        to_array_ref(view[&RowRanges::begins]),
-        to_array_ref(view[&RowRanges::lengths]),
-        to_array_ref(view[&RowRanges::long_rows]),
-        to_array_ref(view[&RowRanges::long_ends]),
-        to_array_ref(view[&RowRanges::masks32]),
-        to_array_ref(view[&RowRanges::masks64]),
-        to_array_ref(view[&RowRanges::roaring_offsets]),
-        to_array_ref(view[&RowRanges::roaring]),
+        to_array_ref(view[&RangeColumns::packed]),
+        to_array_ref(view[&RangeColumns::begins]),
+        to_array_ref(view[&RangeColumns::lengths]),
+        to_array_ref(view[&RangeColumns::long_entries]),
+        to_array_ref(view[&RangeColumns::long_ends]),
+        to_array_ref(view[&RangeColumns::masks32]),
+        to_array_ref(view[&RangeColumns::masks64]),
+        to_array_ref(view[&RangeColumns::roaring_offsets]),
+        to_array_ref(view[&RangeColumns::roaring]),
     };
 }
 
-/// The occurrence table: each row's range and the symbol it names.
+/// The occurrence table: each occurrence's range and the symbol it names.
 struct OccurrenceTable {
-    RowColumns rows;
+    RangeColumnsView columns;
     SymIds syms;
     llvm::ArrayRef<std::uint64_t> sym_hashes;
 
     static OccurrenceTable of(BlobView root) {
         return {
-            .rows = columns_of(root[&ShardBlob::occs]),
+            .columns = columns_of(root[&ShardBlob::occs]),
             .syms = {to_array_ref(root[&ShardBlob::occ_syms8]),
                      to_array_ref(root[&ShardBlob::occ_syms16]),
                      to_array_ref(root[&ShardBlob::occ_syms32])},
@@ -211,39 +212,39 @@ struct OccurrenceTable {
     }
 
     std::size_t size() const {
-        return rows.size();
+        return columns.size();
     }
 
-    Occurrence at(std::uint32_t row) const {
-        return {rows.range_of(row), sym_hashes[syms[row]]};
+    Occurrence at(std::uint32_t entry) const {
+        return {columns.range_of(entry), sym_hashes[syms[entry]]};
     }
 };
 
-/// The relation table: rows grouped per symbol, each with its kind, range
-/// and payload. Payloads live in two sparse tables — decl/def rows carry a
-/// definition range, symbol-pair rows the target's id — walked by a cursor
-/// in row order.
+/// The relation table: relations grouped per symbol, each with its kind,
+/// range and payload. Payloads live in two sparse tables — decl/def
+/// relations carry a definition range, symbol-pair relations the target's
+/// id — walked by a cursor in stored order.
 struct RelationTable {
-    RowColumns rows;
+    RangeColumnsView columns;
     llvm::ArrayRef<std::uint8_t> kinds;
-    llvm::ArrayRef<std::uint32_t> sym_rows;
+    llvm::ArrayRef<std::uint32_t> sym_entries;
     SymIds syms;
-    llvm::ArrayRef<std::uint32_t> def_rows;
+    llvm::ArrayRef<std::uint32_t> def_entries;
     llvm::ArrayRef<std::uint32_t> def_begins;
     llvm::ArrayRef<std::uint32_t> def_ends;
     llvm::ArrayRef<std::uint64_t> sym_hashes;
-    /// Entry i's rows occupy [offsets[i], offsets[i + 1]).
+    /// Entry i's relations occupy [offsets[i], offsets[i + 1]).
     llvm::ArrayRef<std::uint32_t> offsets;
 
     static RelationTable of(BlobView root) {
         return {
-            .rows = columns_of(root[&ShardBlob::rels]),
+            .columns = columns_of(root[&ShardBlob::rels]),
             .kinds = to_array_ref(root[&ShardBlob::rel_kinds]),
-            .sym_rows = to_array_ref(root[&ShardBlob::rel_sym_rows]),
+            .sym_entries = to_array_ref(root[&ShardBlob::rel_sym_entries]),
             .syms = {to_array_ref(root[&ShardBlob::rel_sym8]),
                      to_array_ref(root[&ShardBlob::rel_sym16]),
                      to_array_ref(root[&ShardBlob::rel_sym32])},
-            .def_rows = to_array_ref(root[&ShardBlob::rel_def_rows]),
+            .def_entries = to_array_ref(root[&ShardBlob::rel_def_entries]),
             .def_begins = to_array_ref(root[&ShardBlob::rel_def_begins]),
             .def_ends = to_array_ref(root[&ShardBlob::rel_def_ends]),
             .sym_hashes = to_array_ref(root[&ShardBlob::sym_hashes]),
@@ -252,43 +253,45 @@ struct RelationTable {
     }
 
     std::size_t size() const {
-        return rows.size();
+        return columns.size();
     }
 
-    RelationKind kind_of(std::uint32_t row) const {
-        return static_cast<RelationKind::Kind>(kinds[row]);
+    RelationKind kind_of(std::uint32_t entry) const {
+        return static_cast<RelationKind::Kind>(kinds[entry]);
     }
 
     /// Positions in the two payload tables; decode() advances them, so
-    /// rows must be visited in ascending order from where the cursor was
+    /// relations must be visited in ascending order from where the cursor was
     /// seeked.
     struct Cursor {
         std::size_t sym = 0;
         std::size_t def = 0;
     };
 
-    Cursor cursor_at(std::uint32_t row) const {
+    Cursor cursor_at(std::uint32_t entry) const {
         return {
-            static_cast<std::size_t>(std::ranges::lower_bound(sym_rows, row) - sym_rows.begin()),
-            static_cast<std::size_t>(std::ranges::lower_bound(def_rows, row) - def_rows.begin()),
+            static_cast<std::size_t>(std::ranges::lower_bound(sym_entries, entry) -
+                                     sym_entries.begin()),
+            static_cast<std::size_t>(std::ranges::lower_bound(def_entries, entry) -
+                                     def_entries.begin()),
         };
     }
 
-    Relation decode(std::uint32_t row, Cursor& cursor) const {
-        while(cursor.sym < sym_rows.size() && sym_rows[cursor.sym] < row) {
+    Relation decode(std::uint32_t entry, Cursor& cursor) const {
+        while(cursor.sym < sym_entries.size() && sym_entries[cursor.sym] < entry) {
             cursor.sym += 1;
         }
-        while(cursor.def < def_rows.size() && def_rows[cursor.def] < row) {
+        while(cursor.def < def_entries.size() && def_entries[cursor.def] < entry) {
             cursor.def += 1;
         }
         Relation relation{
-            .kind = kind_of(row),
-            .range = rows.range_of(row),
+            .kind = kind_of(entry),
+            .range = columns.range_of(entry),
             .target_symbol = 0,
         };
-        if(cursor.def < def_rows.size() && def_rows[cursor.def] == row) {
+        if(cursor.def < def_entries.size() && def_entries[cursor.def] == entry) {
             relation.set_definition_range({def_begins[cursor.def], def_ends[cursor.def]});
-        } else if(cursor.sym < sym_rows.size() && sym_rows[cursor.sym] == row) {
+        } else if(cursor.sym < sym_entries.size() && sym_entries[cursor.sym] == entry) {
             relation.target_symbol = sym_hashes[syms[cursor.sym]];
         }
         return relation;
@@ -347,27 +350,27 @@ struct LocalTable {
     }
 };
 
-/// The escape table must pair one-to-one, in row order, with the sentinel
+/// The escape table must pair one-to-one, in column order, with the sentinel
 /// lengths: readers trust the pairing, and a sentinel missing its entry
 /// (or a stray entry masking one elsewhere) can pass every range bound
 /// while serving a wrong value forever.
 bool escapes_ok(llvm::ArrayRef<std::uint8_t> lengths,
-                llvm::ArrayRef<std::uint32_t> escape_rows,
+                llvm::ArrayRef<std::uint32_t> escaped,
                 std::size_t escape_values) {
-    if(escape_values != escape_rows.size()) {
+    if(escape_values != escaped.size()) {
         return false;
     }
     std::size_t cursor = 0;
-    for(std::uint32_t row = 0; row < lengths.size(); row += 1) {
-        if(lengths[row] != length_escape) {
+    for(std::uint32_t entry = 0; entry < lengths.size(); entry += 1) {
+        if(lengths[entry] != length_escape) {
             continue;
         }
-        if(cursor == escape_rows.size() || escape_rows[cursor] != row) {
+        if(cursor == escaped.size() || escaped[cursor] != entry) {
             return false;
         }
         cursor += 1;
     }
-    return cursor == escape_rows.size();
+    return cursor == escaped.size();
 }
 
 /// Sentinel lengths inside the packed column, extracted for escapes_ok.
@@ -382,16 +385,16 @@ llvm::SmallVector<std::uint8_t> packed_lengths(llvm::ArrayRef<std::uint32_t> pac
     return lengths;
 }
 
-/// A sparse row table: one value per listed row, rows strictly ascending
-/// and inside the row count.
-bool sparse_ok(llvm::ArrayRef<std::uint32_t> rows, std::size_t values, std::size_t count) {
-    return rows.size() == values && std::ranges::is_sorted(rows, std::less_equal{}) &&
-           (rows.empty() || rows.back() < count);
+/// A sparse entry table: one value per listed entry, entries strictly
+/// ascending and inside the entry count.
+bool sparse_ok(llvm::ArrayRef<std::uint32_t> entries, std::size_t values, std::size_t count) {
+    return entries.size() == values && std::ranges::is_sorted(entries, std::less_equal{}) &&
+           (entries.empty() || entries.back() < count);
 }
 
-/// Exactly one id width, chosen by the symbol table's size, one id per row
+/// Exactly one id width, chosen by the symbol table's size, one id per entry
 /// and every id inside the table.
-Verdict sym_ids_ok(const SymIds& ids, std::size_t count, std::size_t table_size) {
+CheckResult sym_ids_ok(const SymIds& ids, std::size_t count, std::size_t table_size) {
     if(ids.size() != count) {
         return std::unexpected("symbol id column does not match the row count");
     }
@@ -411,12 +414,12 @@ Verdict sym_ids_ok(const SymIds& ids, std::size_t count, std::size_t table_size)
 }
 
 // A variant is identified by its hash everywhere (set_live, the merge
-// keep filter), so stored hashes must be unique: rows owned only by a
-// duplicated entry would serve and survive compaction with no
-// contribution owning them.
-Verdict variants_ok(BlobView root) {
+// keep filter), so stored hashes must be unique: occurrences and
+// relations owned only by a duplicated entry would serve and survive
+// compaction with no contribution owning them.
+CheckResult variants_ok(BlobView root) {
     auto variants = to_array_ref(root[&ShardBlob::variants]);
-    llvm::SmallVector<RowsHash> sorted(variants.begin(), variants.end());
+    llvm::SmallVector<VariantHash> sorted(variants.begin(), variants.end());
     std::ranges::sort(sorted);
     if(std::ranges::adjacent_find(sorted) != sorted.end()) {
         return std::unexpected("duplicate variant identity");
@@ -424,7 +427,7 @@ Verdict variants_ok(BlobView root) {
     return {};
 }
 
-Verdict content_ok(BlobView root) {
+CheckResult content_ok(BlobView root) {
     auto content = to_ref(root[&ShardBlob::content]);
     if(content.empty()) {
         return {};
@@ -432,7 +435,7 @@ Verdict content_ok(BlobView root) {
     // Every freshness decision compares the advertised content hash
     // (manifest FileVersions, the merge's generation checks), so content
     // bytes corrupted under an intact structure would keep loading as
-    // fresh while position mapping reads text the rows were not built
+    // fresh while position mapping reads text the shard was not built
     // from.
     if(content.size() != root[&ShardBlob::content_size] ||
        llvm::xxh3_64bits(content) != root[&ShardBlob::content_hash]) {
@@ -451,14 +454,13 @@ Verdict content_ok(BlobView root) {
 // corruption. When the content is stored, the sum check is not enough: a
 // table redistributing bytes between lines keeps the sum intact, so every
 // start must match the one the content derives.
-Verdict line_table_ok(BlobView root) {
+CheckResult line_table_ok(BlobView root) {
     auto content = to_ref(root[&ShardBlob::content]);
     auto line_lengths = to_array_ref(root[&ShardBlob::line_lengths]);
-    auto long_line_rows = to_array_ref(root[&ShardBlob::long_line_rows]);
+    auto long_lines = to_array_ref(root[&ShardBlob::long_lines]);
     auto long_line_lengths = to_array_ref(root[&ShardBlob::long_line_lengths]);
-    if(line_lengths.empty() ||
-       !escapes_ok(line_lengths, long_line_rows, long_line_lengths.size()) ||
-       !std::ranges::is_sorted(long_line_rows, std::less_equal{})) {
+    if(line_lengths.empty() || !escapes_ok(line_lengths, long_lines, long_line_lengths.size()) ||
+       !std::ranges::is_sorted(long_lines, std::less_equal{})) {
         return std::unexpected("line table does not pair with its escape table");
     }
     std::vector<std::uint32_t> starts;
@@ -475,16 +477,16 @@ Verdict line_table_ok(BlobView root) {
                                crlf_lines.size() > (line_lengths.size() + 63) / 64)) {
         return std::unexpected("CRLF line table is not canonical");
     }
-    auto ends_crlf = [&](std::size_t row) {
-        return row / 64 < crlf_lines.size() && ((crlf_lines[row / 64] >> (row % 64)) & 1) != 0;
+    auto ends_crlf = [&](std::size_t line) {
+        return line / 64 < crlf_lines.size() && ((crlf_lines[line / 64] >> (line % 64)) & 1) != 0;
     };
     std::uint64_t line_sum = 0;
     std::size_t escape_cursor = 0;
-    for(std::size_t row = 0; row < line_lengths.size(); row += 1) {
-        if(!starts.empty() && starts[row] != line_sum) {
+    for(std::size_t line = 0; line < line_lengths.size(); line += 1) {
+        if(!starts.empty() && starts[line] != line_sum) {
             return std::unexpected("line table does not match the stored content");
         }
-        std::uint32_t length = line_lengths[row];
+        std::uint32_t length = line_lengths[line];
         if(length == length_escape) {
             length = long_line_lengths[escape_cursor];
             escape_cursor += 1;
@@ -492,7 +494,7 @@ Verdict line_table_ok(BlobView root) {
                 return std::unexpected("escaped line length below the escape threshold");
             }
         }
-        if(ends_crlf(row) && (length < 2 || row + 1 == line_lengths.size())) {
+        if(ends_crlf(line) && (length < 2 || line + 1 == line_lengths.size())) {
             return std::unexpected("CRLF bit on a line that cannot end in CRLF");
         }
         line_sum += length;
@@ -506,7 +508,7 @@ Verdict line_table_ok(BlobView root) {
 // Strictly sorted symbol hashes: lookups lower-bound the hash column and
 // read only the first match's slices, so a duplicated hash would strand
 // the later id's relations and local name unreachably.
-Verdict symbol_table_ok(BlobView root) {
+CheckResult symbol_table_ok(BlobView root) {
     auto sym_hashes = to_array_ref(root[&ShardBlob::sym_hashes]);
     auto offsets = to_array_ref(root[&ShardBlob::sym_rel_offsets]);
     if(offsets.size() != sym_hashes.size() + 1) {
@@ -521,23 +523,23 @@ Verdict symbol_table_ok(BlobView root) {
     return {};
 }
 
-// Exactly one range tier, chosen by the content size, with its escape
+// Exactly one range encoding, chosen by the content size, with its escape
 // table paired on both sides.
-Verdict range_tiers_ok(BlobView root) {
+CheckResult range_encodings_ok(BlobView root) {
     auto content_size = root[&ShardBlob::content_size];
     for(auto columns: {columns_of(root[&ShardBlob::occs]), columns_of(root[&ShardBlob::rels])}) {
-        bool tier_ok =
+        bool encoding_ok =
             content_size <= packed_range_limit
                 ? columns.begins.empty() && columns.lengths.empty()
                 : columns.packed.empty() && columns.lengths.size() == columns.begins.size();
-        if(!tier_ok) {
+        if(!encoding_ok) {
             return std::unexpected("range tier is not the canonical one");
         }
         bool escaped_ok =
             columns.packed.empty()
-                ? escapes_ok(columns.lengths, columns.long_rows, columns.long_ends.size())
+                ? escapes_ok(columns.lengths, columns.long_entries, columns.long_ends.size())
                 : escapes_ok(packed_lengths(columns.packed),
-                             columns.long_rows,
+                             columns.long_entries,
                              columns.long_ends.size());
         if(!escaped_ok) {
             return std::unexpected("range escape table does not pair with its rows");
@@ -547,16 +549,16 @@ Verdict range_tiers_ok(BlobView root) {
 }
 
 // lookup(offset) binary-searches the decoded end column and stops its
-// containment walk on begin order; rows out of either order (a corrupt
+// containment walk on begin order; occurrences out of either order (a corrupt
 // escaped end included) would silently miss or misresolve occurrences on
 // every query, forever — reject the blob so it is rebuilt instead. Ends
 // are bounded by the content size too: every decoded range is served as
 // a source range into the content.
-// The merge also two-way merges rows under the full (begin, end, sym)
-// key with equal-key rows combined at write time, so equal ranges must
+// The merge also two-way merges occurrences under the full (begin, end, sym)
+// key with equal-key occurrences combined at write time, so equal ranges must
 // carry strictly ascending symbols — sym_hashes is strictly sorted, so
 // id order stands in for hash order.
-Verdict occurrences_ok(BlobView root) {
+CheckResult occurrences_ok(BlobView root) {
     auto table = OccurrenceTable::of(root);
     if(auto ok = sym_ids_ok(table.syms, table.size(), table.sym_hashes.size()); !ok) {
         return ok;
@@ -565,14 +567,14 @@ Verdict occurrences_ok(BlobView root) {
     std::uint32_t prev_begin = 0;
     std::uint32_t prev_end = 0;
     std::uint32_t prev_sym = 0;
-    for(std::uint32_t row = 0; row < table.size(); row += 1) {
-        auto begin = table.rows.begin_of(row);
-        auto end = table.rows.end_of(row);
-        auto sym = table.syms[row];
+    for(std::uint32_t entry = 0; entry < table.size(); entry += 1) {
+        auto begin = table.columns.begin_of(entry);
+        auto end = table.columns.end_of(entry);
+        auto sym = table.syms[entry];
         if(begin < prev_begin || end < prev_end || end < begin || end > content_size) {
             return std::unexpected("occurrence rows are out of order or past the content");
         }
-        if(row != 0 && begin == prev_begin && end == prev_end && sym <= prev_sym) {
+        if(entry != 0 && begin == prev_begin && end == prev_end && sym <= prev_sym) {
             return std::unexpected("occurrence rows of one range are not strictly ascending");
         }
         prev_begin = begin;
@@ -582,7 +584,7 @@ Verdict occurrences_ok(BlobView root) {
     return {};
 }
 
-Verdict relations_ok(BlobView root) {
+CheckResult relations_ok(BlobView root) {
     auto table = RelationTable::of(root);
     auto content_size = root[&ShardBlob::content_size];
     if(table.kinds.size() != table.size()) {
@@ -595,11 +597,11 @@ Verdict relations_ok(BlobView root) {
     // for pair relations, which carry no range of their own; every other
     // kind is written with a real range, so a sentinel there is corruption
     // that would serve an invalid source range forever.
-    for(std::uint32_t row = 0; row < table.size(); row += 1) {
-        auto begin = table.rows.begin_of(row);
-        auto end = table.rows.end_of(row);
+    for(std::uint32_t entry = 0; entry < table.size(); entry += 1) {
+        auto begin = table.columns.begin_of(entry);
+        auto end = table.columns.end_of(entry);
         if(is_no_range(begin, end)) {
-            if(!table.kind_of(row).isBetweenSymbol()) {
+            if(!table.kind_of(entry).isBetweenSymbol()) {
                 return std::unexpected("no-range sentinel on a relation that carries a range");
             }
             continue;
@@ -609,13 +611,13 @@ Verdict relations_ok(BlobView root) {
         }
     }
 
-    if(!sparse_ok(table.sym_rows, table.syms.size(), table.size())) {
+    if(!sparse_ok(table.sym_entries, table.syms.size(), table.size())) {
         return std::unexpected("relation target table is not sparse over the rows");
     }
-    if(auto ok = sym_ids_ok(table.syms, table.sym_rows.size(), table.sym_hashes.size()); !ok) {
+    if(auto ok = sym_ids_ok(table.syms, table.sym_entries.size(), table.sym_hashes.size()); !ok) {
         return ok;
     }
-    if(!sparse_ok(table.def_rows, table.def_begins.size(), table.size()) ||
+    if(!sparse_ok(table.def_entries, table.def_begins.size(), table.size()) ||
        table.def_ends.size() != table.def_begins.size()) {
         return std::unexpected("definition range table is not sparse over the rows");
     }
@@ -625,38 +627,38 @@ Verdict relations_ok(BlobView root) {
         }
     }
 
-    // The writer splits payloads by kind — decl/def rows carry a
+    // The writer splits payloads by kind — decl/def relations carry a
     // definition range, every other payload names a target symbol — and
-    // the readers decode whichever sparse table holds the row without
-    // consulting its kind. A row in the wrong table would serve one
+    // the readers decode whichever sparse table holds the relation without
+    // consulting its kind. A relation in the wrong table would serve one
     // payload's bit pattern as the other (a source range as a symbol
     // hash, or vice versa), so enforce the partition, which also keeps
     // the tables disjoint.
-    for(auto row: table.sym_rows) {
-        if(table.kind_of(row).isDeclOrDef()) {
+    for(auto entry: table.sym_entries) {
+        if(table.kind_of(entry).isDeclOrDef()) {
             return std::unexpected("declaration row in the target table");
         }
     }
-    for(auto row: table.def_rows) {
-        if(!table.kind_of(row).isDeclOrDef()) {
+    for(auto entry: table.def_entries) {
+        if(!table.kind_of(entry).isDeclOrDef()) {
             return std::unexpected("non-declaration row in the definition range table");
         }
     }
 
-    // Rows of one relation group two-way merge under the full (kind,
-    // begin, end, payload) key with equal-key rows combined at write time,
+    // Entries of one relation group two-way merge under the full (kind,
+    // begin, end, payload) key with equal-key entries combined at write time,
     // so the key must ascend strictly within each group — out-of-order or
-    // repeated rows would mis-merge silently instead of being rejected.
+    // repeated entries would mis-merge silently instead of being rejected.
     RelationTable::Cursor cursor;
     for(std::size_t id = 0; id < table.sym_hashes.size(); id += 1) {
         std::tuple<std::uint8_t, std::uint32_t, std::uint32_t, std::uint64_t> prev{};
-        for(auto row = table.offsets[id]; row < table.offsets[id + 1]; row += 1) {
-            auto relation = table.decode(row, cursor);
-            std::tuple key{table.kinds[row],
+        for(auto entry = table.offsets[id]; entry < table.offsets[id + 1]; entry += 1) {
+            auto relation = table.decode(entry, cursor);
+            std::tuple key{table.kinds[entry],
                            relation.range.begin,
                            relation.range.end,
                            relation.target_symbol};
-            if(row != table.offsets[id] && key <= prev) {
+            if(entry != table.offsets[id] && key <= prev) {
                 return std::unexpected("relation rows of one symbol are not strictly ascending");
             }
             prev = key;
@@ -665,7 +667,7 @@ Verdict relations_ok(BlobView root) {
     return {};
 }
 
-Verdict locals_ok(BlobView root) {
+CheckResult locals_ok(BlobView root) {
     auto table = LocalTable::of(root);
     if(!sparse_ok(table.syms, table.kinds.size(), table.sym_hashes.size()) ||
        table.scopes.size() != table.size() || table.parents.size() != table.size() ||
@@ -683,26 +685,26 @@ Verdict locals_ok(BlobView root) {
     return {};
 }
 
-// Beyond the per-tier column shape, every mask must own at least one
-// stored variant and no bits past the variant table: an ownerless row
+// Beyond the per-encoding column shape, every mask must own at least one
+// stored variant and no bits past the variant table: an ownerless entry
 // serves unconditionally while every stored variant is live (the
 // LiveFilter fast path skips the mask), vanishes once any variant dies,
 // and the next compaction erases it for real — every manifest still
 // fresh throughout.
-Verdict masks_ok(BlobView root) {
+CheckResult masks_ok(BlobView root) {
     auto variant_count = variant_count_of(root);
-    auto tier = tier_of(variant_count);
+    auto encoding = encoding_of(variant_count);
     for(auto columns: {columns_of(root[&ShardBlob::occs]), columns_of(root[&ShardBlob::rels])}) {
         auto count = columns.size();
-        switch(tier) {
-            case MaskTier::Single: {
+        switch(encoding) {
+            case MaskEncoding::Single: {
                 if(!columns.masks32.empty() || !columns.masks64.empty() ||
                    !columns.roaring_offsets.empty() || !columns.roaring.empty()) {
                     return std::unexpected("mask columns on a single-variant blob");
                 }
                 break;
             }
-            case MaskTier::U32: {
+            case MaskEncoding::U32: {
                 if(columns.masks32.size() != count || !columns.masks64.empty() ||
                    !columns.roaring_offsets.empty()) {
                     return std::unexpected("mask tier is not the canonical one");
@@ -715,7 +717,7 @@ Verdict masks_ok(BlobView root) {
                 }
                 break;
             }
-            case MaskTier::U64: {
+            case MaskEncoding::U64: {
                 if(columns.masks64.size() != count || !columns.masks32.empty() ||
                    !columns.roaring_offsets.empty()) {
                     return std::unexpected("mask tier is not the canonical one");
@@ -728,7 +730,7 @@ Verdict masks_ok(BlobView root) {
                 }
                 break;
             }
-            case MaskTier::Roaring: {
+            case MaskEncoding::Roaring: {
                 if(!columns.masks32.empty() || !columns.masks64.empty() ||
                    columns.roaring_offsets.size() != count + 1 ||
                    !std::ranges::is_sorted(columns.roaring_offsets) ||
@@ -737,13 +739,13 @@ Verdict masks_ok(BlobView root) {
                     return std::unexpected("mask tier is not the canonical one");
                 }
                 // A slice failing decode would read as an empty mask — the
-                // ownerless-row corruption above in another coat. Prove
+                // ownerless-entry corruption above in another coat. Prove
                 // each slice decodes once here so queries stay check-free
                 // and the blob rebuilds instead.
-                for(std::uint32_t row = 0; row < count; row += 1) {
-                    auto begin = columns.roaring_offsets[row];
+                for(std::uint32_t entry = 0; entry < count; entry += 1) {
+                    auto begin = columns.roaring_offsets[entry];
                     auto mask = view_bitmap(columns.roaring.data() + begin,
-                                            columns.roaring_offsets[row + 1] - begin);
+                                            columns.roaring_offsets[entry + 1] - begin);
                     if(!mask || mask->isEmpty() || mask->maximum() >= variant_count) {
                         return std::unexpected(
                             "row mask does not decode or owns no stored variant");
@@ -760,17 +762,17 @@ Verdict masks_ok(BlobView root) {
 /// readers dereference through raw column pointers or binary-search must be
 /// proven in-bounds and in order here, once, so queries stay check-free.
 /// The checks are also canonicality checks: every self-describing choice
-/// (range tier, symbol-id width, content omission, mask tier) is a strict
+/// (range encoding, symbol-id width, content omission, mask encoding) is a strict
 /// function of the data, so one logical blob has exactly one encoding and
 /// its byte hash is a usable identity. Later checks decode through columns
 /// earlier ones bounded, so the order matters.
-Verdict validate(BlobView root) {
+CheckResult validate(BlobView root) {
     constexpr std::array checks = {
         variants_ok,
         content_ok,
         line_table_ok,
         symbol_table_ok,
-        range_tiers_ok,
+        range_encodings_ok,
         occurrences_ok,
         relations_ok,
         locals_ok,
@@ -859,7 +861,7 @@ bool Shard::matches_content(std::uint64_t size, std::uint64_t hash) const {
     return loaded() && size == content_size() && hash == content_hash();
 }
 
-std::vector<RowsHash> Shard::variants() const {
+std::vector<VariantHash> Shard::variants() const {
     if(!buffer) {
         return {};
     }
@@ -870,7 +872,7 @@ std::vector<RowsHash> Shard::variants() const {
     return {stored.begin(), stored.end()};
 }
 
-bool Shard::has_variant(RowsHash hash) const {
+bool Shard::has_variant(VariantHash hash) const {
     if(!buffer) {
         return false;
     }
@@ -881,7 +883,7 @@ bool Shard::has_variant(RowsHash hash) const {
     return llvm::is_contained(stored, hash);
 }
 
-void Shard::set_live(llvm::ArrayRef<RowsHash> live_hashes) {
+void Shard::set_live(llvm::ArrayRef<VariantHash> live_hashes) {
     live = {};
     if(!buffer) {
         return;
@@ -908,10 +910,10 @@ bool Shard::has_dead_variants() const {
     return loaded() && !live.all;
 }
 
-LiveFilter Shard::live_filter(const RowColumns& columns) const {
+LiveFilter Shard::live_filter(const RangeColumnsView& columns) const {
     return {
         .all = live.all,
-        .tier = tier_of(root_of(*buffer)),
+        .encoding = encoding_of(root_of(*buffer)),
         .bits = live.bits,
         .big = &live.big,
         .columns = &columns,
@@ -924,42 +926,42 @@ void Shard::lookup(std::uint32_t offset,
         return;
     }
     auto table = OccurrenceTable::of(root_of(*buffer));
-    auto is_live = live_filter(table.rows);
+    auto is_live = live_filter(table.columns);
 
-    // Binary search the first row whose end reaches the offset, then walk
-    // while rows contain it. Occurrence ranges are name-token spans,
+    // Binary search the first occurrence whose end reaches the offset, then walk
+    // while occurrences contain it. Occurrence ranges are name-token spans,
     // pairwise disjoint or identical, so under (begin, end) order the end
     // column is monotonic too.
-    auto rows = std::views::iota(std::uint32_t(0), static_cast<std::uint32_t>(table.size()));
-    auto first = std::ranges::lower_bound(rows, offset, {}, [&](std::uint32_t row) {
-        return table.rows.end_of(row);
+    auto entries = std::views::iota(std::uint32_t(0), static_cast<std::uint32_t>(table.size()));
+    auto first = std::ranges::lower_bound(entries, offset, {}, [&](std::uint32_t entry) {
+        return table.columns.end_of(entry);
     });
 
     // A cursor between two tokens belongs to the one starting at it, so
-    // rows the offset only touches at their right edge yield after every
-    // row it is properly inside — `a+b` with the cursor before `b` must
+    // occurrences the offset only touches at their right edge yield after every
+    // occurrence it is properly inside — `a+b` with the cursor before `b` must
     // resolve to `b`, not `+`, while a cursor right after a lone token
     // still hits that token.
-    llvm::SmallVector<std::uint32_t, 2> edge_rows;
-    for(auto it = first; it != rows.end(); it += 1) {
-        auto row = *it;
-        auto range = table.rows.range_of(row);
+    llvm::SmallVector<std::uint32_t, 2> edge_entries;
+    for(auto it = first; it != entries.end(); it += 1) {
+        auto entry = *it;
+        auto range = table.columns.range_of(entry);
         if(!range.touches(offset)) {
             break;
         }
-        if(!is_live(row)) {
+        if(!is_live(entry)) {
             continue;
         }
         if(range.end == offset && range.begin != offset) {
-            edge_rows.push_back(row);
+            edge_entries.push_back(entry);
             continue;
         }
-        if(!callback(table.at(row))) {
+        if(!callback(table.at(entry))) {
             return;
         }
     }
-    for(auto row: edge_rows) {
-        if(!callback(table.at(row))) {
+    for(auto entry: edge_entries) {
+        if(!callback(table.at(entry))) {
             return;
         }
     }
@@ -967,17 +969,17 @@ void Shard::lookup(std::uint32_t offset,
 
 namespace {
 
-/// Visit the relation rows [begin_row, end_row) that pass `is_live`;
+/// Visit the relations [begin_entry, end_entry) that pass `is_live`;
 /// false when the callback stopped the walk.
-bool visit_relation_rows(const RelationTable& table,
-                         std::uint32_t begin_row,
-                         std::uint32_t end_row,
-                         const LiveFilter& is_live,
-                         llvm::function_ref<bool(const Relation&)> callback) {
-    auto cursor = table.cursor_at(begin_row);
-    for(auto row = begin_row; row < end_row; row += 1) {
-        auto relation = table.decode(row, cursor);
-        if(is_live(row) && !callback(relation)) {
+bool visit_relation_entries(const RelationTable& table,
+                            std::uint32_t begin_entry,
+                            std::uint32_t end_entry,
+                            const LiveFilter& is_live,
+                            llvm::function_ref<bool(const Relation&)> callback) {
+    auto cursor = table.cursor_at(begin_entry);
+    for(auto entry = begin_entry; entry < end_entry; entry += 1) {
+        auto relation = table.decode(entry, cursor);
+        if(is_live(entry) && !callback(relation)) {
             return false;
         }
     }
@@ -998,16 +1000,16 @@ void Shard::lookup(SymbolHash symbol,
         return;
     }
     auto id = static_cast<std::uint32_t>(it - table.sym_hashes.begin());
-    visit_relation_rows(table,
-                        table.offsets[id],
-                        table.offsets[id + 1],
-                        live_filter(table.rows),
-                        [&](const Relation& relation) {
-                            if(!(RelationKind(relation.kind) & kind)) {
-                                return true;
-                            }
-                            return callback(relation);
-                        });
+    visit_relation_entries(table,
+                           table.offsets[id],
+                           table.offsets[id + 1],
+                           live_filter(table.columns),
+                           [&](const Relation& relation) {
+                               if(!(RelationKind(relation.kind) & kind)) {
+                                   return true;
+                               }
+                               return callback(relation);
+                           });
 }
 
 void Shard::for_each_occurrence(llvm::function_ref<bool(const Occurrence&)> callback) const {
@@ -1015,9 +1017,9 @@ void Shard::for_each_occurrence(llvm::function_ref<bool(const Occurrence&)> call
         return;
     }
     auto table = OccurrenceTable::of(root_of(*buffer));
-    auto is_live = live_filter(table.rows);
-    for(std::uint32_t row = 0; row < table.size(); row += 1) {
-        if(is_live(row) && !callback(table.at(row))) {
+    auto is_live = live_filter(table.columns);
+    for(std::uint32_t entry = 0; entry < table.size(); entry += 1) {
+        if(is_live(entry) && !callback(table.at(entry))) {
             return;
         }
     }
@@ -1029,15 +1031,15 @@ void
         return;
     }
     auto table = RelationTable::of(root_of(*buffer));
-    auto is_live = live_filter(table.rows);
+    auto is_live = live_filter(table.columns);
     for(std::uint32_t id = 0; id < table.sym_hashes.size(); id += 1) {
         auto hash = table.sym_hashes[id];
-        bool completed =
-            visit_relation_rows(table,
-                                table.offsets[id],
-                                table.offsets[id + 1],
-                                is_live,
-                                [&](const Relation& relation) { return callback(hash, relation); });
+        bool completed = visit_relation_entries(
+            table,
+            table.offsets[id],
+            table.offsets[id + 1],
+            is_live,
+            [&](const Relation& relation) { return callback(hash, relation); });
         if(!completed) {
             return;
         }
@@ -1113,46 +1115,48 @@ PositionMap Shard::positions() const {
 
 namespace {
 
-/// Working rows during a write: the row as the readers hand it out plus
-/// its variant mask. Masks stay wide; the tier is chosen at emit time from
+/// Working entries during a write: the entry as the readers hand it out plus
+/// its variant mask. Masks stay wide; the encoding is chosen at emit time from
 /// the final variant count.
 template <typename MaskT>
-struct OccRow {
+struct OccurrenceEntry {
     Occurrence occurrence;
     MaskT mask;
 };
 
 template <typename MaskT>
-struct RelRow {
+struct RelationEntry {
     Relation relation;
     MaskT mask;
 };
 
-/// One symbol's relation rows, sorted by (kind, begin, end, payload).
+/// One symbol's relation entries, sorted by (kind, begin, end, payload).
 template <typename MaskT>
 struct RelGroup {
     SymbolHash symbol;
-    std::vector<RelRow<MaskT>> rows;
+    std::vector<RelationEntry<MaskT>> entries;
 };
 
-/// Everything a write accumulates before choosing column tiers.
+/// Everything a write accumulates before choosing column encodings.
 template <typename MaskT>
-struct MergedRows {
-    std::vector<OccRow<MaskT>> occurrences;
+struct MergedEntries {
+    std::vector<OccurrenceEntry<MaskT>> occurrences;
     /// Groups sorted by symbol hash.
     std::vector<RelGroup<MaskT>> relations;
 };
 
-constexpr auto occ_key = [](const auto& row) {
-    return std::tuple(row.occurrence.range.begin, row.occurrence.range.end, row.occurrence.target);
+constexpr auto occ_key = [](const auto& entry) {
+    return std::tuple(entry.occurrence.range.begin,
+                      entry.occurrence.range.end,
+                      entry.occurrence.target);
 };
 
-/// The kind as the column stores it: the wire order the readers rely on.
-constexpr auto rel_key = [](const auto& row) {
-    return std::tuple(static_cast<std::uint8_t>(row.relation.kind),
-                      row.relation.range.begin,
-                      row.relation.range.end,
-                      row.relation.target_symbol);
+/// The kind as the column stores it: the serialized order the readers rely on.
+constexpr auto rel_key = [](const auto& entry) {
+    return std::tuple(static_cast<std::uint8_t>(entry.relation.kind),
+                      entry.relation.range.begin,
+                      entry.relation.range.end,
+                      entry.relation.target_symbol);
 };
 
 constexpr auto group_key = [](const auto& group) {
@@ -1179,13 +1183,13 @@ bool mask_empty(const MaskT& mask) {
     }
 }
 
-/// The old blob's mask of one row, remapped through old-id -> new-id (a
-/// dropped variant's bit vanishes; an all-dropped row reads as empty and
+/// The old blob's mask of one entry, remapped through old-id -> new-id (a
+/// dropped variant's bit vanishes; an all-dropped entry reads as empty and
 /// is skipped by the caller).
 template <typename MaskT>
-MaskT remap_mask(MaskTier tier,
-                 const RowColumns& columns,
-                 std::uint32_t row,
+MaskT remap_mask(MaskEncoding encoding,
+                 const RangeColumnsView& columns,
+                 std::uint32_t entry,
                  llvm::ArrayRef<std::int64_t> id_map) {
     MaskT result{};
     auto apply = [&](std::uint32_t old_id) {
@@ -1199,21 +1203,21 @@ MaskT remap_mask(MaskTier tier,
             bits &= bits - 1;
         }
     };
-    switch(tier) {
-        case MaskTier::Single: {
+    switch(encoding) {
+        case MaskEncoding::Single: {
             apply(0);
             break;
         }
-        case MaskTier::U32: {
-            apply_bits(columns.masks32[row]);
+        case MaskEncoding::U32: {
+            apply_bits(columns.masks32[entry]);
             break;
         }
-        case MaskTier::U64: {
-            apply_bits(columns.masks64[row]);
+        case MaskEncoding::U64: {
+            apply_bits(columns.masks64[entry]);
             break;
         }
-        case MaskTier::Roaring: {
-            for(auto id: columns.bitmap_of(row)) {
+        case MaskEncoding::Roaring: {
+            for(auto id: columns.bitmap_of(entry)) {
                 apply(id);
             }
             break;
@@ -1222,21 +1226,21 @@ MaskT remap_mask(MaskTier tier,
     return result;
 }
 
-/// Two-way merge of runs sorted under `key`; rows with equal keys are one
-/// row and OR their masks — the cross-variant dedup.
-template <typename Row, typename Key>
-void merge_sorted(std::vector<Row> old_rows,
-                  std::vector<Row> fresh_rows,
+/// Two-way merge of runs sorted under `key`; entries with equal keys are
+/// one entry and OR their masks — the cross-variant dedup.
+template <typename Entry, typename Key>
+void merge_sorted(std::vector<Entry> old_entries,
+                  std::vector<Entry> fresh_entries,
                   Key key,
-                  std::vector<Row>& out) {
-    out.reserve(old_rows.size() + fresh_rows.size());
-    auto lhs = old_rows.begin();
-    auto rhs = fresh_rows.begin();
-    while(lhs != old_rows.end() || rhs != fresh_rows.end()) {
-        if(rhs == fresh_rows.end() || (lhs != old_rows.end() && key(*lhs) < key(*rhs))) {
+                  std::vector<Entry>& out) {
+    out.reserve(old_entries.size() + fresh_entries.size());
+    auto lhs = old_entries.begin();
+    auto rhs = fresh_entries.begin();
+    while(lhs != old_entries.end() || rhs != fresh_entries.end()) {
+        if(rhs == fresh_entries.end() || (lhs != old_entries.end() && key(*lhs) < key(*rhs))) {
             out.push_back(std::move(*lhs));
             lhs += 1;
-        } else if(lhs == old_rows.end() || key(*rhs) < key(*lhs)) {
+        } else if(lhs == old_entries.end() || key(*rhs) < key(*lhs)) {
             out.push_back(std::move(*rhs));
             rhs += 1;
         } else {
@@ -1248,43 +1252,43 @@ void merge_sorted(std::vector<Row> old_rows,
     }
 }
 
-/// Combine adjacent equal-key rows of a sorted run into one row with
+/// Combine adjacent equal-key entries of a sorted run into one entry with
 /// OR-ed masks.
-template <typename Row, typename Key>
-void combine_equal(std::vector<Row>& rows, Key key) {
+template <typename Entry, typename Key>
+void combine_equal(std::vector<Entry>& entries, Key key) {
     std::size_t out = 0;
-    for(std::size_t i = 0; i < rows.size(); i += 1) {
-        if(out != 0 && key(rows[out - 1]) == key(rows[i])) {
-            rows[out - 1].mask |= rows[i].mask;
+    for(std::size_t i = 0; i < entries.size(); i += 1) {
+        if(out != 0 && key(entries[out - 1]) == key(entries[i])) {
+            entries[out - 1].mask |= entries[i].mask;
         } else {
             if(out != i) {
-                rows[out] = std::move(rows[i]);
+                entries[out] = std::move(entries[i]);
             }
             out += 1;
         }
     }
-    rows.resize(out);
+    entries.resize(out);
 }
 
-/// Sort a run and combine its equal-key rows.
-template <typename Row, typename Key>
-void canonicalize(std::vector<Row>& rows, Key key) {
-    std::ranges::sort(rows, {}, key);
-    combine_equal(rows, key);
+/// Sort a run and combine its equal-key entries.
+template <typename Entry, typename Key>
+void canonicalize(std::vector<Entry>& entries, Key key) {
+    std::ranges::sort(entries, {}, key);
+    combine_equal(entries, key);
 }
 
-/// The symbol table a set of merged rows requires: occurrence targets,
+/// The symbol table a set of merged entries requires: occurrence targets,
 /// relation group keys, and symbol payloads.
 template <typename MaskT>
-llvm::DenseSet<SymbolHash> referenced_symbols(const MergedRows<MaskT>& merged) {
+llvm::DenseSet<SymbolHash> referenced_symbols(const MergedEntries<MaskT>& merged) {
     llvm::DenseSet<SymbolHash> referenced;
-    for(auto& row: merged.occurrences) {
-        referenced.insert(row.occurrence.target);
+    for(auto& entry: merged.occurrences) {
+        referenced.insert(entry.occurrence.target);
     }
     for(auto& group: merged.relations) {
         referenced.insert(group.symbol);
-        for(auto& row: group.rows) {
-            auto& relation = row.relation;
+        for(auto& entry: group.entries) {
+            auto& relation = entry.relation;
             if(relation.target_symbol != 0 && !RelationKind(relation.kind).isDeclOrDef()) {
                 referenced.insert(relation.target_symbol);
             }
@@ -1293,48 +1297,49 @@ llvm::DenseSet<SymbolHash> referenced_symbols(const MergedRows<MaskT>& merged) {
     return referenced;
 }
 
-/// Decode a blob's occurrence rows into working form; `mask_of` returns
-/// the row's mask in the output id space (empty drops the row).
+/// Decode a blob's occurrences into working form; `mask_of` returns the
+/// occurrence's mask in the output id space (empty drops the occurrence).
 template <typename MaskT, typename MaskOf>
-std::vector<OccRow<MaskT>> decode_occurrences(const OccurrenceTable& table, MaskOf mask_of) {
-    std::vector<OccRow<MaskT>> rows;
-    rows.reserve(table.size());
-    for(std::uint32_t row = 0; row < table.size(); row += 1) {
-        auto mask = mask_of(row);
+std::vector<OccurrenceEntry<MaskT>> decode_occurrences(const OccurrenceTable& table,
+                                                       MaskOf mask_of) {
+    std::vector<OccurrenceEntry<MaskT>> entries;
+    entries.reserve(table.size());
+    for(std::uint32_t entry = 0; entry < table.size(); entry += 1) {
+        auto mask = mask_of(entry);
         if(mask_empty(mask)) {
             continue;
         }
-        rows.push_back({table.at(row), std::move(mask)});
+        entries.push_back({table.at(entry), std::move(mask)});
     }
-    return rows;
+    return entries;
 }
 
 /// Decode one symbol's relation slice of a blob into working form.
 template <typename MaskT, typename MaskOf>
-std::vector<RelRow<MaskT>> decode_relation_group(const RelationTable& table,
-                                                 std::uint32_t begin_row,
-                                                 std::uint32_t end_row,
-                                                 MaskOf mask_of) {
-    std::vector<RelRow<MaskT>> rows;
-    rows.reserve(end_row - begin_row);
-    auto cursor = table.cursor_at(begin_row);
-    for(auto row = begin_row; row < end_row; row += 1) {
-        auto relation = table.decode(row, cursor);
-        auto mask = mask_of(row);
+std::vector<RelationEntry<MaskT>> decode_relation_group(const RelationTable& table,
+                                                        std::uint32_t begin_entry,
+                                                        std::uint32_t end_entry,
+                                                        MaskOf mask_of) {
+    std::vector<RelationEntry<MaskT>> entries;
+    entries.reserve(end_entry - begin_entry);
+    auto cursor = table.cursor_at(begin_entry);
+    for(auto entry = begin_entry; entry < end_entry; entry += 1) {
+        auto relation = table.decode(entry, cursor);
+        auto mask = mask_of(entry);
         if(mask_empty(mask)) {
             continue;
         }
-        rows.push_back({relation, std::move(mask)});
+        entries.push_back({relation, std::move(mask)});
     }
-    return rows;
+    return entries;
 }
 
 /// One blob's relation groups in symbol-hash order, decoded lazily by the
 /// group merge.
 struct GroupIndex {
     SymbolHash hash;
-    std::uint32_t begin_row;
-    std::uint32_t end_row;
+    std::uint32_t begin_entry;
+    std::uint32_t end_entry;
 };
 
 std::vector<GroupIndex> relation_groups(const RelationTable& table) {
@@ -1354,7 +1359,7 @@ struct ContentInfo {
     std::uint32_t size = 0;
     llvm::StringRef content;
     std::vector<std::uint8_t> line_lengths;
-    std::vector<std::uint32_t> long_line_rows;
+    std::vector<std::uint32_t> long_lines;
     std::vector<std::uint32_t> long_line_lengths;
     std::vector<std::uint64_t> crlf_lines;
 };
@@ -1365,10 +1370,10 @@ ContentInfo content_info_of(BlobView root) {
     info.size = root[&ShardBlob::content_size];
     info.content = to_ref(root[&ShardBlob::content]);
     auto lengths = to_array_ref(root[&ShardBlob::line_lengths]);
-    auto long_rows = to_array_ref(root[&ShardBlob::long_line_rows]);
+    auto long_lines = to_array_ref(root[&ShardBlob::long_lines]);
     auto long_lengths = to_array_ref(root[&ShardBlob::long_line_lengths]);
     info.line_lengths.assign(lengths.begin(), lengths.end());
-    info.long_line_rows.assign(long_rows.begin(), long_rows.end());
+    info.long_lines.assign(long_lines.begin(), long_lines.end());
     info.long_line_lengths.assign(long_lengths.begin(), long_lengths.end());
     auto crlf_lines = to_array_ref(root[&ShardBlob::crlf_lines]);
     info.crlf_lines.assign(crlf_lines.begin(), crlf_lines.end());
@@ -1395,7 +1400,7 @@ ContentInfo content_info_of(llvm::StringRef content) {
         }
         if(length >= length_escape) {
             info.line_lengths.push_back(length_escape);
-            info.long_line_rows.push_back(static_cast<std::uint32_t>(i));
+            info.long_lines.push_back(static_cast<std::uint32_t>(i));
             info.long_line_lengths.push_back(length);
         } else {
             info.line_lengths.push_back(static_cast<std::uint8_t>(length));
@@ -1425,7 +1430,7 @@ LocalSymbol own(const SymbolIdentity& identity) {
     };
 }
 
-/// Collect one blob's local symbols; symbols the merged rows no longer
+/// Collect one blob's local symbols; symbols the merged entries no longer
 /// reference are filtered at emit time.
 void collect_locals(BlobView root, llvm::DenseMap<SymbolHash, LocalSymbol>& locals) {
     auto table = LocalTable::of(root);
@@ -1440,24 +1445,24 @@ void collect_locals(BlobView root, llvm::DenseMap<SymbolHash, LocalSymbol>& loca
     }
 }
 
-/// Appends one side's rows in the tiers chosen for the whole blob: the
-/// range tier by content size, the mask tier by variant count.
+/// Appends one side's entries in the encodings chosen for the whole blob:
+/// the range encoding by content size, the mask encoding by variant count.
 struct SideWriter {
-    RowRanges& side;
+    RangeColumns& side;
     bool narrow;
-    MaskTier tier;
-    std::uint32_t row = 0;
+    MaskEncoding encoding;
+    std::uint32_t count = 0;
 
     template <typename MaskT>
     void add(LocalSourceRange range, const MaskT& mask) {
         add_range(range);
         add_mask(mask);
-        row += 1;
+        count += 1;
     }
 
-    /// The roaring tier's offset column ends with the size of the slices.
+    /// The roaring encoding's offset column ends with the size of the slices.
     void finish() {
-        if(tier == MaskTier::Roaring) {
+        if(encoding == MaskEncoding::Roaring) {
             side.roaring_offsets.push_back(static_cast<std::uint32_t>(side.roaring.size()));
         }
     }
@@ -1478,7 +1483,7 @@ struct SideWriter {
         std::uint8_t stored =
             length >= length_escape ? length_escape : static_cast<std::uint8_t>(length);
         if(stored == length_escape) {
-            side.long_rows.push_back(row);
+            side.long_entries.push_back(count);
             side.long_ends.push_back(range.end);
         }
         if(narrow) {
@@ -1491,23 +1496,23 @@ struct SideWriter {
 
     template <typename MaskT>
     void add_mask(const MaskT& mask) {
-        switch(tier) {
-            case MaskTier::Single: {
+        switch(encoding) {
+            case MaskEncoding::Single: {
                 break;
             }
-            case MaskTier::U32: {
+            case MaskEncoding::U32: {
                 if constexpr(std::same_as<MaskT, std::uint64_t>) {
                     side.masks32.push_back(static_cast<std::uint32_t>(mask));
                 }
                 break;
             }
-            case MaskTier::U64: {
+            case MaskEncoding::U64: {
                 if constexpr(std::same_as<MaskT, std::uint64_t>) {
                     side.masks64.push_back(mask);
                 }
                 break;
             }
-            case MaskTier::Roaring: {
+            case MaskEncoding::Roaring: {
                 if constexpr(std::same_as<MaskT, Bitmap>) {
                     auto size = mask.getSizeInBytes(true);
                     auto offset = side.roaring.size();
@@ -1544,14 +1549,14 @@ struct SymIdWriter {
     }
 };
 
-/// Encode merged rows, locals and content into canonical blob bytes. The
+/// Encode merged entries, locals and content into canonical blob bytes. The
 /// only entry point that writes a ShardBlob: every self-describing choice
-/// (range tier, id width, mask tier, content omission) is made here, from
+/// (range encoding, id width, mask encoding, content omission) is made here, from
 /// the data, so equal inputs produce equal bytes.
 template <typename MaskT>
-void emit_blob(const MergedRows<MaskT>& merged,
+void emit_blob(const MergedEntries<MaskT>& merged,
                const llvm::DenseMap<SymbolHash, LocalSymbol>& locals,
-               std::vector<RowsHash> variants,
+               std::vector<VariantHash> variants,
                const ContentInfo& content,
                llvm::raw_ostream& os) {
     auto referenced = referenced_symbols(merged);
@@ -1562,7 +1567,7 @@ void emit_blob(const MergedRows<MaskT>& merged,
     blob.content_size = content.size;
     blob.content = content.content.str();
     blob.line_lengths = content.line_lengths;
-    blob.long_line_rows = content.long_line_rows;
+    blob.long_lines = content.long_lines;
     blob.long_line_lengths = content.long_line_lengths;
     blob.crlf_lines = content.crlf_lines;
     blob.variants = std::move(variants);
@@ -1592,48 +1597,48 @@ void emit_blob(const MergedRows<MaskT>& merged,
         blob.local_flags.push_back(static_cast<std::uint16_t>(info->flags));
     }
 
-    auto tier = tier_of(blob.variants.empty() ? 1 : blob.variants.size());
+    auto encoding = encoding_of(blob.variants.empty() ? 1 : blob.variants.size());
     bool narrow = content.size <= packed_range_limit;
     auto width = SymIdWriter::width_for(blob.sym_hashes.size());
 
-    SideWriter occs{blob.occs, narrow, tier};
+    SideWriter occs{blob.occs, narrow, encoding};
     SymIdWriter occ_syms{width, blob.occ_syms8, blob.occ_syms16, blob.occ_syms32};
-    for(auto& row: merged.occurrences) {
-        occs.add(row.occurrence.range, row.mask);
-        occ_syms.add(sym_id(row.occurrence.target));
+    for(auto& entry: merged.occurrences) {
+        occs.add(entry.occurrence.range, entry.mask);
+        occ_syms.add(sym_id(entry.occurrence.target));
     }
     occs.finish();
 
     // Relation groups follow symbol-table order; a symbol with occurrences
     // only gets an empty slice.
-    SideWriter rels{blob.rels, narrow, tier};
+    SideWriter rels{blob.rels, narrow, encoding};
     SymIdWriter rel_syms{width, blob.rel_sym8, blob.rel_sym16, blob.rel_sym32};
     blob.sym_rel_offsets.reserve(blob.sym_hashes.size() + 1);
     auto group = merged.relations.begin();
     for(auto hash: blob.sym_hashes) {
-        blob.sym_rel_offsets.push_back(rels.row);
+        blob.sym_rel_offsets.push_back(rels.count);
         if(group == merged.relations.end() || group->symbol != hash) {
             continue;
         }
-        for(auto& row: group->rows) {
-            auto& relation = row.relation;
+        for(auto& entry: group->entries) {
+            auto& relation = entry.relation;
             blob.rel_kinds.push_back(static_cast<std::uint8_t>(relation.kind));
             if(relation.target_symbol != 0) {
                 if(RelationKind(relation.kind).isDeclOrDef()) {
                     auto range = std::bit_cast<LocalSourceRange>(relation.target_symbol);
-                    blob.rel_def_rows.push_back(rels.row);
+                    blob.rel_def_entries.push_back(rels.count);
                     blob.rel_def_begins.push_back(range.begin);
                     blob.rel_def_ends.push_back(range.end);
                 } else {
-                    blob.rel_sym_rows.push_back(rels.row);
+                    blob.rel_sym_entries.push_back(rels.count);
                     rel_syms.add(sym_id(relation.target_symbol));
                 }
             }
-            rels.add(relation.range, row.mask);
+            rels.add(relation.range, entry.mask);
         }
         group += 1;
     }
-    blob.sym_rel_offsets.push_back(rels.row);
+    blob.sym_rel_offsets.push_back(rels.count);
     rels.finish();
 
     serialize_blob(blob, os);
@@ -1644,76 +1649,76 @@ void merge_shards_impl(BlobView old_root,
                        llvm::ArrayRef<std::int64_t> id_map,
                        llvm::ArrayRef<Shard> fresh,
                        std::uint32_t fresh_base,
-                       std::vector<RowsHash> variants,
+                       std::vector<VariantHash> variants,
                        const ContentInfo& content,
                        llvm::raw_ostream& os) {
-    MergedRows<MaskT> merged;
+    MergedEntries<MaskT> merged;
 
-    // Occurrences: concatenate every fresh blob's rows (each stamped with
-    // its new bit), sort, combine equal rows, then merge with the old
-    // rows. Fresh runs are individually sorted already; one sort over the
+    // Occurrences: concatenate every fresh blob's entries (each marked with
+    // its new bit), sort, combine equal entries, then merge with the old
+    // entries. Fresh runs are individually sorted already; one sort over the
     // concatenation keeps the merge two-way.
-    std::vector<OccRow<MaskT>> fresh_occs;
+    std::vector<OccurrenceEntry<MaskT>> fresh_occs;
     for(std::uint32_t i = 0; i < fresh.size(); i += 1) {
         auto bit = single_bit<MaskT>(fresh_base + i);
-        auto rows = decode_occurrences<MaskT>(OccurrenceTable::of(view_of(fresh[i].bytes())),
-                                              [&](std::uint32_t) { return bit; });
+        auto entries = decode_occurrences<MaskT>(OccurrenceTable::of(view_of(fresh[i].bytes())),
+                                                 [&](std::uint32_t) { return bit; });
         fresh_occs.insert(fresh_occs.end(),
-                          std::make_move_iterator(rows.begin()),
-                          std::make_move_iterator(rows.end()));
+                          std::make_move_iterator(entries.begin()),
+                          std::make_move_iterator(entries.end()));
     }
     canonicalize(fresh_occs, occ_key);
 
-    std::vector<OccRow<MaskT>> old_occs;
+    std::vector<OccurrenceEntry<MaskT>> old_occs;
     if(old_root.valid()) {
         auto table = OccurrenceTable::of(old_root);
-        auto tier = tier_of(old_root);
-        old_occs = decode_occurrences<MaskT>(table, [&](std::uint32_t row) {
-            return remap_mask<MaskT>(tier, table.rows, row, id_map);
+        auto encoding = encoding_of(old_root);
+        old_occs = decode_occurrences<MaskT>(table, [&](std::uint32_t entry) {
+            return remap_mask<MaskT>(encoding, table.columns, entry, id_map);
         });
     }
     merge_sorted(std::move(old_occs), std::move(fresh_occs), occ_key, merged.occurrences);
 
     // Relations: gather fresh groups per symbol across all fresh blobs,
     // then two-way merge with the old blob's groups in hash order.
-    llvm::DenseMap<SymbolHash, std::vector<RelRow<MaskT>>> fresh_group_map;
+    llvm::DenseMap<SymbolHash, std::vector<RelationEntry<MaskT>>> fresh_group_map;
     for(std::uint32_t i = 0; i < fresh.size(); i += 1) {
         auto table = RelationTable::of(view_of(fresh[i].bytes()));
         auto bit = single_bit<MaskT>(fresh_base + i);
         for(auto& group: relation_groups(table)) {
-            auto rows = decode_relation_group<MaskT>(table,
-                                                     group.begin_row,
-                                                     group.end_row,
-                                                     [&](std::uint32_t) { return bit; });
+            auto entries = decode_relation_group<MaskT>(table,
+                                                        group.begin_entry,
+                                                        group.end_entry,
+                                                        [&](std::uint32_t) { return bit; });
             auto& into = fresh_group_map[group.hash];
             into.insert(into.end(),
-                        std::make_move_iterator(rows.begin()),
-                        std::make_move_iterator(rows.end()));
+                        std::make_move_iterator(entries.begin()),
+                        std::make_move_iterator(entries.end()));
         }
     }
     std::vector<RelGroup<MaskT>> fresh_groups;
     fresh_groups.reserve(fresh_group_map.size());
-    for(auto& [hash, rows]: fresh_group_map) {
-        canonicalize(rows, rel_key);
-        fresh_groups.push_back({hash, std::move(rows)});
+    for(auto& [hash, entries]: fresh_group_map) {
+        canonicalize(entries, rel_key);
+        fresh_groups.push_back({hash, std::move(entries)});
     }
     std::ranges::sort(fresh_groups, {}, group_key);
 
     std::vector<GroupIndex> old_groups;
     RelationTable old_table;
-    MaskTier old_tier = MaskTier::Single;
+    MaskEncoding old_encoding = MaskEncoding::Single;
     if(old_root.valid()) {
         old_table = RelationTable::of(old_root);
-        old_tier = tier_of(old_root);
+        old_encoding = encoding_of(old_root);
         old_groups = relation_groups(old_table);
     }
     auto decode_old = [&](const GroupIndex& group) {
         return decode_relation_group<MaskT>(
             old_table,
-            group.begin_row,
-            group.end_row,
-            [&](std::uint32_t row) {
-                return remap_mask<MaskT>(old_tier, old_table.rows, row, id_map);
+            group.begin_entry,
+            group.end_entry,
+            [&](std::uint32_t entry) {
+                return remap_mask<MaskT>(old_encoding, old_table.columns, entry, id_map);
             });
     };
 
@@ -1721,17 +1726,17 @@ void merge_shards_impl(BlobView old_root,
     auto rhs = fresh_groups.begin();
     while(lhs != old_groups.end() || rhs != fresh_groups.end()) {
         if(rhs == fresh_groups.end() || (lhs != old_groups.end() && lhs->hash < rhs->symbol)) {
-            auto rows = decode_old(*lhs);
-            if(!rows.empty()) {
-                merged.relations.push_back({lhs->hash, std::move(rows)});
+            auto entries = decode_old(*lhs);
+            if(!entries.empty()) {
+                merged.relations.push_back({lhs->hash, std::move(entries)});
             }
             lhs += 1;
         } else if(lhs == old_groups.end() || rhs->symbol < lhs->hash) {
             merged.relations.push_back(std::move(*rhs));
             rhs += 1;
         } else {
-            std::vector<RelRow<MaskT>> combined;
-            merge_sorted(decode_old(*lhs), std::move(rhs->rows), rel_key, combined);
+            std::vector<RelationEntry<MaskT>> combined;
+            merge_sorted(decode_old(*lhs), std::move(rhs->entries), rel_key, combined);
             if(!combined.empty()) {
                 merged.relations.push_back({lhs->hash, std::move(combined)});
             }
@@ -1756,23 +1761,23 @@ void merge_shards_impl(BlobView old_root,
 
 }  // namespace
 
-void write_shard(const FileIndex& rows,
+void write_shard(const FileIndex& file_index,
                  llvm::function_ref<std::optional<SymbolIdentity>(SymbolHash)> symbols,
                  llvm::StringRef content,
                  llvm::raw_ostream& os) {
-    // Canonicalize straight from the in-memory rows: sorted, deduplicated.
+    // Canonicalize straight from the in-memory entries: sorted, deduplicated.
     // MaskT is irrelevant for a single variant (no mask columns) — use the
     // cheap one.
-    MergedRows<std::uint64_t> merged;
-    merged.occurrences.reserve(rows.occurrences.size());
-    for(auto& occurrence: rows.occurrences) {
+    MergedEntries<std::uint64_t> merged;
+    merged.occurrences.reserve(file_index.occurrences.size());
+    for(auto& occurrence: file_index.occurrences) {
         merged.occurrences.push_back({occurrence, 1});
     }
     canonicalize(merged.occurrences, occ_key);
 
-    merged.relations.reserve(rows.relations.size());
-    for(auto& [hash, relations]: rows.relations) {
-        std::vector<RelRow<std::uint64_t>> group;
+    merged.relations.reserve(file_index.relations.size());
+    for(auto& [hash, relations]: file_index.relations) {
+        std::vector<RelationEntry<std::uint64_t>> group;
         group.reserve(relations.size());
         for(auto& relation: relations) {
             group.push_back({relation, 1});
@@ -1796,14 +1801,14 @@ void write_shard(const FileIndex& rows,
 }
 
 void merge_shards(const Shard& old,
-                  llvm::ArrayRef<RowsHash> keep,
+                  llvm::ArrayRef<VariantHash> keep,
                   llvm::ArrayRef<Shard> fresh,
                   llvm::raw_ostream& os) {
     auto old_variants = old.variants();
 
     // old-id -> new-id; -1 drops the variant.
     llvm::SmallVector<std::int64_t> id_map(old_variants.size(), -1);
-    std::vector<RowsHash> variants;
+    std::vector<VariantHash> variants;
     for(std::uint32_t id = 0; id < old_variants.size(); id += 1) {
         if(llvm::is_contained(keep, old_variants[id])) {
             id_map[id] = static_cast<std::int64_t>(variants.size());
@@ -1829,7 +1834,7 @@ void merge_shards(const Shard& old,
 
     // Content and line table travel verbatim from any input — all inputs
     // share one content generation. Offsets from different generations
-    // must never share row storage, hence the assert.
+    // must never share entry storage, hence the assert.
     ContentInfo content = old_root.valid() ? content_info_of(old_root)
                                            : content_info_of(view_of(fresh.front().bytes()));
     for([[maybe_unused]] auto& shard: fresh) {

@@ -26,13 +26,12 @@ namespace clice {
 using kota::ipc::RequestResult;
 using RequestContext = kota::ipc::BincodePeer::RequestContext;
 
-/// Serialize the preamble's index envelope (full index + document links
+/// Serialize the preamble's index blob (full index + document links
 /// + inactive regions + diagnostics) into a string. Runs while the freshly parsed AST
 /// is still in memory — the only moment the preamble's index is
 /// obtainable without deserializing the whole PCH. The file write
 /// happens separately, after the PCH itself is flushed.
-static std::string serialize_preamble_envelope(CompilationUnit& unit,
-                                               std::uint32_t preamble_bound) {
+static std::string serialize_preamble_index(CompilationUnit& unit, std::uint32_t preamble_bound) {
     ScopedTimer links_timer;
     auto links = feature::document_links(unit);
     auto inactive = feature::inactive_regions(unit, {}, 0, preamble_bound);
@@ -55,8 +54,8 @@ static std::string serialize_preamble_envelope(CompilationUnit& unit,
 
 /// Write the serialized blob next to the PCH. Returns an error description
 /// on failure so the master's anomaly carries the cause.
-static std::optional<std::string> write_preamble_envelope(llvm::StringRef blob,
-                                                          llvm::StringRef output_path) {
+static std::optional<std::string> write_preamble_index(llvm::StringRef blob,
+                                                       llvm::StringRef output_path) {
     if(auto error = vfs::write(output_path, blob)) {
         auto message =
             std::format("failed writing pch.idx envelope {}: {}", output_path, error.message());
@@ -90,13 +89,13 @@ static std::expected<std::string, std::string> artifact_output(llvm::StringRef l
 /// the errors — `internal_error` marks a failure of the worker's own I/O,
 /// never the user's code, and must not be downgraded to an expected build
 /// failure. Either way the reply carries the build's inputs.
-static worker::ArtifactBuildResult land_artifact(llvm::StringRef label,
-                                                 bool success,
-                                                 const std::string& tmp_path,
-                                                 std::int64_t build_at,
-                                                 const auto& deps,
-                                                 std::string errors,
-                                                 bool internal_error) {
+static worker::ArtifactBuildResult finish_artifact(llvm::StringRef label,
+                                                   bool success,
+                                                   const std::string& tmp_path,
+                                                   std::int64_t build_at,
+                                                   const auto& deps,
+                                                   std::string errors,
+                                                   bool internal_error) {
     worker::ArtifactBuildResult result;
     result.build_at = build_at;
     result.deps = deps;
@@ -136,7 +135,7 @@ static worker::ArtifactBuildResult handle_build_pch(const worker::BuildPCHParams
     auto unit = compile(cp, pch_info);
     auto compile_ms = compile_timer.ms();
     // A cancelled parse reports !completed(); the extra check catches a
-    // cancellation landing between the parse and the serialization, whose
+    // cancellation arriving between the parse and the serialization, whose
     // blob nobody will read. The tmp file is removed like any failed build.
     bool success = unit.completed() && !stop->load(std::memory_order_relaxed);
     auto build_at = unit.build_at().count();
@@ -148,7 +147,7 @@ static worker::ArtifactBuildResult handle_build_pch(const worker::BuildPCHParams
     std::string blob;
     ScopedTimer index_timer;
     if(success) {
-        blob = serialize_preamble_envelope(unit, params.preamble_bound);
+        blob = serialize_preamble_index(unit, params.preamble_bound);
     }
     auto index_ms = index_timer.ms();
 
@@ -165,7 +164,7 @@ static worker::ArtifactBuildResult handle_build_pch(const worker::BuildPCHParams
     bool internal_error = false;
     ScopedTimer state_write_timer;
     if(success) {
-        if(auto error = write_preamble_envelope(blob, params.index_output_path)) {
+        if(auto error = write_preamble_index(blob, params.index_output_path)) {
             success = false;
             internal_error = true;
             errors = std::move(*error);
@@ -187,13 +186,13 @@ static worker::ArtifactBuildResult handle_build_pch(const worker::BuildPCHParams
     } else {
         LOG_WARN("BuildPCH failed: file={}, {}ms, errors=[{}]", params.file, timer.ms(), errors);
     }
-    return land_artifact("PCH",
-                         success,
-                         *output,
-                         build_at,
-                         pch_info.deps,
-                         std::move(errors),
-                         internal_error);
+    return finish_artifact("PCH",
+                           success,
+                           *output,
+                           build_at,
+                           pch_info.deps,
+                           std::move(errors),
+                           internal_error);
 }
 
 static worker::ArtifactBuildResult handle_build_pcm(const worker::BuildPCMParams& params,
@@ -244,13 +243,13 @@ static worker::ArtifactBuildResult handle_build_pcm(const worker::BuildPCMParams
                  timer.ms(),
                  errors);
     }
-    return land_artifact("PCM",
-                         success,
-                         *output,
-                         build_at,
-                         pcm_info.deps,
-                         std::move(errors),
-                         /*internal_error=*/false);
+    return finish_artifact("PCM",
+                           success,
+                           *output,
+                           build_at,
+                           pcm_info.deps,
+                           std::move(errors),
+                           /*internal_error=*/false);
 }
 
 /// Collect the tidy pass's findings with real per-file locations: unlike
@@ -396,7 +395,7 @@ static worker::TURunResult handle_turun(const worker::TURunParams& params,
     }
 
     // Building and serializing the index costs a large share of the pass;
-    // skip it when the cancellation landed after the parse finished.
+    // skip it when the cancellation arrived after the parse finished.
     if(stop->load(std::memory_order_relaxed)) {
         return {false, "TU run cancelled"};
     }
@@ -405,9 +404,9 @@ static worker::TURunResult handle_turun(const worker::TURunParams& params,
     ScopedTimer index_timer;
     std::size_t index_bytes = 0;
     if(params.index) {
-        auto envelope = index::build_tu_index(unit, {.known_variants = params.known_variants});
-        index_bytes = envelope.size();
-        if(auto error = hand_over_index(std::move(envelope), params.index_output_path, result)) {
+        auto blob = index::build_tu_index(unit, {.known_variants = params.known_variants});
+        index_bytes = blob.size();
+        if(auto error = hand_over_index(std::move(blob), params.index_output_path, result)) {
             return {false, std::move(*error)};
         }
     }

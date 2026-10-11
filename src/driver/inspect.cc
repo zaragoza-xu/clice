@@ -53,36 +53,28 @@ struct InspectOptions {
              required = false)
     annotations;
 
-    DecoKVStyled(kota::deco::decl::KVStyle::JoinedOrSeparate,
-                 names = {"--markers", "--markers="},
-                 help = R"(JSON file of the markers in the inspected source file, at byte )"
-                        R"(offsets: {"points": {"name": 12}, "ranges": {"name": )"
-                        R"({"begin": 3, "end": 7}}}; results are keyed by these names)",
-                 required = false)
+    DecoKV(help = R"(JSON file of the markers in the inspected source file, at byte )"
+                  R"(offsets: {"points": {"name": 12}, "ranges": {"name": )"
+                  R"({"begin": 3, "end": 7}}}; results are keyed by these names)",
+           required = false)
     <std::string> markers;
 
-    DecoKVStyled(kota::deco::decl::KVStyle::JoinedOrSeparate,
-                 names = {"--flags", "--flags="},
-                 help =
-                     "Compile flags for the inputs as a JSON string array; "
-                     "replaces the compile_commands.json lookup",
-                 required = false)
+    DecoKV(help =
+               "Compile flags for the inputs as a JSON string array; "
+               "replaces the compile_commands.json lookup",
+           required = false)
     <std::string> flags;
 
-    DecoKVStyled(kota::deco::decl::KVStyle::JoinedOrSeparate,
-                 names = {"--config", "--config="},
-                 help =
-                     "Feature options overlay as a JSON object "
-                     "(only features that take options accept it)",
-                 required = false)
+    DecoKV(help =
+               "Feature options overlay as a JSON object "
+               "(only features that take options accept it)",
+           required = false)
     <std::string> config;
 
-    DecoKVStyled(kota::deco::decl::KVStyle::JoinedOrSeparate,
-                 names = {"--configuration", "--configuration="},
-                 help =
-                     "Build configuration to activate, one of the tags declared on "
-                     "rules (default: the selected one, else default_configuration)",
-                 required = false)
+    DecoKV(help =
+               "Build configuration to activate, one of the tags declared on "
+               "rules (default: the selected one, else default_configuration)",
+           required = false)
     <std::string> configuration;
 
     LogLevelOption log{.log_level = LogLevel::Warn};
@@ -219,8 +211,8 @@ struct RawInlayHint {
 
 /// Range payload for inlay hints: each label piece naming a symbol placed
 /// as the server places it, from the unit's own TU index standing in for
-/// the server's — a declaration, else the definition, the main file's rows
-/// first as an open buffer's are.
+/// the server's — a declaration, else the definition, the main file's shard
+/// first as an open buffer's is.
 std::optional<kota::codec::RawValue> run_inlay_hints(CompilationUnitRef unit,
                                                      LocalSourceRange range,
                                                      llvm::StringRef config) {
@@ -228,20 +220,20 @@ std::optional<kota::codec::RawValue> run_inlay_hints(CompilationUnitRef unit,
                                       range,
                                       *parse_feature_config<feature::InlayHintsOptions>(config));
 
-    std::string envelope;
+    std::string bytes;
     index::TUIndex tu;
     auto place = [&](index::SymbolHash symbol) -> std::optional<RawLocation> {
-        if(envelope.empty()) {
-            envelope = index::build_tu_index(unit);
-            tu = index::TUIndex::from_bytes(envelope);
+        if(bytes.empty()) {
+            bytes = index::build_tu_index(unit);
+            tu = index::TUIndex::from_bytes(bytes);
         }
         auto main = tu.path_count() - 1;
         for(auto kind: {RelationKind::Declaration, RelationKind::Definition}) {
             for(std::uint32_t i = 0; i < tu.path_count(); i += 1) {
                 auto path_id = i == 0 ? main : i - 1;
-                const auto& rows = tu.shard_of(path_id);
+                const auto& shard = tu.shard_of(path_id);
                 std::optional<LocalSourceRange> found;
-                rows.lookup(symbol, kind, [&](const index::Relation& relation) {
+                shard.lookup(symbol, kind, [&](const index::Relation& relation) {
                     found = relation.range;
                     return false;
                 });
@@ -250,7 +242,7 @@ std::optional<kota::codec::RawValue> run_inlay_hints(CompilationUnitRef unit,
                 }
                 return RawLocation{
                     .path = tu.path(path_id).str(),
-                    .range = *rows.positions().range(*found, PositionEncoding::UTF16),
+                    .range = *shard.positions().range(*found, PositionEncoding::UTF16),
                 };
             }
         }
@@ -372,17 +364,17 @@ std::optional<kota::codec::RawValue>
     run_document_highlight(CompilationUnitRef unit,
                            std::uint32_t offset,
                            [[maybe_unused]] llvm::StringRef config) {
-    auto envelope = index::build_tu_index(unit);
-    auto tu = index::TUIndex::from_bytes(envelope);
-    const index::Shard& rows = tu.shard_of(tu.path_count() - 1);
-    auto named = index::named_at(rows, offset, [&](index::SymbolHash hash) {
+    auto bytes = index::build_tu_index(unit);
+    auto tu = index::TUIndex::from_bytes(bytes);
+    const index::Shard& shard = tu.shard_of(tu.path_count() - 1);
+    auto named = index::named_at(shard, offset, [&](index::SymbolHash hash) {
         auto symbol = tu.find_symbol(hash);
         return symbol && symbol->kind == SymbolKind::Macro;
     });
     if(!named) {
         return to_raw_json(std::vector<index::Highlight>{});
     }
-    return to_raw_json(index::highlights({&rows}, named->symbols));
+    return to_raw_json(index::highlights({&shard}, named->symbols));
 }
 
 /// A feature runs in exactly one shape: whole-document (`run`), once per
@@ -617,7 +609,7 @@ bool participates(const FeatureSpec& spec, const SourceFile& file) {
 /// Run the feature over one participating file and fill its entry. The
 /// compile is one pass, deliberately without the preamble PCH the server
 /// uses: a shared snapshot pins that the PCH split does not change feature
-/// results, so any divergence between the two paths surfaces as a snapshot
+/// results, so any divergence between the two paths shows as a snapshot
 /// mismatch instead of hiding in the preamble. It sees the whole unit —
 /// every stripped file is remapped and every built PCM attached — so
 /// cross-file fixtures compile like the server's view of the workspace.
@@ -673,7 +665,7 @@ void run_feature(FileEntry& entry,
     }
 
     // The AST builds even for broken sources (a language server must keep
-    // working on them), so error diagnostics are surfaced separately: the
+    // working on them), so error diagnostics are reported separately: the
     // snap harness rejects fixtures whose code or annotations silently
     // broke instead of pinning garbage.
     if(auto errors = error_messages(unit, /*errors_only=*/true); !errors.empty()) {
@@ -789,7 +781,7 @@ int run_inspect(const InspectOptions& opts) {
     }
 
     // Validate --config up front so a typo fails the whole run with a
-    // clear message instead of surfacing as a per-file feature error.
+    // clear message instead of showing as a per-file feature error.
     llvm::StringRef config = opts.config.has_value() ? llvm::StringRef(*opts.config) : "";
     if(!config.empty()) {
         if(spec->check_config == nullptr) {
@@ -913,7 +905,7 @@ int run_inspect(const InspectOptions& opts) {
 
     // Directory mode covers what the build compiles under the tree, not only
     // what the suffix filter admits: a source without a known suffix that a
-    // default command claims (`-x c++`) is a member too.
+    // default command covers (`-x c++`) is a member too.
     if(is_dir && flags.empty()) {
         llvm::StringSet<> listed;
         for(auto& [rel, abs]: files) {
@@ -932,7 +924,7 @@ int run_inspect(const InspectOptions& opts) {
 
     // Every readable file gets an entry up front: the hash of its stripped
     // content feeds the C++/TS stripper-twin check for support files too,
-    // and module/feature errors below land on stable entries.
+    // and module/feature errors below end up on stable entries.
     std::vector<SourceFile> sources;
     for(auto& [rel, abs]: files) {
         auto buffer = vfs::read(abs);
@@ -996,7 +988,7 @@ int run_inspect(const InspectOptions& opts) {
     // and build the PCM of each unit providing a module in dependency
     // order, so importing files in the unit compile like they do against
     // the server's module pipeline. A dependency cycle leaves its modules
-    // unbuilt and surfaces as ordinary compile errors on the importers.
+    // unbuilt and shows as ordinary compile errors on the importers.
     llvm::StringMap<std::string> pcms;
     std::vector<std::string> pcm_files;
     if(is_dir) {

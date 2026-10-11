@@ -11,13 +11,13 @@ import :syntax.lexer;
 
 namespace clice::feature {
 
-IndexRows extract_index_rows(const index::Shard& shard) {
-    IndexRows rows;
+IndexEntries extract_index_entries(const index::Shard& shard) {
+    IndexEntries entries;
     shard.for_each_occurrence([&](const index::Occurrence& occurrence) {
-        rows.occurrences.push_back(occurrence);
+        entries.occurrences.push_back(occurrence);
         return true;
     });
-    auto written = rows.occurrences;
+    auto written = entries.occurrences;
     std::ranges::sort(written, {}, [](const index::Occurrence& o) { return o.range.begin; });
     auto nested = [&](LocalSourceRange range) {
         auto it =
@@ -32,17 +32,17 @@ IndexRows extract_index_rows(const index::Shard& shard) {
         RelationKind kind(relation.kind);
         if(kind.isDeclOrDef()) {
             auto copy = relation;
-            rows.decls.push_back({.range = relation.range,
-                                  .extent = copy.definition_range(),
-                                  .symbol = hash,
-                                  .definition = kind.is_one_of(RelationKind::Definition)});
+            entries.decls.push_back({.range = relation.range,
+                                     .extent = copy.definition_range(),
+                                     .symbol = hash,
+                                     .definition = kind.is_one_of(RelationKind::Definition)});
         } else if(kind.isReference() && nested(relation.range)) {
             names.push_back({.range = relation.range, .target = hash});
         }
         return true;
     });
-    llvm::append_range(rows.occurrences, names);
-    return rows;
+    llvm::append_range(entries.occurrences, names);
+    return entries;
 }
 
 namespace {
@@ -147,16 +147,16 @@ std::optional<llvm::StringRef> before_body(const std::string& text) {
 
 }  // namespace
 
-auto index_lang_options(llvm::StringRef path, bool c_rows, llvm::StringRef standard)
+auto index_lang_options(llvm::StringRef path, bool c_only, llvm::StringRef standard)
     -> const clang::LangOptions& {
-    bool c = c_rows || path.ends_with(".c");
+    bool c = c_only || path.ends_with(".c");
     auto lang = c ? clang::Language::C : clang::Language::CXX;
     // A command without -std parses under the driver's default dialect;
-    // the same default keeps the keyword table aligned with the rows.
+    // the same default keeps the keyword table aligned with the index.
     auto kind = clang::getDefaultLanguageStandard(lang, llvm::Triple());
     if(!standard.empty()) {
         auto parsed = clang::LangStandard::getLangKind(standard);
-        // A standard of the other language contradicts the resolved rows'
+        // A standard of the other language contradicts the resolved index's
         // language; keep the language's default rather than obeying it.
         if(parsed != clang::LangStandard::lang_unspecified &&
            clang::LangStandard::getLangStandardForKind(parsed).getLanguage() == lang) {
@@ -169,31 +169,31 @@ auto index_lang_options(llvm::StringRef path, bool c_rows, llvm::StringRef stand
 auto index_semantic_tokens(llvm::StringRef content,
                            const clang::LangOptions& lang_opts,
                            llvm::ArrayRef<index::Occurrence> occurrences,
-                           llvm::ArrayRef<IndexDeclRow> decls,
+                           llvm::ArrayRef<IndexDecl> decls,
                            IndexSymbolResolver resolve) -> std::vector<SemanticToken> {
     auto& profile = profile_for(lang_opts);
 
-    // Rows arrive in shard order (occurrences by range, relations grouped
+    // Entries arrive in shard order (occurrences by range, relations grouped
     // by symbol); token matching needs both sorted by anchor begin.
     std::vector<index::Occurrence> occs(occurrences.begin(), occurrences.end());
     std::ranges::sort(occs, {}, [](const index::Occurrence& o) { return o.range.begin; });
-    std::vector<IndexDeclRow> decl_rows(decls.begin(), decls.end());
-    std::ranges::sort(decl_rows, {}, [](const IndexDeclRow& r) { return r.range.begin; });
+    std::vector<IndexDecl> sorted_decls(decls.begin(), decls.end());
+    std::ranges::sort(sorted_decls, {}, [](const IndexDecl& r) { return r.range.begin; });
 
     // The semantic classification of the token anchored at `begin`: decl
-    // rows carry their Declaration/Definition modifier; occurrences of
-    // symbols without a decl row here contribute the bare kind. Multiple
-    // rows on one anchor (merged shard variants) combine — kind
+    // entries carry their Declaration/Definition modifier; occurrences of
+    // symbols without a decl entry here contribute the bare kind. Multiple
+    // entries on one anchor (merged shard variants) combine — kind
     // disagreement is a Conflict, like instantiation disagreement on the
     // AST path.
     auto semantic_at = [&](std::uint32_t begin) {
         Classified semantic;
         llvm::SmallVector<index::SymbolHash, 4> covered;
 
-        auto decl_it = std::ranges::lower_bound(decl_rows, begin, {}, [](const IndexDeclRow& r) {
+        auto decl_it = std::ranges::lower_bound(sorted_decls, begin, {}, [](const IndexDecl& r) {
             return r.range.begin;
         });
-        for(; decl_it != decl_rows.end() && decl_it->range.begin == begin; ++decl_it) {
+        for(; decl_it != sorted_decls.end() && decl_it->range.begin == begin; ++decl_it) {
             auto info = resolve(decl_it->symbol);
             if(!info) {
                 continue;
@@ -219,7 +219,7 @@ auto index_semantic_tokens(llvm::StringRef content,
     };
 
     // A module occurrence spans the whole written name (`demo.core`,
-    // `foo:part` — the index stores one row over all components), while
+    // `foo:part` — the index stores one occurrence over all components), while
     // the raw lex sees one token per component; collect the spans so the
     // components past the first classify like the first, as on the AST
     // path.
@@ -324,7 +324,7 @@ auto index_semantic_tokens(llvm::StringRef content,
         // Only tokens that can spell a name take semantic classification —
         // mirroring the AST path, which anchors declaration names at
         // identifiers and a destructor's `~` only. Keywords stay lexical:
-        // a row anchored on `operator` names nothing written there.
+        // an entry anchored on `operator` names nothing written there.
         Classified semantic;
         if(kind == clang::tok::identifier || kind == clang::tok::tilde) {
             semantic = semantic_at(token.range.begin);
@@ -340,7 +340,7 @@ auto index_semantic_tokens(llvm::StringRef content,
             }
         }
 
-        Classified result = settle(semantic, lexical);
+        Classified result = final_classification(semantic, lexical);
 
         if(result.kind != SymbolKind::Invalid) {
             append_token(tokens, token.range, result.kind, result.modifiers);
@@ -350,7 +350,7 @@ auto index_semantic_tokens(llvm::StringRef content,
     return tokens;
 }
 
-auto index_document_symbols(llvm::ArrayRef<IndexDeclRow> decls, IndexSymbolResolver resolve)
+auto index_document_symbols(llvm::ArrayRef<IndexDecl> decls, IndexSymbolResolver resolve)
     -> std::vector<DocumentSymbol> {
     struct Entry {
         DocumentSymbol symbol;
@@ -359,30 +359,30 @@ auto index_document_symbols(llvm::ArrayRef<IndexDeclRow> decls, IndexSymbolResol
     };
 
     std::vector<Entry> entries;
-    for(const auto& row: decls) {
-        if(!row.extent.valid() || row.extent.begin >= row.extent.end) {
+    for(const auto& decl: decls) {
+        if(!decl.extent.valid() || decl.extent.begin >= decl.extent.end) {
             continue;
         }
-        auto info = resolve(row.symbol);
+        auto info = resolve(decl.symbol);
         if(!info || info->name.empty() || !outline_kind(info->kind)) {
             continue;
         }
-        auto selection = row.range;
-        if(selection.begin < row.extent.begin || selection.end > row.extent.end) {
-            selection = row.extent;
+        auto selection = decl.range;
+        if(selection.begin < decl.extent.begin || selection.end > decl.extent.end) {
+            selection = decl.extent;
         }
         entries.push_back({
             {.name = info->display_name(),
              .kind = info->kind,
-             .range = row.extent,
+             .range = decl.extent,
              .selection_range = selection},
-            row.extent,
-            row.symbol,
+            decl.extent,
+            decl.symbol,
         });
     }
 
-    // Merged shard rows can duplicate an anchor (a symbol's Declaration
-    // and Definition rows of an inline definition share it, and so do
+    // Merged shard entries can duplicate an anchor (a symbol's Declaration
+    // and Definition relations of an inline definition share it, and so do
     // context variants); one outline entry per (site, symbol identity).
     // Descending end puts a strict container before everything inside it.
     std::ranges::sort(entries, [](const Entry& lhs, const Entry& rhs) {
@@ -454,7 +454,7 @@ auto index_document_symbols(llvm::ArrayRef<IndexDeclRow> decls, IndexSymbolResol
 
 auto index_folding_ranges(llvm::StringRef content,
                           const clang::LangOptions& lang_opts,
-                          llvm::ArrayRef<IndexDeclRow> decls,
+                          llvm::ArrayRef<IndexDecl> decls,
                           IndexSymbolResolver resolve) -> std::vector<FoldingRange> {
     // One raw lex collects every brace outside comments, literals and
     // directive lines (a #define body's brace pairs nothing in the file's
@@ -533,19 +533,19 @@ auto index_folding_ranges(llvm::StringRef content,
     }
 
     std::vector<FoldingRange> ranges;
-    for(const auto& row: decls) {
-        if(!row.definition || !row.extent.valid() || row.extent.begin >= row.extent.end) {
+    for(const auto& decl: decls) {
+        if(!decl.definition || !decl.extent.valid() || decl.extent.begin >= decl.extent.end) {
             continue;
         }
         if(llvm::any_of(ambiguous, [&](const LocalSourceRange& region) {
-               return region.begin < row.extent.end && row.extent.begin < region.end;
+               return region.begin < decl.extent.end && decl.extent.begin < region.end;
            })) {
             continue;
         }
 
         // The block keeps the name and signature visible like the AST
         // folds do.
-        auto group = last_brace_group(braces, row.extent);
+        auto group = last_brace_group(braces, decl.extent);
         if(!group) {
             continue;
         }
@@ -559,7 +559,7 @@ auto index_folding_ranges(llvm::StringRef content,
         // A symbol the resolver cannot name still folds, just without a
         // kind.
         std::optional<protocol::FoldingRangeKind> kind;
-        if(auto info = resolve(row.symbol)) {
+        if(auto info = resolve(decl.symbol)) {
             kind = declaration_fold_kind(info->kind);
         }
 
@@ -569,12 +569,12 @@ auto index_folding_ranges(llvm::StringRef content,
             .range = *group,
             .kind = kind,
             .collapsed_text = "{...}",
-            .lines = kind ? declaration_lines(content, *group, row.range.begin, block_directives)
+            .lines = kind ? declaration_lines(content, *group, decl.range.begin, block_directives)
                           : std::nullopt,
         });
     }
 
-    // One fold per range, the declaration's own where several rows share
+    // One fold per range, the declaration's own where several entries share
     // its braces (`typedef struct {...} T;`, the struct's and the alias's).
     std::ranges::sort(ranges, [](const FoldingRange& lhs, const FoldingRange& rhs) {
         return std::tuple(lhs.range.begin, lhs.range.end, !lhs.kind, lhs.kind) <

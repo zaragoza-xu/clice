@@ -79,16 +79,16 @@ std::optional<llvm::SmallVector<Host>> tree_enterings(Project& project,
                                                       Fid header,
                                                       VersionID root,
                                                       llvm::ArrayRef<index::IncludeNode> nodes) {
-    using Verdict = vfs::DiskState::Verdict;
+    using CheckResult = vfs::DiskState::CheckResult;
     auto& files = project.file_table;
-    if(files.check_version(root) != Verdict::Fresh) {
+    if(files.check_version(root) != CheckResult::Fresh) {
         return std::nullopt;
     }
     auto file_of = [&](std::uint32_t node) {
         return files.version(VersionID{nodes[node].file}).fid;
     };
     auto fresh = [&](std::uint32_t node) {
-        return files.check_version(VersionID{nodes[node].file}) == Verdict::Fresh;
+        return files.check_version(VersionID{nodes[node].file}) == CheckResult::Fresh;
     };
 
     // The header's own guard decides which of its includes after the first
@@ -161,7 +161,7 @@ const LenderIndex& lender_index(Project& project) {
     std::ranges::sort(members, {}, [&](Fid unit) { return project.file_table.resolve(unit); });
     llvm::StringMap<CanonicalPath> identities;
     for(auto member: members) {
-        // A member a rule claims with a default command that is no compile
+        // A member a rule covers with a default command that is no compile
         // command has none; a provisional member's is borrowed, and never
         // lent on.
         for(auto& command: project.build.commands(member)) {
@@ -297,7 +297,7 @@ llvm::SmallVector<Fid> ranked_hosts(Project& project, Fid header) {
 
     // The lexical scan follows each header's includes under the first
     // command that reached it; a unit whose compile resolved them
-    // otherwise names the header in its index rows.
+    // otherwise names the header in its index entries.
     llvm::SmallVector<Fid> hosts;
     llvm::DenseSet<Fid> seen;
     auto add = [&](Fid candidate) {

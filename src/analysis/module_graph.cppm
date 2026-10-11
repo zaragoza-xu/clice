@@ -11,9 +11,10 @@ import :vfs.path;
 
 namespace clice {
 
+class CommandResolver;
 struct Project;
 
-}
+}  // namespace clice
 
 namespace clice::analysis {
 
@@ -33,7 +34,7 @@ struct File {
 
     std::uint32_t lines = 0;
 
-    /// Distinct row variants the index holds: more than one means the
+    /// Distinct variants the index holds: more than one means the
     /// file reads differently depending on what includes it.
     std::uint32_t variants = 0;
 
@@ -54,12 +55,12 @@ struct File {
     /// the directive's line and that file.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> directives;
 
-    /// For a fragment, the includers whose Pasted rows at its directive
+    /// For a fragment, the includers whose Pasted relations at its directive
     /// name what it names there: it is a table pasted inside declarations,
-    /// and its own rows are charged to no file.
+    /// and its own entries are charged to no file.
     std::vector<std::uint32_t> pasters;
 
-    /// Names only some of its row variants carry: uses that follow the
+    /// Names only some of its variants carry: uses that follow the
     /// including context, such as the overloads a template's dependent
     /// call finds where it is included. They still draw edges.
     std::vector<std::string> unstable;
@@ -103,6 +104,11 @@ struct Entity {
     /// declaring it, else the source defining it; the first by path among
     /// equals.
     std::uint32_t owner = 0;
+
+    /// The file declaring it, whose index holds it: the owner, or the
+    /// fragment the owner pastes it in from. A hypothetical move changes
+    /// the owner, never this.
+    std::uint32_t declared_in = 0;
 
     InternalLinkage linkage = InternalLinkage::None;
 
@@ -263,7 +269,7 @@ struct Facts {
     std::vector<NamespaceAlias> aliases;
     std::vector<UsingDeclaration> usings;
     /// Each unit's include tree, a node per file entry or guarded directive:
-    /// a header's include edges merged over units claim chains no single
+    /// a header's include edges merged over units report chains no single
     /// unit runs (<stdio.h> includes <stdarg.h> for its va_list type alone).
     std::vector<IncludeTree> trees;
 };
@@ -286,17 +292,23 @@ struct LoadError {
     std::vector<std::string> dropped;
 };
 
+/// Changes the facts while the index they were read from is still open,
+/// for what only the index can resolve: the symbols a locator names.
+using FactsEdit =
+    llvm::function_ref<std::expected<void, std::string>(Project&, CommandResolver&, Facts&)>;
+
 /// The facts of the files the `scope` globs select out of the index of
 /// `workspace` (default: the workspace's own files outside dot
-/// directories), and the workspace root; none from an index that lacks a
-/// unit.
+/// directories), after `edit`, and the workspace root; none from an index
+/// that lacks a unit.
 std::expected<LoadedFacts, LoadError> load_facts(const Spelling& workspace,
                                                  llvm::StringRef configuration,
-                                                 llvm::ArrayRef<std::string> scope);
+                                                 llvm::ArrayRef<std::string> scope,
+                                                 FactsEdit edit = {});
 
 /// What a module is to the program a partition wraps.
 enum class ModuleKind : std::uint8_t {
-    /// A directory of the program no glob claims: its headers stay.
+    /// A directory of the program no glob covers: its headers stay.
     Program,
 
     /// Wrapped: files of other modules see its headers emptied and import
@@ -363,7 +375,7 @@ struct PartitionSpec {
         std::string primary;
     };
 
-    /// Modules claimed by globs, first match wins; unclaimed files keep their
+    /// Modules covered by globs, first match wins; uncovered files keep their
     /// directory module. A name listed again adds globs, and its kind and
     /// provided names.
     std::vector<Module> modules;
@@ -385,10 +397,13 @@ bool is_keyword(llvm::StringRef word);
 /// directory.
 bool is_module_name(llvm::StringRef name);
 
-/// Move the entities a `<name or #id>=<path>` spec selects, with their
-/// members, to another header, existing or hypothetical: what the move
-/// of a declaration would do to the graph, without making it.
-std::expected<void, std::string> move_entities(Facts& facts, llvm::StringRef spec);
+/// Move the entities of `symbols`, with their members, to the header
+/// `path`, existing or hypothetical: what the move of a declaration would
+/// do to the graph, without making it. `spec` names the move in errors.
+std::expected<void, std::string> move_entities(Facts& facts,
+                                               llvm::StringRef spec,
+                                               llvm::ArrayRef<index::SymbolHash> symbols,
+                                               llvm::StringRef path);
 
 struct ModuleSummary {
     std::string name;
@@ -541,7 +556,8 @@ struct Overview {
 };
 
 struct EntityUse {
-    /// `#<hex>`, as `clice query` takes it; overloads share a name.
+    /// The locator naming it, as `clice query` and `--move-entity` take it:
+    /// `#<hex>`, with `path:` the file declaring one of internal linkage.
     std::string id;
     std::string entity;
     std::string owner;
@@ -605,7 +621,7 @@ struct FileDetail {
     std::vector<ModuleLink> affinity;
 };
 
-/// A header the index holds several row variants of. Rows are names and
+/// A header the index holds several variants of. Index entries are names and
 /// positions, so a variant count of one does not prove the header reads
 /// the same everywhere (an initializer may still differ).
 struct VariantHeader {

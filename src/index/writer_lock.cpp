@@ -19,12 +19,12 @@ namespace {
 constexpr llvm::StringLiteral lock_name = "index.lock";
 constexpr llvm::StringLiteral endpoint_name = "server.json";
 
-/// The holder's pid as stamped into the lock file; nullopt when the stamp
+/// The holder's pid as recorded in the lock file; nullopt when the pid
 /// is unreadable (a Windows holder keeps the file exclusive) or absent.
-std::optional<std::uint32_t> stamped_pid(llvm::StringRef lock_path) {
-    auto stamped = vfs::read(lock_path, vfs::Read::Bytes);
+std::optional<std::uint32_t> recorded_pid(llvm::StringRef lock_path) {
+    auto content = vfs::read(lock_path, vfs::Read::Bytes);
     std::uint32_t pid = 0;
-    if(!stamped || (*stamped)->getBuffer().trim().getAsInteger(10, pid)) {
+    if(!content || (*content)->getBuffer().trim().getAsInteger(10, pid)) {
         return std::nullopt;
     }
     return pid;
@@ -47,7 +47,7 @@ std::optional<WriterLock> WriterLock::acquire(llvm::StringRef cache_dir) {
         return std::nullopt;
     }
     if(llvm::sys::fs::tryLockFile(lock_fd)) {
-        auto holder = holder_name(stamped_pid(lock_path));
+        auto holder = holder_name(recorded_pid(lock_path));
         LOG_WARN(
             "Another clice process{} is writing the index cache at {}; "
             "index persistence is disabled for this process",
@@ -60,19 +60,19 @@ std::optional<WriterLock> WriterLock::acquire(llvm::StringRef cache_dir) {
     // holder is now this process, which publishes its own if it serves.
     remove_endpoint(cache_dir);
     llvm::sys::fs::resize_file(lock_fd, 0);
-    llvm::raw_fd_ostream stamp(lock_fd, /*shouldClose=*/false);
-    stamp.seek(0);
-    stamp << llvm::sys::Process::getProcessId() << '\n';
-    stamp.flush();
-    // Best effort: a lock left unstamped only costs the next process the
+    llvm::raw_fd_ostream out(lock_fd, /*shouldClose=*/false);
+    out.seek(0);
+    out << llvm::sys::Process::getProcessId() << '\n';
+    out.flush();
+    // Best effort: a lock left without a pid only costs the next process the
     // pid in its message, while an errored stream aborts in its destructor.
-    stamp.clear_error();
+    out.clear_error();
     return WriterLock(lock_fd);
 }
 
 void WriterLock::release() {
     if(fd != -1) {
-        // The stamp names the holder; an unheld lock reads as nobody.
+        // The recorded pid names the holder; an unheld lock reads as nobody.
         llvm::sys::fs::resize_file(fd, 0);
         llvm::sys::fs::unlockFile(fd);
         llvm::sys::Process::SafelyCloseFileDescriptor(fd);
@@ -118,8 +118,8 @@ WriterProbe probe_writer(llvm::StringRef cache_dir) {
         return probe;
     }
     if(!llvm::sys::fs::tryLockFile(lock_fd)) {
-        // Swept under the lock: a server acquiring it right after the
-        // release publishes a record this sweep must not take.
+        // Removed under the lock: a server acquiring it right after the
+        // release publishes a record this removal must not take.
         remove_endpoint(cache_dir);
         llvm::sys::fs::unlockFile(lock_fd);
         llvm::sys::Process::SafelyCloseFileDescriptor(lock_fd);
@@ -127,7 +127,7 @@ WriterProbe probe_writer(llvm::StringRef cache_dir) {
     }
     llvm::sys::Process::SafelyCloseFileDescriptor(lock_fd);
     probe.state = WriterProbe::State::Held;
-    auto holder = stamped_pid(lock_path);
+    auto holder = recorded_pid(lock_path);
     probe.holder = holder_name(holder);
 
     auto record = vfs::read(path::join(cache_dir, endpoint_name), vfs::Read::Bytes);
@@ -139,7 +139,7 @@ WriterProbe probe_writer(llvm::StringRef cache_dir) {
         return probe;
     }
     // A record from a server that died holding the lock survives until the
-    // next holder records its own; the stamp tells them apart where it can
+    // next holder records its own; the recorded pid tells them apart where it can
     // be read.
     if(holder && *holder != endpoint.pid) {
         return probe;

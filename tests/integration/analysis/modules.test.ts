@@ -467,12 +467,97 @@ test("hypothetical partitions", async ({ session }) => {
     const byId = (await analyze(ws, "--move-entity", `${clock?.id}=core/clock.h`)) as Overview;
     expect(byId.cycles).toHaveLength(0);
 
+    // One of internal linkage is named with the header that owns it.
+    const used = (await analyze(ws, "--view", "edge", "--from", "app", "--to", "core")) as {
+        entities: { id: string; entity: string }[];
+    };
+    const helper = used.entities.find((entry) => entry.entity === "helper");
+    expect(helper?.id).toMatch(/^#[0-9a-f]+ path:core\/str\.h$/);
+    const internal = (await analyze(ws, "--move-entity", `${helper?.id}=app/helper.h`)) as Overview;
+    expect(edge(internal, "core", "app")?.sample).toContain("helper");
+    // Moved, it is still named by the header the index holds it in.
+    const back = (await analyze(
+        ws,
+        "--move-entity",
+        `${helper?.id}=app/helper.h`,
+        "--view",
+        "edge",
+        "--from",
+        "core",
+        "--to",
+        "app",
+    )) as { entities: { id: string; entity: string }[] };
+    expect(back.entities.find((entry) => entry.entity === "helper")?.id).toBe(helper?.id);
+
     // What the moved definition names moves with it.
     const carried = (await analyze(ws, "--move-entity", "Clock=meta/clock.h")) as Overview;
     expect(edge(carried, "meta", "core")?.sample).toEqual(
         expect.arrayContaining(["Str", "length"]),
     );
     expect(edge(carried, "core", "meta")?.sample).toContain("Clock");
+
+    // Each repetition is one more move.
+    const one = (await analyze(ws, "--move-entity", "twice=core/twice.h")) as Overview;
+    expect(edge(one, "core", "util")?.sample).toContain("Clock");
+    const both = (await analyze(
+        ws,
+        "--move-entity",
+        "twice=core/twice.h",
+        "--move-entity",
+        "kind:struct,class Clock=core/clock.h",
+    )) as Overview;
+    expect(edge(both, "core", "util")?.sample ?? []).not.toEqual(expect.arrayContaining(["Clock"]));
+    expect(edge(both, "core", "util")?.sample ?? []).not.toEqual(expect.arrayContaining(["twice"]));
+
+    const failed = await runClice(
+        "analyze",
+        "modules",
+        "--workspace",
+        ws.root,
+        "--move-entity",
+        "Traits=core/traits2.h",
+    );
+    expect(failed.status).toBe(1);
+    const failure = JSON.parse(failed.stdout) as { error: string; candidates: unknown[] };
+    expect(failure.error).toMatch(/^--move-entity Traits=core\/traits2\.h: ambiguous/);
+    expect(failure.candidates.length).toBeGreaterThan(1);
+});
+
+test("operator overloads move together", async ({ session }) => {
+    const ws = session.tmpdir();
+    ws.pinCacheDir();
+    ws.write(
+        "core/vec.h",
+        lines(
+            "#pragma once",
+            "struct Vec { int x; };",
+            "Vec operator+(Vec a, Vec b);",
+            "Vec operator+(Vec a, int b);",
+        ),
+    );
+    ws.write(
+        "core/vec.cpp",
+        lines(
+            '#include "core/vec.h"',
+            "Vec operator+(Vec a, Vec b) { return {a.x + b.x}; }",
+            "Vec operator+(Vec a, int b) { return {a.x + b}; }",
+        ),
+    );
+    ws.write(
+        "app/main.cpp",
+        lines('#include "core/vec.h"', "int main() { return (Vec{1} + Vec{2} + 3).x; }"),
+    );
+    ws.writeEntries([
+        ["core/vec.cpp", [`-I${ws.root}`]],
+        ["app/main.cpp", [`-I${ws.root}`]],
+    ]);
+    const run = await runClice("index", "--workspace", ws.root);
+    expect(run.status, `stderr: ${run.stderr}`).toBe(0);
+
+    const before = (await analyze(ws)) as Overview;
+    expect(edge(before, "app", "core")?.sample).toContain("operator+");
+    const moved = (await analyze(ws, "--move-entity", "operator+=app/ops.h")) as Overview;
+    expect(edge(moved, "app", "core")?.sample ?? []).not.toContain("operator+");
 });
 
 test("partition files and limits", async ({ session }) => {

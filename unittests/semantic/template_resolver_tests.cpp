@@ -4295,7 +4295,7 @@ ZEST_CASE(ConstrainedBeatsUnconstrained) {
 }
 
 ZEST_CASE(ConstraintDisjunction) {
-    /// A satisfied disjunct settles the disjunction even beside one that
+    /// A satisfied disjunct decides the disjunction even beside one that
     /// cannot be decided.
     run(R"code(
         template <typename T>
@@ -4903,7 +4903,7 @@ ZEST_CASE(ResolvedCallee) {
     ZEXPECT(candidates.front()->getName() == "take");
 }
 
-ZEST_CASE(BrokenCodeSweep) {
+ZEST_CASE(BrokenCodeScan) {
     /// Error-recovery ASTs are the resolver's everyday hostile input in an
     /// LSP; resolving anything in a broken TU must degrade, never crash.
     add_main("main.cpp", R"code(
@@ -4937,11 +4937,11 @@ ZEST_CASE(BrokenCodeSweep) {
     prepare();
     ZASSERT(try_compile());
 
-    struct Sweeper : clang::RecursiveASTVisitor<Sweeper> {
+    struct Scanner : clang::RecursiveASTVisitor<Scanner> {
         types::TemplateResolver& resolver;
         unsigned visited = 0;
 
-        Sweeper(types::TemplateResolver& resolver) : resolver(resolver) {}
+        Scanner(types::TemplateResolver& resolver) : resolver(resolver) {}
 
         bool VisitTypedefNameDecl(clang::TypedefNameDecl* decl) {
             auto type = decl->getUnderlyingType();
@@ -4963,17 +4963,17 @@ ZEST_CASE(BrokenCodeSweep) {
             visited += 1;
             return true;
         }
-    } sweeper(unit->resolver());
+    } scanner(unit->resolver());
 
-    sweeper.TraverseAST(unit->context());
-    ZEXPECT(sweeper.visited > 0);
+    scanner.TraverseAST(unit->context());
+    ZEXPECT(scanner.visited > 0);
 }
 
-ZEST_CASE(StandardSweep) {
-    /// Crash-safety sweep: feed every dependent typedef and dependent
+ZEST_CASE(StandardScan) {
+    /// Crash-safety scan: feed every dependent typedef and dependent
     /// expression in a libstdc++-heavy TU through the resolver. Results are
     /// irrelevant — under the assertion-enabled ASan Debug build, surviving
-    /// the sweep is the assertion.
+    /// the scan is the assertion.
     add_main("main.cpp", R"code(
         #include <functional>
         #include <map>
@@ -4982,11 +4982,11 @@ ZEST_CASE(StandardSweep) {
     )code");
     ZASSERT(compile_driver());
 
-    struct Sweeper : clang::RecursiveASTVisitor<Sweeper> {
+    struct Scanner : clang::RecursiveASTVisitor<Scanner> {
         types::TemplateResolver& resolver;
         unsigned visited = 0;
 
-        Sweeper(types::TemplateResolver& resolver) : resolver(resolver) {}
+        Scanner(types::TemplateResolver& resolver) : resolver(resolver) {}
 
         bool VisitTypedefNameDecl(clang::TypedefNameDecl* decl) {
             auto type = decl->getUnderlyingType();
@@ -5008,10 +5008,10 @@ ZEST_CASE(StandardSweep) {
             visited += 1;
             return true;
         }
-    } sweeper(unit->resolver());
+    } scanner(unit->resolver());
 
-    sweeper.TraverseAST(unit->context());
-    ZEXPECT(sweeper.visited > 0);
+    scanner.TraverseAST(unit->context());
+    ZEXPECT(scanner.visited > 0);
 }
 
 };  // ZEST_SUITE(TemplateResolver)

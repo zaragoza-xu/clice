@@ -34,7 +34,7 @@ llvm::SmallVector<std::uint32_t, 1>
     return found;
 }
 
-/// Positions in one text, for the sites of tokens no row spans.
+/// Positions in one text, for the sites of tokens no relation spans.
 struct Lines {
     llvm::StringRef text;
     std::vector<std::uint32_t> starts;
@@ -112,7 +112,7 @@ std::vector<IndexQuery::Located> all_named(const IndexQuery& query, llvm::String
     }
 }
 
-/// The newest dialect of each language; read-only once built, so sweeps
+/// The newest dialect of each language; read-only once built, so scans
 /// on other threads may share them.
 const clang::LangOptions& cxx() {
     const static auto options = raw_dialect(clang::Language::CXX, clang::LangStandard::lang_cxx26);
@@ -162,7 +162,7 @@ std::optional<std::string> invalid_identifier(llvm::StringRef name) {
     return std::nullopt;
 }
 
-std::optional<SweptText> sweep_text(std::string text, const llvm::StringSet<>& names) {
+std::optional<ScannedText> scan_text(std::string text, const llvm::StringSet<>& names) {
     // Most files spell no name: a scan of the identifier-like runs, a
     // comment's words among them, rules them out before any lexing.
     llvm::StringRef rest = text;
@@ -179,7 +179,7 @@ std::optional<SweptText> sweep_text(std::string text, const llvm::StringSet<>& n
     if(!spelled) {
         return std::nullopt;
     }
-    SweptText swept;
+    ScannedText scanned;
     bool directive = false;
     Lexer lexer(text, {.lang_opts = &cxx()});
     for(auto token = lexer.advance(); !token.is_eof(); token = lexer.advance()) {
@@ -189,14 +189,14 @@ std::optional<SweptText> sweep_text(std::string text, const llvm::StringSet<>& n
             directive = false;
         }
         if(auto name = token.text(text); token.is_identifier() && names.contains(name)) {
-            swept.tokens[name].push_back({.offset = token.range.begin, .directive = directive});
+            scanned.tokens[name].push_back({.offset = token.range.begin, .directive = directive});
         }
     }
-    if(swept.tokens.empty()) {
+    if(scanned.tokens.empty()) {
         return std::nullopt;
     }
-    swept.text = std::move(text);
-    return swept;
+    scanned.text = std::move(text);
+    return scanned;
 }
 
 std::expected<RenameTarget, std::string> rename_target(const IndexQuery& query,
@@ -338,7 +338,7 @@ RenamePlan plan_rename(const IndexQuery& query,
         group.insert(member.symbol.hash);
     }
     // A deduction guide relates to nothing and has no definition to find
-    // it by: the sweep meets each one where it spells the template's name.
+    // it by: the scan meets each one where it spells the template's name.
     bool guided = class_like(root.kind) && has_flag(root.flags, SymbolFlags::Template);
     auto renames = [&](SymbolHash symbol, Fid file) {
         if(group.contains(symbol)) {
@@ -357,7 +357,7 @@ RenamePlan plan_rename(const IndexQuery& query,
         return other != batch.renamed.end() && other->second == new_name;
     };
 
-    // The text every row of a file indexes, and its positions.
+    // The text every entry of a file indexes, and its positions.
     struct Text {
         std::optional<std::string> text;
         std::optional<Lines> lines;
@@ -448,7 +448,7 @@ RenamePlan plan_rename(const IndexQuery& query,
                 }
                 auto offsets = spellings(*text.text, site.range.begin, site.range.end, old_name);
                 if(offsets.empty()) {
-                    // A row on punctuation (a construction's paren) spells
+                    // A relation on punctuation (a construction's paren) spells
                     // no name; one on another name is a macro's invocation.
                     auto written =
                         llvm::StringRef(*text.text).slice(site.range.begin, site.range.end);
@@ -482,7 +482,7 @@ RenamePlan plan_rename(const IndexQuery& query,
                             edit.site.path));
             continue;
         }
-        // The edits are offsets into the text the rows index; the sweep
+        // The edits are offsets into the text the index was built from; the scan
         // below compares only the files that still spell a name.
         auto* current = scope.read(path);
         if(!current || current->text != *text_of(file).text) {
@@ -578,7 +578,7 @@ RenamePlan plan_rename(const IndexQuery& query,
         if(!source) {
             continue;
         }
-        source->rows->for_each_relation([&](SymbolHash hash, const Relation&) {
+        source->shard->for_each_relation([&](SymbolHash hash, const Relation&) {
             if(!listed.insert(hash).second) {
                 return true;
             }
@@ -780,8 +780,8 @@ BatchPlan plan_renames(const IndexQuery& query,
 
     llvm::StringMap<std::vector<std::string>> spelled;
     for(auto& path: scope.files) {
-        if(auto* swept = scope.read(path)) {
-            for(auto& name: swept->tokens) {
+        if(auto* scanned = scope.read(path)) {
+            for(auto& name: scanned->tokens) {
                 spelled[name.getKey()].push_back(path);
             }
         }

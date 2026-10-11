@@ -119,7 +119,7 @@ kota::task<> shutdown(BatchStack& stack) {
 
 /// A batch run's signal handling and the order of its ending. Interruption
 /// is judged only after the scheduling stack shut down and the watchers
-/// settled: a signal arriving while the final save/teardown ran must still
+/// finished: a signal arriving while the final save/teardown ran must still
 /// report an interruption, not a normal completion with exit code 0.
 struct BatchLifetime {
     BatchStack& stack;
@@ -148,7 +148,7 @@ struct BatchLifetime {
         return stop.token();
     }
 
-    /// Shuts the stack down and settles the watchers; whether the run was
+    /// Shuts the stack down and stops the watchers; whether the run was
     /// interrupted.
     kota::task<bool> finish() {
         co_await shutdown(stack);
@@ -305,9 +305,9 @@ kota::task<> run(BatchStack& stack, const BatchOptions& options, BatchResult& re
     result.seconds = timer.ms() / 1000.0;
 }
 
-/// The lint sweep's shared counters and findings, living on run_lint's
+/// The lint pass's shared counters and findings, living on run_lint's
 /// frame.
-struct LintSweep {
+struct LintPass {
     std::size_t inflight = 0;
     std::size_t checked = 0;
     std::size_t failed = 0;
@@ -332,7 +332,7 @@ void merge_findings(std::vector<worker::TidyDiagnostic>& findings) {
     findings.erase(duplicates.begin(), duplicates.end());
 }
 
-kota::task<> lint_one(BatchStack& stack, bool with_index, Fid path_id, LintSweep& sweep) {
+kota::task<> lint_one(BatchStack& stack, bool with_index, Fid path_id, LintPass& pass) {
     auto file = stack.project.file_table.resolve(path_id);
     // A TU outside the lint set is here for the index only.
     TURunFamily::Plan plan;
@@ -343,27 +343,27 @@ kota::task<> lint_one(BatchStack& stack, bool with_index, Fid path_id, LintSweep
     }
 
     // One retry: a lost run or a preemption says nothing about the TU, and
-    // a one-shot sweep has no later round to requeue into. A run that
+    // a one-shot pass has no later round to requeue into. A run that
     // crashed its worker would crash the retry too.
     auto outcome = co_await stack.sched.turun.run(path_id, plan);
-    if(outcome.verdict == TURunFamily::Verdict::Lost ||
-       outcome.verdict == TURunFamily::Verdict::Preempted) {
+    if(outcome.result == TURunFamily::Result::Lost ||
+       outcome.result == TURunFamily::Result::Preempted) {
         outcome = co_await stack.sched.turun.run(path_id, std::move(plan));
     }
 
-    switch(outcome.verdict) {
-        case TURunFamily::Verdict::Completed: {
+    switch(outcome.result) {
+        case TURunFamily::Result::Completed: {
             if(plan.tidy) {
-                sweep.checked += 1;
+                pass.checked += 1;
             }
             if(with_index) {
-                stack.sched.pump.claim_report(outcome.report);
+                stack.sched.pump.apply_report(outcome.report);
             }
             // The lint set applies to the findings too: a header outside
             // it reports nothing. A compiler error stays wherever it is:
             // broken code is not a clean run.
             std::ranges::copy_if(outcome.tidy_diagnostics,
-                                 std::back_inserter(sweep.findings),
+                                 std::back_inserter(pass.findings),
                                  [&](const worker::TidyDiagnostic& d) {
                                      auto& files = stack.project.file_table;
                                      return d.check == "clang-diagnostic-error" ||
@@ -372,40 +372,40 @@ kota::task<> lint_one(BatchStack& stack, bool with_index, Fid path_id, LintSweep
                                  });
             break;
         }
-        case TURunFamily::Verdict::Skipped:
-        case TURunFamily::Verdict::Failed: {
+        case TURunFamily::Result::Skipped:
+        case TURunFamily::Result::Failed: {
             // Skipped means no real compile command (the index path keeps
-            // last-known rows then; lint has nothing to keep) — either way
+            // the last-known index then; lint has nothing to keep) — either way
             // the TU went unchecked.
-            sweep.failed += 1;
+            pass.failed += 1;
             LOG_WARN("Lint failed for {}: {}",
                      file,
                      outcome.error.empty() ? "no compile command found" : outcome.error);
             break;
         }
-        case TURunFamily::Verdict::Crashed: {
-            sweep.failed += 1;
+        case TURunFamily::Result::Crashed: {
+            pass.failed += 1;
             LOG_WARN("Lint gave up on {}: {}", file, outcome.error);
             break;
         }
-        case TURunFamily::Verdict::Lost:
-        case TURunFamily::Verdict::Preempted: {
-            sweep.failed += 1;
+        case TURunFamily::Result::Lost:
+        case TURunFamily::Result::Preempted: {
+            pass.failed += 1;
             LOG_WARN("Lint gave up on {} after a retry: {}", file, outcome.error);
             break;
         }
-        case TURunFamily::Verdict::Shutdown: {
+        case TURunFamily::Result::Shutdown: {
             break;
         }
     }
-    sweep.inflight -= 1;
-    sweep.task_done.set();
+    pass.inflight -= 1;
+    pass.task_done.set();
 }
 
-kota::task<> run_lint_sweep(BatchStack& stack,
-                            const BatchLintOptions& options,
-                            llvm::ArrayRef<Fid> tus,
-                            LintSweep& sweep) {
+kota::task<> run_lint_pass(BatchStack& stack,
+                           const BatchLintOptions& options,
+                           llvm::ArrayRef<Fid> tus,
+                           LintPass& pass) {
     kota::task_group<> workers;
 
     // The dispatch loop runs as a child of `workers`, like the pump's
@@ -414,21 +414,20 @@ kota::task<> run_lint_sweep(BatchStack& stack,
     auto feeder = [](BatchStack& stack,
                      const BatchLintOptions& options,
                      llvm::ArrayRef<Fid> tus,
-                     LintSweep& sweep,
+                     LintPass& pass,
                      kota::task_group<>& workers) -> kota::task<> {
         for(auto path_id: tus) {
             // The pump feeder's window: deep enough that workers never
             // idle, shallow enough that a wind-down drains fast.
-            while(sweep.inflight >=
-                  std::max<std::size_t>(2 * stack.pool.effective_low_limit(), 2)) {
-                sweep.task_done.reset();
-                co_await sweep.task_done.wait();
+            while(pass.inflight >= std::max<std::size_t>(2 * stack.pool.effective_low_limit(), 2)) {
+                pass.task_done.reset();
+                co_await pass.task_done.wait();
             }
-            sweep.inflight += 1;
-            workers.spawn(lint_one(stack, options.with_index, path_id, sweep));
+            pass.inflight += 1;
+            workers.spawn(lint_one(stack, options.with_index, path_id, pass));
         }
     };
-    workers.spawn(feeder(stack, options, tus, sweep, workers));
+    workers.spawn(feeder(stack, options, tus, pass, workers));
     co_await workers.join();
 }
 
@@ -443,10 +442,10 @@ kota::task<> run_lint(BatchStack& stack, const BatchLintOptions& options, BatchL
         co_await stack.pool.stop();
         co_return;
     }
-    // The command's product is the lint report: the background sweep must
+    // The command's product is the lint report: the background pass must
     // not race the plan's own runs, and without --index nothing may touch
     // the persisted index — the read-only load queues no reconciliation
-    // or sweep writes, so the shutdown save commits nothing.
+    // or removal writes, so the shutdown save commits nothing.
     if(!check_requested_configuration(project.config, options.configuration)) {
         result.exit_code = 2;
         co_await stack.pool.stop();
@@ -478,7 +477,7 @@ kota::task<> run_lint(BatchStack& stack, const BatchLintOptions& options, BatchL
     }
 
     // One run per file: a file with several CDB entries lints once, under
-    // the command resolve_command picks — same as the indexing sweep. A TU
+    // the command resolve_command picks — same as the indexing pass. A TU
     // the rules keep out of the lint set is not even parsed, unless the
     // index wants it.
     llvm::SmallVector<Fid> tus;
@@ -490,26 +489,26 @@ kota::task<> run_lint(BatchStack& stack, const BatchLintOptions& options, BatchL
     }
 
     BatchLifetime lifetime(stack);
-    LintSweep sweep;
-    co_await kota::with_token(run_lint_sweep(stack, options, tus, sweep), lifetime.token());
-    // What landed is the report, whole or cut short by an interruption.
+    LintPass pass;
+    co_await kota::with_token(run_lint_pass(stack, options, tus, pass), lifetime.token());
+    // What arrived is the report, whole or cut short by an interruption.
     auto shown = [&files = project.file_table](std::string& file) {
         file = files.display(files.intern(Spelling::absolute(file)));
     };
-    for(auto& finding: sweep.findings) {
+    for(auto& finding: pass.findings) {
         shown(finding.file);
         for(auto& note: finding.notes) {
             shown(note.file);
         }
     }
-    merge_findings(sweep.findings);
-    result.findings = std::move(sweep.findings);
+    merge_findings(pass.findings);
+    result.findings = std::move(pass.findings);
     if(options.with_index && !lifetime.stop_requested) {
-        // The sweep's merges can owe other TUs a reindex (a rebuilt shared
-        // shard dropped their variants), and bootstrap may have claimed
-        // prior-session debt — the sweep runs outside the pump, so nothing
-        // settled any of it. Drain it through the pump like the index
-        // batch does, or an already-linted owner's rows stay missing while
+        // The pass's merges can owe other TUs a reindex (a rebuilt shared
+        // shard dropped their variants), and bootstrap may have taken
+        // prior-session debt — the pass runs outside the pump, so nothing
+        // drained any of it. Drain it through the pump like the index
+        // batch does, or an already-linted owner's index stays missing while
         // the run exits clean.
         project.config.project.enable_indexing.value = true;
         stack.sched.pump.schedule(/*immediate=*/true);
@@ -522,8 +521,8 @@ kota::task<> run_lint(BatchStack& stack, const BatchLintOptions& options, BatchL
     }
 
     result.completed = true;
-    result.checked_tus = sweep.checked;
-    result.failed_tus = sweep.failed + stack.sched.pump.failed().size();
+    result.checked_tus = pass.checked;
+    result.failed_tus = pass.failed + stack.sched.pump.failed().size();
     // The shutdown save was the last retry: with --index the persisted
     // index is part of the product, so unsaved state must fail the run
     // like the index-only batch does.
@@ -641,7 +640,7 @@ kota::task<ToolRun> run_clang_format(const std::string& executable,
                       .output = std::move(captured->stderr_data)};
 }
 
-/// One of the `jobs` workers: runs the next unclaimed chunk until none is
+/// One of the `jobs` workers: runs the next untaken chunk until none is
 /// left.
 kota::task<> format_chunks(const std::string& executable,
                            bool check,
@@ -655,11 +654,11 @@ kota::task<> format_chunks(const std::string& executable,
     }
 }
 
-kota::task<> run_format_sweep(const std::string& executable,
-                              bool check,
-                              std::uint32_t jobs,
-                              llvm::ArrayRef<std::vector<std::string>> chunks,
-                              std::vector<ToolRun>& runs) {
+kota::task<> run_format_pass(const std::string& executable,
+                             bool check,
+                             std::uint32_t jobs,
+                             llvm::ArrayRef<std::vector<std::string>> chunks,
+                             std::vector<ToolRun>& runs) {
     std::size_t next = 0;
     kota::task_group<> workers;
     for(std::uint32_t i = 0; i < jobs && i < chunks.size(); i += 1) {
@@ -814,7 +813,7 @@ BatchFormatResult run_batch_format(const BatchFormatOptions& options) {
     std::uint32_t jobs =
         options.jobs != 0 ? options.jobs : std::max(1u, std::thread::hardware_concurrency());
     std::vector<ToolRun> runs(chunks.size());
-    kota::run(run_format_sweep(*executable, options.check, jobs, chunks, runs));
+    kota::run(run_format_pass(*executable, options.check, jobs, chunks, runs));
 
     llvm::StringSet<> unformatted;
     bool failed = false;

@@ -4,7 +4,7 @@
 /// independent of the host's.
 
 import type * as proto from "vscode-languageserver-protocol";
-import { SETTLE_TIME, waitUntil, type CliceClient } from "@clice/tools/client";
+import { STABILIZE_DELAY, waitUntil, type CliceClient } from "@clice/tools/client";
 import { applyTextEdits, editsFor } from "@clice/tools/client/edits";
 import { expect, test } from "../fixtures.ts";
 
@@ -46,7 +46,7 @@ async function waitIndexed(client: CliceClient, name: string, file: string): Pro
             ((await client.workspaceSymbols(name)) ?? []).some((symbol) =>
                 symbol.location.uri.endsWith(file),
             ),
-        { timeout: 30_000, interval: SETTLE_TIME, description: `${name} indexed from ${file}` },
+        { timeout: 30_000, interval: STABILIZE_DELAY, description: `${name} indexed from ${file}` },
     );
 }
 

@@ -1,5 +1,5 @@
 import type * as proto from "vscode-languageserver-protocol";
-import { SETTLE_TIME, sleep } from "../../client/client.ts";
+import { STABILIZE_DELAY, sleep } from "../../client/client.ts";
 import { markerPoints, markerRanges } from "../annotation.ts";
 import {
     directiveLines,
@@ -120,7 +120,7 @@ export const codeAction: Feature = {
         // The index-backed actions (definitions vetted and placed in the
         // host, headers declaring a name) race the background index: an
         // indexing fixture names the symbols that must have arrived from
-        // another file's rows — the requested file's own session already
+        // another file's index — the requested file's own session already
         // knows the declarations it sees, which is not the fact awaited.
         const indexed = directiveLines(ctx.stripped, "indexed");
         if (indexed.length > 0 && ctx.indexing !== true) {
@@ -134,7 +134,7 @@ export const codeAction: Feature = {
                     (symbol) => symbol.name === name && symbol.location.uri !== uri,
                 );
                 if (!elsewhere) {
-                    await sleep(SETTLE_TIME);
+                    await sleep(STABILIZE_DELAY);
                 }
             }
             if (!elsewhere) {

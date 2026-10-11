@@ -150,9 +150,7 @@ enum class LogLevel : std::uint8_t { Trace, Debug, Info, Warn, Error, Off };
 /// The --log-level option every subcommand's options hold; a subcommand
 /// that logs less unless asked gives it a default of its own.
 struct LogLevelOption {
-    DecoKV(style = kota::deco::decl::KVStyle::JoinedOrSeparate,
-           help = "Log level",
-           required = false)
+    DecoKV(help = "Log level", required = false)
     <LogLevel> log_level = LogLevel::Info;
 
     /// Make the level given the global log level.
@@ -208,7 +206,7 @@ const inline char* plural_s(std::size_t count) {
 }
 
 /// One answer on stdout: `{"result": ..., "stale": [...]}`, the files
-/// whose rows were withheld because their content moved on from the
+/// whose shards were withheld because their content moved on from the
 /// index (or that the index never held) listed so the reader knows what
 /// the answer lacks.
 template <typename T>
@@ -249,7 +247,7 @@ inline std::expected<index::SymbolQuery, std::string>
 
 /// Bring the index up to date with the disk before a --fresh answer:
 /// through the serving writer when a server holds the lock, else by a
-/// batch run of this process. Either sweeps the build under the hash
+/// batch run of this process. Either runs a pass over the build under the hash
 /// gate, so only units whose inputs changed are recompiled — and an
 /// absent index gets built from nothing. Returns the units that failed
 /// to index, or why the refresh could not run.

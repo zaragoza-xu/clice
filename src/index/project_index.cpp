@@ -14,7 +14,7 @@ namespace clice::index {
 
 namespace {
 
-/// Upper bound on the persisted FileVersion id space a blob may claim:
+/// Upper bound on the persisted FileVersion id space a blob may report:
 /// the writer hands ids out from the blob's counter, so a garbage one just
 /// below the reserved keys would soon hand one out. The cap is far beyond
 /// any lineage a writer accumulates (ids grow only with newly persisted
@@ -40,12 +40,12 @@ struct GlobalBlob {
 
     /// Path id -> path for every id the symbol columns reference. Ids
     /// are dense and stable across writes: a path keeps its id for as
-    /// long as the blob lineage lives, so a base row's bitmap image is
+    /// long as the blob lineage lives, so a base entry's bitmap image is
     /// copied into the next blob verbatim.
     std::vector<std::string> paths;
 
     /// The external symbol table, sorted by hash. Reference bitmaps are
-    /// portable roaring images back to back, one end offset per row.
+    /// portable roaring images back to back, one end offset per symbol.
     std::vector<std::uint64_t> sym_hashes;
     std::string sym_names;
     std::vector<std::uint32_t> sym_name_ends;
@@ -54,27 +54,27 @@ struct GlobalBlob {
     std::vector<std::uint64_t> sym_parents;
     std::vector<std::uint8_t> sym_kinds;
     std::vector<std::uint16_t> sym_flags;
-    /// Path ids, `no_file` for a symbol without a declaring row.
+    /// Path ids, `no_file` for a symbol without a declaring relation.
     std::vector<std::uint32_t> sym_files;
     std::vector<std::uint32_t> sym_reference_counts;
     std::vector<std::uint32_t> sym_bitmap_ends;
     std::vector<std::uint8_t> sym_bitmaps;
 
-    /// tu_fv -> generation stamp of every manifest current at this save.
-    /// The loader adopts a manifest blob only on an exact stamp match, so
-    /// a manifest whose write failed while the global landed (or one that
+    /// tu_fv -> generation of every manifest current at this save.
+    /// The loader adopts a manifest blob only on an exact generation match, so
+    /// a manifest whose write failed while the global was persisted (or one that
     /// outran a lost global write) reads as lost and its TU reindexes,
     /// instead of an older on-disk manifest serving as current.
     std::vector<std::uint32_t> manifest_fvs;
     std::vector<std::uint64_t> manifest_gens;
 
     /// The generation of the search blob this table was saved with, and
-    /// the rows changed since that blob was built.
+    /// the entries changed since that blob was built.
     std::uint64_t search_generation = 0;
     std::vector<std::uint64_t> search_pending;
 
     /// The reverse include graph, for readers holding no manifests: every
-    /// file some TU contributed rows to (path ids, ascending), and those
+    /// file some TU contributed a variant to (path ids, ascending), and those
     /// TUs' path ids as portable roaring images back to back.
     std::vector<std::uint32_t> contributed_files;
     std::vector<std::uint32_t> contributor_ends;
@@ -155,7 +155,7 @@ struct ProjectIndex::Base {
         return view_bitmap(bytes.data(), bytes.size());
     }
 
-    /// The TUs that contributed rows to `file`, as path ids; nullopt when
+    /// The TUs that contributed a variant to `file`, as path ids; nullopt when
     /// none did or the image fails to decode.
     std::optional<Bitmap> contributors_of(Fid file) const {
         if(contributed_index.empty()) {
@@ -257,8 +257,8 @@ std::expected<void, llvm::StringRef> ProjectIndex::Base::bind(BlobView root) {
        !monotone_ends(bitmap_ends, bitmaps.size())) {
         return std::unexpected("symbol arenas do not line up");
     }
-    // Hashes, parents and pending rows become table keys downstream, which
-    // reserve two sentinel values; a repeated hash would let one row shadow
+    // Hashes, parents and pending entries become table keys downstream, which
+    // reserve two sentinel values; a repeated hash would let one entry shadow
     // another.
     for(std::size_t i = 0; i < count; i += 1) {
         if(reserved_key(hashes[i]) || (i > 0 && hashes[i] <= hashes[i - 1])) {
@@ -471,8 +471,8 @@ std::uint32_t ProjectIndex::reference_count(SymbolHash hash) const {
 }
 
 void ProjectIndex::each_reference_file(SymbolHash hash, llvm::function_ref<void(Fid)> visit) const {
-    auto own = [&](const Symbol& row) {
-        for(auto id: row.reference_files) {
+    auto own = [&](const Symbol& symbol) {
+        for(auto id: symbol.reference_files) {
             visit(Fid{id});
         }
     };
@@ -506,20 +506,20 @@ void ProjectIndex::each_reference_file(SymbolHash hash, llvm::function_ref<void(
 
 void ProjectIndex::for_each_symbol(
     llvm::function_ref<bool(SymbolHash, const SymbolIdentity&, std::uint32_t)> visit) const {
-    for(auto& [hash, row]: changed) {
+    for(auto& [hash, symbol]: changed) {
         if(!visit(hash,
-                  row.identity(),
-                  static_cast<std::uint32_t>(row.reference_files.cardinality()))) {
+                  symbol.identity(),
+                  static_cast<std::uint32_t>(symbol.reference_files.cardinality()))) {
             return;
         }
     }
-    for(auto& [hash, row]: written) {
+    for(auto& [hash, symbol]: written) {
         if(changed.contains(hash)) {
             continue;
         }
         if(!visit(hash,
-                  row.identity(),
-                  static_cast<std::uint32_t>(row.reference_files.cardinality()))) {
+                  symbol.identity(),
+                  static_cast<std::uint32_t>(symbol.reference_files.cardinality()))) {
             return;
         }
     }
@@ -557,33 +557,33 @@ Symbol& ProjectIndex::touch(SymbolHash hash) {
     if(!inserted) {
         return it->second;
     }
-    auto& row = it->second;
+    auto& symbol = it->second;
     if(auto held = written.find(hash); held != written.end()) {
-        row = held->second;
-        return row;
+        symbol = held->second;
+        return symbol;
     }
     if(!base) {
-        return row;
+        return symbol;
     }
     auto doc = base->find(hash);
     if(!doc) {
-        return row;
+        return symbol;
     }
     auto identity = base->identity(*doc);
-    row.name = identity.name.str();
-    row.args = identity.args.str();
-    row.parent = identity.parent;
-    row.kind = identity.kind;
-    row.flags = identity.flags;
-    row.file = identity.file;
+    symbol.name = identity.name.str();
+    symbol.args = identity.args.str();
+    symbol.parent = identity.parent;
+    symbol.kind = identity.kind;
+    symbol.flags = identity.flags;
+    symbol.file = identity.file;
     if(auto decoded = base->bitmap(*doc)) {
         for(auto id: *decoded) {
             if(id < base->remap.size()) {
-                row.reference_files.add(base->remap[id].raw);
+                symbol.reference_files.add(base->remap[id].raw);
             }
         }
     }
-    return row;
+    return symbol;
 }
 
 void ProjectIndex::merge(const TUIndex& index,
@@ -598,7 +598,7 @@ void ProjectIndex::merge(const TUIndex& index,
     // spelling, SystemHeader under -isystem against -I, Deprecated under a
     // deployment target — and nothing represents that dependence: the
     // table folds whatever units send, and a unit whose every file holding
-    // the symbol's rows is a stored variant sends nothing of it
+    // the symbol's entries is a stored variant sends nothing of it
     // (TUIndexOptions::known_variants), so the first unit to store the
     // variant decides. Such facts want one explicit, per-context record
     // instead of a fold.
@@ -619,14 +619,14 @@ void ProjectIndex::merge(const TUIndex& index,
         }
         bool known = identity_of(hash).has_value();
         auto& target = touch(hash);
-        bool changed_row = !known;
+        bool symbol_changed = !known;
         if(target.name.empty() && !identity.name.empty()) {
             target.parent = identity.parent;
             target.kind = identity.kind;
-            changed_row = true;
+            symbol_changed = true;
         }
-        changed_row = prefer(target.name, identity.name) || changed_row;
-        changed_row = prefer(target.args, identity.args) || changed_row;
+        symbol_changed = prefer(target.name, identity.name) || symbol_changed;
+        symbol_changed = prefer(target.args, identity.args) || symbol_changed;
         // A unit that defines the symbol always places it: the table never
         // retracts a unit's earlier report, so an old definition bit must
         // not pin the file after the definition moved. Declarations only
@@ -634,16 +634,16 @@ void ProjectIndex::merge(const TUIndex& index,
         bool defines = has_flag(identity.flags, SymbolFlags::HasDefinition);
         if(identity.file != no_file && (target.file == no_file || defines)) {
             auto file = file_ids_map[identity.file].raw;
-            changed_row = changed_row || target.file != file;
+            symbol_changed = symbol_changed || target.file != file;
             target.file = file;
         }
         auto flags = target.flags | identity.flags;
-        changed_row = changed_row || flags != target.flags;
+        symbol_changed = symbol_changed || flags != target.flags;
         target.flags = flags;
         for(auto ref: references) {
             target.reference_files.add(file_ids_map[ref].raw);
         }
-        if(changed_row && added) {
+        if(symbol_changed && added) {
             added->push_back(hash);
         }
         return true;
@@ -651,10 +651,10 @@ void ProjectIndex::merge(const TUIndex& index,
 }
 
 void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& files) {
-    // The rows changed since the last write join the ones still held
-    // aside from a write that never landed; the newer row wins.
-    for(auto& [hash, row]: changed) {
-        written[hash] = std::move(row);
+    // The entries changed since the last write join the ones still held
+    // aside from a write that was never persisted; the newer entry wins.
+    for(auto& [hash, symbol]: changed) {
+        written[hash] = std::move(symbol);
     }
     changed.clear();
 
@@ -700,8 +700,8 @@ void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& file
         blob.manifest_gens.push_back(manifest.global_gen);
     }
 
-    // The base's path table stays as it is, so its rows' bitmap images
-    // copy verbatim; files the written rows reference beyond it are
+    // The base's path table stays as it is, so its entries' bitmap images
+    // copy verbatim; files the written entries reference beyond it are
     // appended.
     llvm::DenseMap<Fid, std::uint32_t> id_of;
     if(base) {
@@ -745,20 +745,20 @@ void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& file
         blob.sym_bitmaps.insert(blob.sym_bitmaps.end(), image.begin(), image.end());
         blob.sym_bitmap_ends.push_back(static_cast<std::uint32_t>(blob.sym_bitmaps.size()));
     };
-    auto emit_row = [&](SymbolHash hash, const Symbol& row) {
+    auto emit_symbol = [&](SymbolHash hash, const Symbol& symbol) {
         blob.sym_hashes.push_back(hash);
-        blob.sym_names += row.name;
+        blob.sym_names += symbol.name;
         blob.sym_name_ends.push_back(static_cast<std::uint32_t>(blob.sym_names.size()));
-        blob.sym_args += row.args;
+        blob.sym_args += symbol.args;
         blob.sym_args_ends.push_back(static_cast<std::uint32_t>(blob.sym_args.size()));
-        blob.sym_parents.push_back(row.parent);
-        blob.sym_kinds.push_back(row.kind.value());
-        blob.sym_flags.push_back(static_cast<std::uint16_t>(row.flags));
-        blob.sym_files.push_back(row.file == no_file ? no_file : path_id(Fid{row.file}));
+        blob.sym_parents.push_back(symbol.parent);
+        blob.sym_kinds.push_back(symbol.kind.value());
+        blob.sym_flags.push_back(static_cast<std::uint16_t>(symbol.flags));
+        blob.sym_files.push_back(symbol.file == no_file ? no_file : path_id(Fid{symbol.file}));
         blob.sym_reference_counts.push_back(
-            static_cast<std::uint32_t>(row.reference_files.cardinality()));
+            static_cast<std::uint32_t>(symbol.reference_files.cardinality()));
         Bitmap references;
-        for(auto id: row.reference_files) {
+        for(auto id: symbol.reference_files) {
             references.add(path_id(Fid{id}));
         }
         auto image = write_bitmap(references);
@@ -785,7 +785,7 @@ void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& file
         if(doc < base_count && base->hashes[doc] == keys[k]) {
             doc += 1;
         }
-        emit_row(keys[k], written.find(keys[k])->second);
+        emit_symbol(keys[k], written.find(keys[k])->second);
         k += 1;
     }
 
@@ -821,8 +821,8 @@ void ProjectIndex::rebase(std::unique_ptr<llvm::MemoryBuffer> blob, FileTable& f
 }
 
 void ProjectIndex::restore_unwritten() {
-    for(auto& [hash, row]: written) {
-        changed.try_emplace(hash, std::move(row));
+    for(auto& [hash, symbol]: written) {
+        changed.try_emplace(hash, std::move(symbol));
     }
     written.clear();
 }
@@ -1051,7 +1051,7 @@ const TUManifest* ProjectIndex::tu_manifest(Fid tu) const {
     }
     auto [it, inserted] = fetched_manifests.try_emplace(tu);
     if(inserted) {
-        // A reader adopts a manifest only under the stamp the bound global
+        // A reader adopts a manifest only under the generation the bound global
         // pins for it, as the writer's load does; the versions it names
         // stay persisted ids.
         auto pinned = [&](const TUManifest& manifest) {

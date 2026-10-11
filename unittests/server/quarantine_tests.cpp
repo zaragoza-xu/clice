@@ -64,11 +64,11 @@ ZEST_CASE(StrikesLeaveSaveOnly) {
     ZEXPECT(!q.barred(compile, t + seconds(10)));
 }
 
-ZEST_CASE(LandClearsRecord) {
+ZEST_CASE(SuccessClearsRecord) {
     Quarantine q;
     auto t0 = Clock::now();
     q.on_crash(compile, "d1", "cause", t0);
-    q.on_land(compile);
+    q.on_success(compile);
     ZEXPECT(!q.crashed(compile));
     ZEXPECT(!q.barred(compile, t0));
     ZEXPECT(q.empty());
@@ -195,20 +195,20 @@ ZEST_CASE(BudgetBlocksAtThreshold) {
     ZEXPECT(!budget.blocked("key-b"));
 }
 
-ZEST_CASE(BudgetClearsOnLand) {
-    // A consumer landing proves the blames were transient: without the
+ZEST_CASE(BudgetClearsOnSuccess) {
+    // A consumer succeeding proves the blames were transient: without the
     // clear, two unrelated hiccups far apart would block a key that
     // serves fine in between.
     BlameBudget budget;
     budget.on_blame("key");
-    budget.on_land("key");
+    budget.on_success("key");
     budget.on_blame("key");
     ZEXPECT(!budget.blocked("key"));
 }
 
 ZEST_CASE(BudgetRearmsAfterCooldown) {
     // The poison may live in content the key cannot see (a header included
-    // by the hashed preamble text): a block is a cooldown, not a verdict.
+    // by the hashed preamble text): a block is a cooldown, not a decision.
     // Zero cooldown models "elapsed" — the key earns a fresh budget.
     BlameBudget budget{std::chrono::milliseconds(0)};
     budget.on_blame("key");

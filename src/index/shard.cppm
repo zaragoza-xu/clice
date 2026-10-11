@@ -10,23 +10,23 @@ import :syntax.position;
 
 namespace clice::index {
 
-/// Identity of one variant of a file's rows: xxh3_64 over the encoded
+/// Identity of one variant of a file's index: xxh3_64 over the encoded
 /// single-variant blob bytes the worker produced. Encoding is canonical
 /// and deterministic, so two compilation contexts whose preprocessing of
 /// the file agrees produce byte-identical blobs and share one identity.
-using RowsHash = std::uint64_t;
+using VariantHash = std::uint64_t;
 
-struct RowColumns;
+struct RangeColumnsView;
 struct LiveFilter;
 
 /// Zero-copy reader over a shard blob, plus the live-variant mask the
 /// indexer maintains: a variant whose last contributing TU was removed or
-/// replaced stops serving immediately, and its rows are erased for real by
+/// replaced stops serving immediately, and its entries are erased for real by
 /// the next merge_shards covering the blob.
 ///
-/// The same blob encoding serves every holder of a file's rows: the
+/// The same blob encoding serves every holder of a file's index: the
 /// worker's per-file product travelling in an indexing result, the disk
-/// shard, a session's main-file rows and the preamble index entries.
+/// shard, a session's main-file index and the preamble index entries.
 class Shard {
 public:
     Shard() = default;
@@ -62,11 +62,11 @@ public:
         return buffer ? buffer->getBuffer() : llvm::StringRef();
     }
 
-    /// xxh3 of the content bytes the rows were built from (the content
+    /// xxh3 of the content bytes the shard was built from (the content
     /// generation), not of the blob.
     std::uint64_t content_hash() const;
 
-    /// Size of the content the rows were built from; the upper bound of
+    /// Size of the content the shard was built from; the upper bound of
     /// every stored range.
     std::uint32_t content_size() const;
 
@@ -76,7 +76,7 @@ public:
     /// re-read the file from disk under a content_hash check.
     llvm::StringRef content() const;
 
-    /// Whether `text` is the exact content the rows were built from —
+    /// Whether `text` is the exact content the shard was built from —
     /// the freshness comparison for disk state. Compares by size and
     /// hash, so it works for ASCII blobs, whose text is not stored.
     bool matches_content(llvm::StringRef text) const;
@@ -88,13 +88,13 @@ public:
     /// All variant identities stored in the blob, in mask-bit order. A
     /// worker-emitted blob holds one anonymous variant identified by its
     /// own byte hash.
-    std::vector<RowsHash> variants() const;
+    std::vector<VariantHash> variants() const;
 
-    bool has_variant(RowsHash hash) const;
+    bool has_variant(VariantHash hash) const;
 
     /// Restrict queries to the given variants (the file's live
     /// contributions). Hashes the blob does not store are ignored.
-    void set_live(llvm::ArrayRef<RowsHash> live);
+    void set_live(llvm::ArrayRef<VariantHash> live);
 
     /// Whether any stored variant was masked out by set_live — the signal
     /// that the next serialization of this file should compact.
@@ -106,12 +106,12 @@ public:
                 RelationKind kind,
                 llvm::function_ref<bool(const Relation&)> callback) const;
 
-    /// Visit every live occurrence in row order (sorted by range, then
+    /// Visit every live occurrence in stored order (sorted by range, then
     /// target hash).
     void for_each_occurrence(llvm::function_ref<bool(const Occurrence&)> callback) const;
 
     /// Visit every live relation, grouped by symbol in ascending hash
-    /// order, rows in (kind, range, payload) order within each group.
+    /// order, relations in (kind, range, payload) order within each group.
     void for_each_relation(llvm::function_ref<bool(SymbolHash, const Relation&)> callback) const;
 
     /// Look up a local symbol's identity; the strings borrow the blob.
@@ -128,7 +128,7 @@ public:
     /// Which lines end in "\r\n" (ShardBlob::crlf_lines), read in place.
     std::span<const std::uint64_t> crlf_lines() const;
 
-    /// The positions of the text the rows were built from: over its stored
+    /// The positions of the text the shard was built from: over its stored
     /// text, or its line table alone when it is pure ASCII.
     PositionMap positions() const;
 
@@ -136,7 +136,7 @@ private:
     explicit Shard(std::unique_ptr<llvm::MemoryBuffer> buffer);
 
     struct Live {
-        /// Fast path: every stored variant is live, no per-row filtering.
+        /// Fast path: every stored variant is live, no per-entry filtering.
         bool all = true;
         std::uint64_t bits = 0;
         Bitmap big;
@@ -144,7 +144,7 @@ private:
 
     /// The live mask resolved against one side's mask columns, built once
     /// per query.
-    LiveFilter live_filter(const RowColumns& columns) const;
+    LiveFilter live_filter(const RangeColumnsView& columns) const;
 
     std::unique_ptr<llvm::MemoryBuffer> buffer;
     Live live;
@@ -156,23 +156,23 @@ private:
     mutable std::vector<std::uint32_t> line_starts_cache;
 };
 
-/// Encode one variant's rows as a self-contained single-variant blob —
-/// the worker's per-file product. Rows are canonicalized (sorted,
+/// Encode one variant's index as a self-contained single-variant blob —
+/// the worker's per-file product. Entries are canonicalized (sorted,
 /// deduplicated) and the encoding is deterministic: the blob's byte hash
 /// is the variant's identity. `symbols` resolves referenced symbols so
-/// non-External names land in the blob's local-name table (External names
+/// non-External names end up in the blob's local-name table (External names
 /// live in the ProjectIndex); returned name refs must stay valid for the
 /// duration of the call. `content` is the text the indexing compile
 /// consumed; pure-ASCII content is hashed and measured but not stored.
-void write_shard(const FileIndex& rows,
+void write_shard(const FileIndex& file_index,
                  llvm::function_ref<std::optional<SymbolIdentity>(SymbolHash)> symbols,
                  llvm::StringRef content,
                  llvm::raw_ostream& os);
 
 /// Merge blobs of one file and one content generation: the variants of
 /// `old` whose identity is in `keep` (in stored order), then each blob of
-/// `fresh` as one new variant. Rows shared between variants merge into
-/// one row; masks are re-encoded for the surviving variant set. `old` may
+/// `fresh` as one new variant. Entries shared between variants merge into
+/// one entry; masks are re-encoded for the surviving variant set. `old` may
 /// be an empty shard (all-fresh merge) and `fresh` may be empty (pure
 /// compaction), but at least one variant must survive overall — a blob
 /// holds at least one variant, and a file whose last variant died is
@@ -180,7 +180,7 @@ void write_shard(const FileIndex& rows,
 /// must be a loaded single-variant blob of the same content generation as
 /// the other inputs.
 void merge_shards(const Shard& old,
-                  llvm::ArrayRef<RowsHash> keep,
+                  llvm::ArrayRef<VariantHash> keep,
                   llvm::ArrayRef<Shard> fresh,
                   llvm::raw_ostream& os);
 

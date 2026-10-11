@@ -20,28 +20,21 @@ import :support.timer;
 
 namespace clice::driver {
 
-using kota::deco::decl::KVStyle;
-
 namespace {
 
 struct IndexOptions {
     kota::deco::decl::HelpOption help;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Workspace root directory (default: current directory)",
-           required = false)
+    DecoKV(help = "Workspace root directory (default: current directory)", required = false)
     <std::string> workspace;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "Build configuration to activate, one of the tags declared on rules "
                "(default: the selected one, else default_configuration)",
            required = false)
     <std::string> configuration;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Number of indexing workers (default: from config)",
-           required = false)
+    DecoKV(help = "Number of indexing workers (default: from config)", required = false)
     <std::uint32_t> workers;
 
     DecoFlag(names = {"--stats"},
@@ -49,9 +42,7 @@ struct IndexOptions {
              required = false)
     stats;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "How many of the largest file shards --stats lists",
-           required = false)
+    DecoKV(help = "How many of the largest file shards --stats lists", required = false)
     <std::uint32_t> top;
 
     DecoFlag(names = {"--variants"},
@@ -61,25 +52,19 @@ struct IndexOptions {
              required = false)
     variants;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           names = {"--show-symbol", "--show-symbol="},
-           help =
+    DecoKV(help =
                "Print what the persisted index records about a symbol, named by its "
                "name, qualified name or #hash, instead of indexing",
            required = false)
     <std::string> show_symbol;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           names = {"--show-file", "--show-file="},
-           help =
+    DecoKV(help =
                "Print a file's persisted rows: variants, contributing units and row "
                "counts, instead of indexing",
            required = false)
     <std::string> show_file;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           names = {"--show-tu", "--show-tu="},
-           help =
+    DecoKV(help =
                "Print a translation unit's persisted manifest: include tree and "
                "contributions, instead of indexing",
            required = false)
@@ -102,7 +87,7 @@ std::string format_hash(std::uint64_t hash) {
     return std::format("#{:016x}", hash);
 }
 
-/// Milliseconds since the epoch as a local wall-clock stamp.
+/// Milliseconds since the epoch as a local wall-clock timestamp.
 std::string format_time(std::uint64_t epoch_ms) {
     auto seconds = static_cast<std::time_t>(epoch_ms / 1000);
     std::tm local{};
@@ -111,14 +96,14 @@ std::string format_time(std::uint64_t epoch_ms) {
 #else
     localtime_r(&seconds, &local);
 #endif
-    char stamp[32];
-    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &local);
-    return stamp;
+    char timestamp[32];
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &local);
+    return timestamp;
 }
 
 /// Index through the serving writer: the editor's server holds the cache
-/// directory's writer lock, so it runs the sweep and the command waits
-/// for the rows to land.
+/// directory's writer lock, so it runs the pass and the command waits
+/// for the index to be committed.
 int run_indexing_via_server(const index::ServerEndpoint& endpoint, llvm::StringRef configuration) {
     auto result = control::request_index(endpoint, configuration);
     if(!result) {
@@ -286,13 +271,14 @@ struct ShardColumns {
     std::uint64_t variants = 0;
     std::uint64_t symbols = 0;
     std::uint64_t locals = 0;
-    std::uint64_t occ_rows = 0;
+    std::uint64_t occ_entries = 0;
     std::uint64_t occ_masks = 0;
-    std::uint64_t rel_rows = 0;
+    std::uint64_t rel_entries = 0;
     std::uint64_t rel_masks = 0;
 
     std::uint64_t total() const {
-        return content + variants + symbols + locals + occ_rows + occ_masks + rel_rows + rel_masks;
+        return content + variants + symbols + locals + occ_entries + occ_masks + rel_entries +
+               rel_masks;
     }
 };
 
@@ -302,16 +288,16 @@ ShardColumns shard_columns_of(llvm::StringRef bytes) {
     if(!index::deserialize_blob(bytes, blob)) {
         return columns;
     }
-    auto row_bytes = [](const index::RowRanges& rr) -> std::uint64_t {
+    auto range_bytes = [](const index::RangeColumns& rr) -> std::uint64_t {
         return rr.packed.size() * 4 + rr.begins.size() * 4 + rr.lengths.size() +
-               rr.long_rows.size() * 4 + rr.long_ends.size() * 4;
+               rr.long_entries.size() * 4 + rr.long_ends.size() * 4;
     };
-    auto mask_bytes = [](const index::RowRanges& rr) -> std::uint64_t {
+    auto mask_bytes = [](const index::RangeColumns& rr) -> std::uint64_t {
         return rr.masks32.size() * 4 + rr.masks64.size() * 8 + rr.roaring_offsets.size() * 4 +
                rr.roaring.size();
     };
-    columns.content = blob.content.size() + blob.line_lengths.size() +
-                      blob.long_line_rows.size() * 4 + blob.long_line_lengths.size() * 4;
+    columns.content = blob.content.size() + blob.line_lengths.size() + blob.long_lines.size() * 4 +
+                      blob.long_line_lengths.size() * 4;
     columns.variants = blob.variants.size() * 8;
     columns.symbols = blob.sym_hashes.size() * 8 + blob.sym_rel_offsets.size() * 4;
     columns.locals = blob.local_syms.size() * 4 + blob.local_kinds.size() +
@@ -323,13 +309,14 @@ ShardColumns shard_columns_of(llvm::StringRef bytes) {
     for(auto& args: blob.local_args) {
         columns.locals += args.size();
     }
-    columns.occ_rows = row_bytes(blob.occs) + blob.occ_syms8.size() + blob.occ_syms16.size() * 2 +
-                       blob.occ_syms32.size() * 4;
+    columns.occ_entries = range_bytes(blob.occs) + blob.occ_syms8.size() +
+                          blob.occ_syms16.size() * 2 + blob.occ_syms32.size() * 4;
     columns.occ_masks = mask_bytes(blob.occs);
-    columns.rel_rows = row_bytes(blob.rels) + blob.rel_kinds.size() + blob.rel_sym_rows.size() * 4 +
-                       blob.rel_sym8.size() + blob.rel_sym16.size() * 2 +
-                       blob.rel_sym32.size() * 4 + blob.rel_def_rows.size() * 4 +
-                       blob.rel_def_begins.size() * 4 + blob.rel_def_ends.size() * 4;
+    columns.rel_entries = range_bytes(blob.rels) + blob.rel_kinds.size() +
+                          blob.rel_sym_entries.size() * 4 + blob.rel_sym8.size() +
+                          blob.rel_sym16.size() * 2 + blob.rel_sym32.size() * 4 +
+                          blob.rel_def_entries.size() * 4 + blob.rel_def_begins.size() * 4 +
+                          blob.rel_def_ends.size() * 4;
     columns.rel_masks = mask_bytes(blob.rels);
     return columns;
 }
@@ -376,9 +363,9 @@ IndexStats collect_stats(Project& project) {
         stats.columns.variants += columns.variants;
         stats.columns.symbols += columns.symbols;
         stats.columns.locals += columns.locals;
-        stats.columns.occ_rows += columns.occ_rows;
+        stats.columns.occ_entries += columns.occ_entries;
         stats.columns.occ_masks += columns.occ_masks;
-        stats.columns.rel_rows += columns.rel_rows;
+        stats.columns.rel_entries += columns.rel_entries;
         stats.columns.rel_masks += columns.rel_masks;
         stats.shards.push_back(stat);
     }
@@ -454,9 +441,9 @@ void print_stats(const Project& project,
     driver::println();
     driver::println("Shard payload by column ({}; the rest of the file size is format framing):",
                     format_size(payload));
-    column("occurrence rows", stats.columns.occ_rows, payload);
+    column("occurrence rows", stats.columns.occ_entries, payload);
     column("occurrence masks", stats.columns.occ_masks, payload);
-    column("relation rows", stats.columns.rel_rows, payload);
+    column("relation rows", stats.columns.rel_entries, payload);
     column("relation masks", stats.columns.rel_masks, payload);
     column("symbol tables", stats.columns.symbols, payload);
     column("local symbols", stats.columns.locals, payload);

@@ -25,9 +25,9 @@ constexpr std::size_t max_chain = 64;
 
 using Mode = SymbolQuery::Mode;
 
-/// The persisted search index. Rows are in quality order (ties by hash),
+/// The persisted search index. Entries are in quality order (ties by hash),
 /// which is the doc id order every bitmap speaks; the arenas hold the
-/// names back to back with one end offset per row; posting arenas hold
+/// names back to back with one end offset per entry; posting arenas hold
 /// portable roaring images the same way.
 struct SearchBlob {
     std::uint32_t format_version = 0;
@@ -75,7 +75,7 @@ struct SearchBlob {
     std::vector<std::uint32_t> kind_ends;
     std::vector<std::uint8_t> kind_postings;
 
-    /// The files of the rows, one bitmap each.
+    /// The files of the entries, one bitmap each.
     std::vector<std::string> paths;
     std::vector<std::uint32_t> file_ends;
     std::vector<std::uint8_t> file_postings;
@@ -239,12 +239,12 @@ float symbol_quality(llvm::StringRef name,
 }
 
 std::string build_search_blob(const SearchSnapshot& snapshot) {
-    struct Row {
+    struct Ranked {
         std::uint32_t entry;
         float quality;
     };
 
-    std::vector<Row> rows;
+    std::vector<Ranked> ranked;
     llvm::DenseSet<SymbolHash> seen;
     for(std::uint32_t i = 0; i < snapshot.entries.size(); i += 1) {
         auto& entry = snapshot.entries[i];
@@ -253,18 +253,18 @@ std::string build_search_blob(const SearchSnapshot& snapshot) {
            reserved_key(entry.hash) || !seen.insert(entry.hash).second) {
             continue;
         }
-        rows.push_back(
+        ranked.push_back(
             {i, symbol_quality(entry.name, entry.kind, entry.flags, entry.reference_files)});
     }
-    std::ranges::sort(rows, [&](const Row& lhs, const Row& rhs) {
+    std::ranges::sort(ranked, [&](const Ranked& lhs, const Ranked& rhs) {
         if(lhs.quality != rhs.quality) {
             return lhs.quality > rhs.quality;
         }
         return snapshot.entries[lhs.entry].hash < snapshot.entries[rhs.entry].hash;
     });
-    auto count = static_cast<std::uint32_t>(rows.size());
+    auto count = static_cast<std::uint32_t>(ranked.size());
     auto entry_of = [&](std::uint32_t doc) -> const SearchEntry& {
-        return snapshot.entries[rows[doc].entry];
+        return snapshot.entries[ranked[doc].entry];
     };
 
     llvm::DenseMap<SymbolHash, std::uint32_t> doc_of;
@@ -321,7 +321,7 @@ std::string build_search_blob(const SearchSnapshot& snapshot) {
         blob.args += entry.args;
         blob.args_ends.push_back(static_cast<std::uint32_t>(blob.args.size()));
         blob.parents.push_back(parent_of(doc));
-        blob.qualities.push_back(rows[doc].quality);
+        blob.qualities.push_back(ranked[doc].quality);
         lower_names.push_back(lowercase(entry.name));
     }
 
@@ -512,7 +512,7 @@ std::optional<NameRank>
                         .score = quality};
     }
     // A query too short for trigrams is keyed by a name's first two words
-    // in the index; judging rows the same way keeps the two answers alike.
+    // in the index; judging entries the same way keeps the two answers alike.
     if(!short_tokens.empty()) {
         llvm::SmallVector<NameToken, 64> tokens;
         name_tokens(name, tokens);

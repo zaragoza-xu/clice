@@ -24,26 +24,26 @@ public:
         project(project), pch(pch), sessions(sessions), projections(projections) {}
 
     bool is_open(Fid file) const override;
-    std::optional<index::RowSource> claim(Fid file) const override;
-    void each_session(llvm::function_ref<bool(const index::RowSource&)> visit) const override;
+    std::optional<index::IndexSource> buffer_index(Fid file) const override;
+    void each_session(llvm::function_ref<bool(const index::IndexSource&)> visit) const override;
     void each_session_index(llvm::function_ref<bool(const index::TUIndex&)> visit) const override;
-    void each_preamble(llvm::function_ref<bool(const index::RowSource&)> visit) const override;
+    void each_preamble(llvm::function_ref<bool(const index::IndexSource&)> visit) const override;
     void each_overlay(llvm::function_ref<bool(const index::TUIndex&)> visit) const override;
     std::shared_ptr<index::TUIndex> preamble_blob(Fid file) const override;
 
 private:
-    /// The overlay envelope of an open buffer's PCH, or null when it has
-    /// no PCH or the envelope is unreadable.
+    /// The overlay TU index of an open buffer's PCH, or null when it has
+    /// no PCH or the index is unreadable.
     std::shared_ptr<index::TUIndex> overlay_of(Fid file) const;
 
-    /// The open buffer's own file index when its rows describe the buffer:
+    /// The open buffer's own file index when it describes the buffer:
     /// the compile is current, or it compiled these very bytes.
-    const index::Shard* session_rows(Fid file, const Session& session) const;
+    const index::Shard* session_shard(Fid file, const Session& session) const;
 
-    index::RowSource buffer_source(index::RowSource::Kind kind,
-                                   Fid file,
-                                   const Session& session,
-                                   const index::Shard& rows) const;
+    index::IndexSource buffer_source(index::IndexSource::Kind kind,
+                                     Fid file,
+                                     const Session& session,
+                                     const index::Shard& shard) const;
 
     Project& project;
     PCHFamily& pch;

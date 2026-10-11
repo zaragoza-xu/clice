@@ -30,8 +30,8 @@ namespace {
 /// Manifest checkpoint is forced after this many commits/invalidates.
 constexpr std::uint32_t checkpoint_interval = 16;
 
-/// Root-level lock file serializing open()'s version sweep against layout
-/// startup; lives beside the version directories, exempt from the sweep.
+/// Root-level lock file serializing open()'s version removal against layout
+/// startup; lives beside the version directories, exempt from the removal.
 constexpr llvm::StringLiteral store_lock_name = "store.lock";
 
 /// JSON layout of manifest.json.  Only an acceleration structure: blob
@@ -115,7 +115,7 @@ bool same_content(llvm::StringRef tmp_path, llvm::StringRef final_path) {
 
 /// Remove directory children whose name parses as a dead pid.
 /// Used for both `tmp/{pid}` and Scratch `{ns}/{pid}` layouts.
-void sweep_dead_pid_dirs(llvm::StringRef dir, std::uint32_t self_pid) {
+void remove_dead_pid_dirs(llvm::StringRef dir, std::uint32_t self_pid) {
     for(auto& entry: vfs::read_dir(dir).value_or(std::vector<vfs::Entry>())) {
         std::uint32_t pid = 0;
         auto name = path::filename(entry.path);
@@ -167,7 +167,7 @@ struct CacheStore::State {
         llvm::StringMap<Entry> entries;
         std::uint64_t total_size = 0;
         /// Keys a commit is publishing outside the lock: whatever lies at
-        /// their final paths is the commit's until it lands.
+        /// their final paths is the commit's until it finishes.
         llvm::StringSet<> publishing;
     };
 
@@ -194,16 +194,16 @@ struct CacheStore::State {
     bool dirty = false;
 
     /// Inspection mode (open's read_only): no directory is created or
-    /// swept, and writes are a caller bug.
+    /// removed, and writes are a caller bug.
     bool read_only = false;
 
-    /// Logical clock: strictly increasing per issued stamp so that LRU
+    /// Logical clock: strictly increasing per issued generation so that LRU
     /// ordering is deterministic even within one millisecond.
-    std::int64_t last_stamp = 0;
+    std::int64_t last_generation = 0;
 
-    std::int64_t next_stamp() {
-        last_stamp = std::max(now_ms(), last_stamp + 1);
-        return last_stamp;
+    std::int64_t next_generation() {
+        last_generation = std::max(now_ms(), last_generation + 1);
+        return last_generation;
     }
 
     std::string blob_path(const Namespace& ns, llvm::StringRef key) const {
@@ -220,7 +220,7 @@ struct CacheStore::State {
     /// The accounting is zeroed even when the delete fails (file open on
     /// Windows) — lookup_aux must stop serving the stale blob immediately;
     /// the leftover file is overwritten by the following aux commit or
-    /// swept when the entry is eventually evicted.
+    /// removed when the entry is eventually evicted.
     void reset_aux_locked(Namespace& ns, llvm::StringRef key, Entry& entry) {
         if(ns.config.aux_extension.empty() || entry.aux_size == 0) {
             return;
@@ -271,15 +271,15 @@ std::expected<CacheStore, std::error_code> CacheStore::open(llvm::StringRef root
         return CacheStore(std::move(state));
     }
 
-    // Only the parent may exist before the lock is held: it hosts the lock
-    // file and is never swept.
+    // Only the parent may exist before the lock is held: it holds the lock
+    // file and is never removed.
     if(auto ec = vfs::create_directories(parent)) {
         return std::unexpected(ec);
     }
 
     // The pid marker created below is what shields a layout from another
-    // version's sweep, but it only exists at the end of this function: a
-    // sweeper scanning between our create_directories and the marker would
+    // version's removal pass, but it only exists at the end of this function: a
+    // pass scanning between our create_directories and the marker would
     // reclaim the layout we are initializing. This root-level lock covers
     // exactly that window — every writable open holds it from before its
     // version directory exists until its marker does. Best effort: on a
@@ -340,7 +340,7 @@ std::expected<CacheStore, std::error_code> CacheStore::open(llvm::StringRef root
             for(auto& entry: data.entries) {
                 auto key = entry.ns + "/" + entry.key;
                 state->manifest_atimes[key] = entry.atime;
-                state->last_stamp = std::max(state->last_stamp, entry.atime);
+                state->last_generation = std::max(state->last_generation, entry.atime);
             }
         } else {
             LOG_WARN("CacheStore: corrupt manifest {}, rebuilding from directory scan",
@@ -349,10 +349,10 @@ std::expected<CacheStore, std::error_code> CacheStore::open(llvm::StringRef root
     }
 
     // The only crash residue are in-flight tmp files; committed blobs are
-    // complete by construction (atomic rename).  Sweep tmp directories of
+    // complete by construction (atomic rename).  Remove tmp directories of
     // instances that no longer exist.
     auto tmp_parent = path::join(state->base, "tmp");
-    sweep_dead_pid_dirs(tmp_parent, state->self_pid);
+    remove_dead_pid_dirs(tmp_parent, state->self_pid);
 
     state->tmp_dir = path::join(tmp_parent, std::to_string(state->self_pid));
     vfs::remove_all(state->tmp_dir);
@@ -371,7 +371,7 @@ void CacheStore::write_ignore_markers(llvm::StringRef root) {
     // must stay visible. CACHEDIR.TAG (the standard marker backup and
     // scanning tools skip) sits at the root too: it must cover generated
     // content outside the store (logs), and
-    // root-level files are safe from open()'s layout sweep, which only
+    // root-level files are safe from open()'s layout removal, which only
     // scans cache/. The known cost is that CACHEDIR-aware backups also
     // skip a config.toml kept here — git, which sees it, is the intended
     // preservation channel.
@@ -432,7 +432,7 @@ void CacheStore::register_namespace(CacheNamespace ns) {
         }
         // Scratch directories are per-instance; reclaim those left behind
         // by crashed instances and start with a fresh one of our own.
-        sweep_dead_pid_dirs(ns_dir, state->self_pid);
+        remove_dead_pid_dirs(ns_dir, state->self_pid);
         vfs::remove_all(ns_state.dir);
         vfs::create_directories(ns_state.dir);
         return;
@@ -528,7 +528,7 @@ std::optional<std::string> CacheStore::lookup(llvm::StringRef ns, llvm::StringRe
         return std::nullopt;
     }
 
-    it->second.atime = state->next_stamp();
+    it->second.atime = state->next_generation();
     state->dirty = true;
     return state->blob_path(*ns_state, key);
 }
@@ -546,7 +546,7 @@ std::optional<std::string> CacheStore::lookup_aux(llvm::StringRef ns, llvm::Stri
         return std::nullopt;
     }
 
-    it->second.atime = state->next_stamp();
+    it->second.atime = state->next_generation();
     state->dirty = true;
     return state->aux_blob_path(*ns_state, key);
 }
@@ -730,7 +730,7 @@ std::expected<std::string, std::error_code> CacheStore::commit(PendingEntry pend
             ns_state->total_size += status->stamp.size - entry.size;
             entry.size = status->stamp.size;
         }
-        entry.atime = state->next_stamp();
+        entry.atime = state->next_generation();
 
         if(ns_state->config.policy == CachePolicy::LRU) {
             state->evict_locked(*ns_state, pending.key);

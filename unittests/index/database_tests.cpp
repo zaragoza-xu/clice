@@ -258,18 +258,18 @@ ZEST_CASE(WritesCoverFreedTail) {
         file = path::join(index::library_directory(store, ""), "index.mdb");
         auto db = index::open_database(store, "");
         ZASSERT(db != nullptr);
-        auto settle = [&] {
+        auto advance_snapshot = [&] {
             ZASSERT(db->advance_read_snapshot());
             db->retire_old_snapshot();
         };
         ZASSERT(db->write({blob(index::IndexBlobKind::Shard, "x", large_value('x'))}, {}).empty());
-        settle();
+        advance_snapshot();
         ZASSERT(db->write(
                       {
         },
                       {{index::IndexBlobKind::Shard, "x"}})
                     .empty());
-        settle();
+        advance_snapshot();
         ZASSERT(db->write(
                       {
                           blob(index::IndexBlobKind::CDB, "cdb", "small"),
@@ -478,7 +478,7 @@ ZEST_CASE(ProbeIgnoresStaleEndpoint) {
     index::write_endpoint(cache_dir, {.pid = 1, .version = "x", .host = "127.0.0.1", .port = 1});
     ZASSERT(llvm::sys::fs::exists(path::join(cache_dir, "server.json")));
 
-    // Nobody holds the lock: the record is a crash's residue, swept by
+    // Nobody holds the lock: the record is a crash's residue, removed by
     // the probe.
     auto probe = index::probe_writer(cache_dir);
     ZASSERT(probe.state == index::WriterProbe::State::Free);

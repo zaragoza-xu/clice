@@ -34,12 +34,12 @@ ProjectServer::ProjectServer(MasterServer& server, CanonicalPath root) :
     invalidator(project, sessions, contexts, ast.projections, sched.pcm, sched.store) {
     ast.register_runner();
     // The loaded-state budget follows the open-document count; the PCH
-    // family cannot see SessionStore, so the project wires the provider.
+    // family cannot see SessionStore, so the project connects the provider.
     sched.pch.open_documents = [this] {
         return sessions.sessions.size();
     };
-    // Metadata marks (a PCH landing, a context switch) flush through the
-    // next save; the wiring schedules one soon after the first mark.
+    // Metadata marks (a PCH commit, a context switch) flush through the
+    // next save; the callback schedules one soon after the first mark.
     project.request_flush = [this] {
         schedule_metadata_flush();
     };
@@ -59,11 +59,11 @@ ProjectServer::ProjectServer(MasterServer& server, CanonicalPath root) :
         auto session = sessions.find(path_id);
         return session && session->serving == ServingMode::Escalated;
     };
-    sched.pump.on_attempt_settled = [this](Fid path_id) {
-        index_attempt_settled(path_id);
+    sched.pump.on_attempt_finished = [this](Fid path_id) {
+        index_attempt_finished(path_id);
     };
-    index_rows_conn = sched.pump.on_rows_changed.connect(
-        [this](llvm::ArrayRef<Fid> path_ids) { index_rows_changed(path_ids); });
+    index_changed_conn = sched.pump.on_index_changed.connect(
+        [this](llvm::ArrayRef<Fid> path_ids) { on_index_changed(path_ids); });
 
     // The AST family's pull-side staleness check found an input of an open
     // document changed on disk: the document gets the treatment the
@@ -179,7 +179,7 @@ void ProjectServer::start() {
     // Documents opened before the project started were created under the
     // default mode with no choice loaded; validate their persisted
     // context choices and derive their serving mode now that the
-    // configuration governs. Settlement waits
+    // configuration governs. The serving decision waits
     // until here — after the load — so divergence detection sees the
     // persisted shards it just loaded (a restored unsaved buffer must
     // escalate, not read as merely unindexed).
@@ -188,7 +188,7 @@ void ProjectServer::start() {
             contexts.validate_saved_context(session->path_id);
             session->serving =
                 ast.readonly == ReadonlyMode::Off ? ServingMode::Escalated : ServingMode::IndexOnly;
-            settle_open_serving(session);
+            decide_open_serving(session);
         }
     }
 
@@ -273,8 +273,8 @@ std::shared_ptr<Session> ProjectServer::create_session(Fid path_id) {
     return session;
 }
 
-void ProjectServer::settle_open_serving(std::shared_ptr<Session> session) {
-    // An escalated session needs no settlement: builds stay pull-driven,
+void ProjectServer::decide_open_serving(std::shared_ptr<Session> session) {
+    // An escalated session needs no decision: builds stay pull-driven,
     // and boosting its file would enqueue work the indexer skips for
     // open non-IndexOnly documents.
     if(session->serving == ServingMode::Escalated) {
@@ -293,7 +293,7 @@ void ProjectServer::settle_open_serving(std::shared_ptr<Session> session) {
     // Nothing indexed yet: reading this file is the reason to index it
     // first — unless indexing is disabled, in which case no shard will
     // ever arrive and only an AST can serve the document. A boost the
-    // pump cannot fulfill escalates through the adapter's attempt-settled
+    // pump cannot fulfill escalates through the adapter's attempt-finished
     // check.
     if(project.config.project.enable_indexing.value) {
         sched.pump.boost(session->path_id);
@@ -370,12 +370,12 @@ void ProjectServer::open_session(Fid path_id, std::string text, int version) {
         return;
     }
     contexts.validate_saved_context(path_id);
-    settle_open_serving(session);
+    decide_open_serving(session);
 }
 
-void ProjectServer::index_attempt_settled(Fid path_id) {
-    // The boost in settle_open_serving promised the index would serve the
-    // cold session; an attempt that settles without a servable shard ends
+void ProjectServer::index_attempt_finished(Fid path_id) {
+    // The boost in decide_open_serving promised the index would serve the
+    // cold session; an attempt that finishes without a servable shard ends
     // that promise — escalate like the disabled-indexing branch, or the
     // session answers empty until its first edit.
     auto session = sessions.find(path_id);
@@ -389,17 +389,17 @@ void ProjectServer::index_attempt_settled(Fid path_id) {
     }
 }
 
-bool ProjectServer::serves_session_rows(Fid path_id) const {
+bool ProjectServer::session_served_by_shard(Fid path_id) const {
     auto session = sessions.find(path_id);
     return session && !ast.projections.index_current(path_id) && session->index_served;
 }
 
-void ProjectServer::index_rows_changed(llvm::ArrayRef<Fid> path_ids) {
-    // Sessions without a current file index serve these very rows
-    // (freshness clause 4); index_served says the client pulled some of
+void ProjectServer::on_index_changed(llvm::ArrayRef<Fid> path_ids) {
+    // Sessions without a current file index serve these very shards
+    // (freshness clause 4); index_served says the client pulled from
     // them. Tell subscribers so those results get re-pulled.
-    if(llvm::any_of(path_ids, [&](Fid id) { return serves_session_rows(id); })) {
-        server.on_serving_rows_changed.emit();
+    if(llvm::any_of(path_ids, [&](Fid id) { return session_served_by_shard(id); })) {
+        server.on_serving_index_changed.emit();
     }
 }
 
@@ -421,7 +421,7 @@ void ProjectServer::dispatch(llvm::ArrayRef<FileEvent> events) {
     }
 
     // The Lost invalidation voids the projection's currency (and any
-    // in-flight round's landing-as-current) without touching generation —
+    // in-flight round's commit-as-current) without touching generation —
     // the buffer is still the same buffer, and the round still publishes
     // its product as bounded staleness; the next request recompiles.
     for(auto path_id: dirty.mark_ast_dirty) {
@@ -434,7 +434,7 @@ void ProjectServer::dispatch(llvm::ArrayRef<FileEvent> events) {
     }
 
     // A live round sends a compile of its own, which puts the AST back on
-    // a worker — invalidating it would only make it land stale and compile
+    // a worker — invalidating it would only make it finish stale and compile
     // twice.
     for(auto path_id: dirty.mark_lost) {
         if(sessions.find(path_id) && !ast.compiling(path_id)) {
@@ -451,7 +451,7 @@ void ProjectServer::dispatch(llvm::ArrayRef<FileEvent> events) {
     }
 
     for(auto path_id: dirty.drop_index) {
-        sched.pump.claim_report(sched.store.drop_index(path_id));
+        sched.pump.apply_report(sched.store.drop_index(path_id));
     }
 
     for(auto path_id: dirty.reindex_content_changed) {
@@ -472,7 +472,7 @@ void ProjectServer::dispatch(llvm::ArrayRef<FileEvent> events) {
     }
 
     // Not before the server is ready: document-sync events are accepted
-    // early (a pre-ready didClose lands here), but the scheduler reads
+    // early (a pre-ready didClose arrives here), but the scheduler reads
     // configuration that initialize() has not applied yet. The reindex
     // queue filled above is kept — the post-ready workspace load kicks the
     // scheduler.

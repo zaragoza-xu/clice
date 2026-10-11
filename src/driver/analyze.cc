@@ -10,116 +10,96 @@ import :analysis.annotation;
 import :analysis.module_graph;
 import :analysis.wrapping;
 import :driver.driver;
+import :index.query;
+import :index.symbol_query;
+import :project.command_resolver;
+import :project.project;
+import :server.editor_context;
+import :server.query_commands;
 import :support.text;
 
 namespace clice::driver {
-
-using kota::deco::decl::KVStyle;
 
 namespace {
 
 struct ModulesOptions {
     kota::deco::decl::HelpOption help;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Workspace root directory (default: current directory)",
-           required = false)
+    DecoKV(help = "Workspace root directory (default: current directory)", required = false)
     <std::string> workspace;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "Build configuration to read, one of the tags declared on rules "
                "(default: the selected one, else default_configuration)",
            required = false)
     <std::string> configuration;
 
     DecoKV(
-        style = KVStyle::JoinedOrSeparate,
         help =
             "What to show: overview (default), edge, module, file, obstacles, macros, impact, interface",
         required = false)
     <std::string> view;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "edge: the module whose files name the other's entities",
-           required = false)
+    DecoKV(help = "edge: the module whose files name the other's entities", required = false)
     <std::string> from;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate, help = "edge: the module named", required = false)
+    DecoKV(help = "edge: the module named", required = false)
     <std::string> to;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "module, interface: the module to show",
-           required = false)
+    DecoKV(help = "module, interface: the module to show", required = false)
     <std::string> module;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "file: the file to show, relative to the workspace",
-           required = false)
+    DecoKV(help = "file: the file to show, relative to the workspace", required = false)
     <std::string> file;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "Comma-separated globs over workspace-relative paths, absolute ones outside "
                "the workspace: analyze only the files they match (default: every indexed file "
                "under the workspace outside a dot directory)",
            required = false)
     <std::string> scope;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "Directory segments naming a file's default module (default 0: its whole "
                "directory)",
            required = false)
     <int> depth;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "JSON file assigning modules by globs, first match wins: "
                R"({"modules": [{"name": "core", "files": ["src/support/**"]}]})",
            required = false)
     <std::string> partition;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "libc++'s module sources (share/libc++/v1), for a partition module provided "
                "by std.compat",
            required = false)
     <std::string> std;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Comma-separated hypothetical moves: <path>=<module>",
-           required = false)
+    DecoKV(help = "Comma-separated hypothetical moves: <path>=<module>", required = false)
     <std::string> move;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Comma-separated hypothetical merges: <module>+<module>[+...] into the first",
+    DecoKV(help = "Comma-separated hypothetical merges: <module>+<module>[+...] into the first",
            required = false)
     <std::string> merge;
 
-    DecoKV(names = {"--move-entity", "--move-entity="},
-           style = KVStyle::JoinedOrSeparate,
-           help = "Comma-separated hypothetical declaration moves: <name or #id>=<header>",
-           required = false)
-    <std::string> move_entity;
+    DecoKV(help = "A hypothetical declaration move: <locator>=<header>", required = false)
+    <std::vector<std::string>> move_entity;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "Comma-separated annotation files weighing the results: "
                R"({"name": "compile_time", "unit": "s", "values": {"src/a.cpp": 1.5}})",
            required = false)
     <std::string> annotation;
 
-    DecoKV(names = {"--churn-since", "--churn-since="},
-           style = KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "git log --since value of the churn annotation (default 6.months; empty "
                "leaves it out)",
            required = false)
     <std::string> churn_since;
 
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           help = "Most hotspots, move and split candidates the overview lists (default 20)",
+    DecoKV(help = "Most hotspots, move and split candidates the overview lists (default 20)",
            required = false)
     <int> limit;
 
@@ -147,20 +127,54 @@ int run_modules(const ModulesOptions& opts) {
     if(!spec) {
         return fail(spec.error());
     }
+    std::vector<query::SymbolEntry> candidates;
+    std::vector<std::string> unindexed;
+    auto move_declarations = [&](Project& project,
+                                 CommandResolver& commands,
+                                 analysis::Facts& facts) -> std::expected<void, std::string> {
+        ContextsBlob saved;
+        EditorContext contexts{project, commands, saved};
+        index::IndexQuery index_query(project.project_index, project.file_table, nullptr, nullptr);
+        query::Context ctx{.project = project, .contexts = contexts, .query = index_query};
+        for(llvm::StringRef move: opts.move_entity.value_or(std::vector<std::string>{})) {
+            auto [text, path] = move.rsplit('=');
+            if(text.empty() || path.empty()) {
+                return std::unexpected(std::format("--move-entity {}: expected <locator>=<header>",
+                                                   std::string_view(move)));
+            }
+            auto locator = index::SymbolQuery::parse(text);
+            if(!locator) {
+                return std::unexpected(
+                    std::format("--move-entity {}: {}", std::string_view(move), locator.error()));
+            }
+            auto symbols = query::declaration(ctx, std::move(*locator));
+            if(!symbols) {
+                candidates = std::move(ctx.candidates);
+                unindexed = std::move(ctx.unindexed);
+                return std::unexpected(
+                    std::format("--move-entity {}: {}", std::string_view(move), symbols.error()));
+            }
+            if(auto moved = analysis::move_entities(facts, move, *symbols, path); !moved) {
+                return moved;
+            }
+        }
+        return {};
+    };
     auto loaded = analysis::load_facts(workspace_spelling(opts.workspace.value_or("")),
                                        opts.configuration.value_or(""),
-                                       comma_list(opts.scope.value_or("")));
+                                       comma_list(opts.scope.value_or("")),
+                                       move_declarations);
     if(!loaded) {
-        print_json(Failure{.error = std::move(loaded.error().message),
-                           .stale = std::move(loaded.error().dropped)});
+        Failure failure{.error = std::move(loaded.error().message),
+                        .stale = std::move(loaded.error().dropped)};
+        failure.stale.insert(failure.stale.end(), unindexed.begin(), unindexed.end());
+        if(!candidates.empty()) {
+            failure.candidates = std::move(candidates);
+        }
+        print_json(failure);
         return 1;
     }
     auto& facts = loaded->facts;
-    for(auto& move: comma_list(opts.move_entity.value_or(""))) {
-        if(auto moved = analysis::move_entities(facts, move); !moved) {
-            return fail(moved.error());
-        }
-    }
     auto partition = analysis::partition(facts, *spec);
     if(!partition) {
         return fail(partition.error());

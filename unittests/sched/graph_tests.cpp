@@ -166,7 +166,7 @@ ZEST_CASE(request_no_deps) {
 }
 
 ZEST_CASE(request_dep_chain) {
-    // 1 -> 2 -> 3: rounds land bottom-up along declared edges, and the
+    // 1 -> 2 -> 3: rounds commit bottom-up along declared edges, and the
     // durable edge sets reflect the declarations.
     Adjacency adj;
     adj[a(1)] = {a(2)};
@@ -214,9 +214,9 @@ ZEST_CASE(second_request_skips) {
     });
 }
 
-ZEST_CASE(reference_survives_landing) {
+ZEST_CASE(reference_survives_commit) {
     // reference() records a candidate edge to a node that never runs: it
-    // must survive the successful landing (candidates replace the durable
+    // must survive the successful commit (candidates replace the durable
     // set) so a later update on the referenced node re-dirties this one.
     NodeId sentinel{FamB, (1ull << 63) | 42};
     graph.register_family(FamA, [&](RoundContext& ctx, NodeId) -> kota::task<RoundOutcome> {
@@ -266,9 +266,9 @@ ZEST_CASE(artifact_dirty_no_cascade) {
     ZEXPECT(rebuild.outcome == JoinOutcome::Success);
 }
 
-ZEST_CASE(artifact_dirty_inflight_lands) {
+ZEST_CASE(artifact_dirty_inflight_commits) {
     // Marking while a round is in flight neither voids nor re-runs it:
-    // the round is already producing the fresh artifact, and its landing
+    // the round is already producing the fresh artifact, and its commit
     // clears the flag it finds set.
     ManualFamily mf;
     graph.register_family(FamA, mf.runner());
@@ -342,10 +342,10 @@ ZEST_CASE(cross_family_edge) {
 /// and overtaken rounds' candidates are discarded. declare() commits
 /// facade-known topology into the same durable set without a round.
 
-ZEST_CASE(edge_live_before_landing) {
+ZEST_CASE(edge_live_before_commit) {
     // The dependent's round is still in flight when its dependency is
     // updated: the cascade must reach the dependent through the candidate
-    // edge — the round never landed, so no durable edge exists yet.
+    // edge — the round never committed, so no durable edge exists yet.
     ManualFamily mf;
     mf.adj[a(1)] = {b(5)};
     graph.register_family(FamA, mf.runner());
@@ -377,7 +377,7 @@ ZEST_CASE(edge_live_before_landing) {
 
 ZEST_CASE(success_replaces_edges) {
     // A re-resolve that drops a dependency detaches its reverse edge once
-    // the new round lands: updating the ex-dependency no longer cascades.
+    // the new round commits: updating the ex-dependency no longer cascades.
     Adjacency adj;
     adj[a(1)] = {b(2)};
     graph.register_family(FamA, instant(adj));
@@ -398,7 +398,7 @@ ZEST_CASE(success_replaces_edges) {
 }
 
 ZEST_CASE(voided_candidates_discarded) {
-    // An overtaken round's candidate edges are discarded at landing: the
+    // An overtaken round's candidate edges are discarded at commit: the
     // durable set still reflects the last successful round, not the
     // declarations of the round that update() voided.
     ManualFamily mf;
@@ -413,8 +413,8 @@ ZEST_CASE(voided_candidates_discarded) {
         ZEXPECT(graph.dependencies(a(1))[0] == b(2));
 
         // Flip the imports and drive a new round parked in its dispatch:
-        // it has declared the candidate edge to b(3) but not landed. The
-        // observer joins OneAttempt so the voided round's landing leaves a
+        // it has declared the candidate edge to b(3) but not committed. The
+        // observer joins OneAttempt so the voided round finishing leaves a
         // quiescent graph instead of respawning against the closed gate.
         mf.adj[a(1)] = {b(3)};
         mf.gate(a(1)).proceed.reset();
@@ -431,8 +431,7 @@ ZEST_CASE(voided_candidates_discarded) {
             co_return;
         };
 
-        co_await kota::when_all(run_request(a(1), probe, {.flavor = JoinFlavor::OneAttempt}),
-                                driver());
+        co_await kota::when_all(run_request(a(1), probe, {.kind = JoinKind::OneAttempt}), driver());
 
         // The void discarded the candidates: the durable set still points
         // at b(2), and only it cascades.
@@ -442,7 +441,7 @@ ZEST_CASE(voided_candidates_discarded) {
         ZEXPECT(!ranges::contains(graph.update(b(3)), a(1)));
         ZEXPECT(ranges::contains(graph.update(b(2)), a(1)));
 
-        // A fresh terminal join lands the flipped imports.
+        // A fresh terminal join commits the flipped imports.
         mf.open({a(1)});
         auto outcome = co_await graph.request(a(1));
         ZEXPECT(outcome == JoinOutcome::Success);
@@ -525,8 +524,8 @@ ZEST_CASE(failed_keeps_declared) {
     });
 }
 
-ZEST_CASE(landing_overwrites_declare) {
-    // A declare against an in-flight round is answered at landing: a
+ZEST_CASE(commit_overwrites_declare) {
+    // A declare against an in-flight round is answered at commit: a
     // current Success promotes its candidates over the interim
     // declaration. Benign by the topology invariant — had the content
     // changed between the two resolves, update() would have voided the
@@ -558,7 +557,7 @@ ZEST_CASE(landing_overwrites_declare) {
 /// ============================================================================
 ///
 /// The graph never destroys a running round; an overtaken round runs to
-/// its real reply, and whatever it reports lands as Stale.
+/// its real reply, and whatever it reports arrives as Stale.
 
 ZEST_CASE(stale_success_discarded) {
     // The closure ignores its token and reports Success after update()
@@ -594,7 +593,7 @@ ZEST_CASE(stale_success_discarded) {
 }
 
 ZEST_CASE(stale_failure_retries) {
-    // A Failed reply from an overtaken round is no verdict about the new
+    // A Failed reply from an overtaken round is no decision about the new
     // content: waiters retry instead of propagating the failure.
     ManualFamily mf;
     mf.stubborn = true;
@@ -647,7 +646,7 @@ ZEST_CASE(salvage_before_stale) {
 }
 
 /// ============================================================================
-///                              Join flavors
+///                              Join kinds
 /// ============================================================================
 
 ZEST_CASE(one_attempt_stale) {
@@ -664,8 +663,7 @@ ZEST_CASE(one_attempt_stale) {
             co_return;
         };
 
-        co_await kota::when_all(run_request(a(1), probe, {.flavor = JoinFlavor::OneAttempt}),
-                                driver());
+        co_await kota::when_all(run_request(a(1), probe, {.kind = JoinKind::OneAttempt}), driver());
 
         ZEXPECT(probe.outcome == JoinOutcome::Stale);
         ZEXPECT(mf.gate(a(1)).calls == 1);
@@ -682,7 +680,7 @@ ZEST_CASE(one_attempt_clean) {
         co_await graph.request(a(1));
         ZEXPECT(ran.size() == 1u);
 
-        auto outcome = co_await graph.request(a(1), {.flavor = JoinFlavor::OneAttempt});
+        auto outcome = co_await graph.request(a(1), {.kind = JoinKind::OneAttempt});
         ZEXPECT(outcome == JoinOutcome::Success);
         ZEXPECT(ran.size() == 1u);
     });
@@ -774,7 +772,7 @@ ZEST_CASE(requester_cancel_releases) {
         auto driver = [&]() -> kota::task<> {
             co_await mf.gate(a(1)).started.wait();
             probe.source.cancel();
-            co_await settle([&] { return !graph.is_compiling(a(1)); });
+            co_await wait_until([&] { return !graph.is_compiling(a(1)); });
 
             ZEXPECT(probe.done);
             ZEXPECT(probe.outcome == std::nullopt);
@@ -806,7 +804,7 @@ ZEST_CASE(shared_dep_survives_cancel) {
             ZEXPECT(graph.refcount(b(5)) == 2u);
 
             p1.source.cancel();
-            co_await settle([&] { return !graph.is_compiling(a(1)); });
+            co_await wait_until([&] { return !graph.is_compiling(a(1)); });
 
             ZEXPECT(graph.is_compiling(b(5)));
             ZEXPECT(mf.gate(b(5)).calls == 1);
@@ -1169,7 +1167,7 @@ ZEST_CASE(randomized_stress) {
                 }
             }
 
-            // Let deferred unwinds land, then check structural sanity.
+            // Let deferred unwinds finish, then check structural sanity.
             co_await kota::yield();
             ZEXPECT(graph.consistent());
         }

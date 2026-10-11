@@ -15,38 +15,25 @@ import :worker.probe;
 
 namespace clice {
 
-namespace deco = kota::deco;
-
 enum class ServerMode : std::uint8_t { Pipe, Socket };
 
 struct ServerOptions {
-    DecoKV(style = deco::decl::KVStyle::JoinedOrSeparate,
-           help = "Server mode: pipe (default) or socket (debug)",
-           required = false)
+    DecoKV(help = "Server mode: pipe (default) or socket (debug)", required = false)
     <ServerMode> mode = ServerMode::Pipe;
 
-    DecoKV(style = deco::decl::KVStyle::JoinedOrSeparate,
-           help = "Socket mode address",
-           required = false)
+    DecoKV(help = "Socket mode address", required = false)
     <std::string> host = "127.0.0.1";
 
-    DecoKV(style = deco::decl::KVStyle::JoinedOrSeparate,
-           help = "Socket mode TCP port",
-           required = false)
+    DecoKV(help = "Socket mode TCP port", required = false)
     <int> port = 0;
 
-    DecoKV(style = deco::decl::KVStyle::JoinedOrSeparate,
-           help = "Record LSP input to file for replay testing",
-           required = false)
+    DecoKV(help = "Record LSP input to file for replay testing", required = false)
     <std::string> record;
 
-    DecoKV(style = deco::decl::KVStyle::JoinedOrSeparate,
-           help = "Workspace root directory (optional, skips LSP initialize)",
-           required = false)
+    DecoKV(help = "Workspace root directory (optional, skips LSP initialize)", required = false)
     <std::string> workspace;
 
-    DecoKV(style = deco::decl::KVStyle::JoinedOrSeparate,
-           help =
+    DecoKV(help =
                "Build configuration to activate, one of the tags declared on rules "
                "(default: the selected one, else default_configuration)",
            required = false)
@@ -202,9 +189,9 @@ public:
     /// message, so the look is exact — with periodic ticks off, as tests
     /// run: workspace polling and checkpoints start work on their own. The
     /// metadata save that follows a build is not waited for.
-    kota::task<> settle(const kota::ipc::JSONPeer& editor);
+    kota::task<> wait_idle(const kota::ipc::JSONPeer& editor);
 
-    /// What settle() still waits for, one line each; empty once settled.
+    /// What wait_idle() still waits for, one line each; empty once idle.
     std::vector<std::string> pending_work(const kota::ipc::JSONPeer& editor);
 
     kota::cancellation_token shutdown_token() const {
@@ -223,7 +210,7 @@ public:
     WorkerPool pool;
 
     /// The projects served, in folder order; never empty. The first also
-    /// serves files no project claims. Shared with the requests running in
+    /// serves files no project covers. Shared with the requests running in
     /// a project, which keep a removed one alive until they complete.
     std::vector<std::shared_ptr<ProjectServer>> projects;
 
@@ -241,14 +228,14 @@ public:
     /// A project started or stopped serving.
     Signal<> on_projects_changed;
 
-    /// Emitted when rows an open index-served session is serving changed:
-    /// results the client already pulled describe the old rows, and only a
+    /// Emitted when the index an open index-served session is serving changed:
+    /// results the client already pulled describe the old index, and only a
     /// refresh request makes it re-pull them — index-only sessions never
     /// compile, so the compile-driven refresh in the output push path
     /// cannot cover them.
-    Signal<> on_serving_rows_changed;
+    Signal<> on_serving_index_changed;
 
-    /// Wakes subscribers after a new message landed in notify_log. Pure
+    /// Wakes subscribers after a new message arrived in notify_log. Pure
     /// wake-up per the Signal contract: subscribers keep a sequence cursor
     /// and read the messages from the log, so a late subscriber (or a
     /// missed signal) simply catches up on its next drain. The constructor
@@ -270,7 +257,7 @@ public:
 
     /// The folders served: the client's workspace folders (or
     /// the command line's --workspace), and the roots open_session found
-    /// above files no folder claims.
+    /// above files no folder covers.
     std::vector<CanonicalPath> workspace_roots;
 
     /// The client's initializationOptions, applied to every project.
@@ -287,7 +274,7 @@ public:
     bool client_on_host = false;
 
 private:
-    /// A project over `root`, its cross-project queries wired to the
+    /// A project over `root`, its cross-project queries connected to the
     /// others.
     std::shared_ptr<ProjectServer> make_project(CanonicalPath root);
 
@@ -336,10 +323,10 @@ private:
     ProjectServer* compiler(Fid path_id);
 
     /// The project a file belongs to: its compiler, else the deepest root
-    /// holding it; null when none claims it.
-    ProjectServer* claimant(Fid path_id);
+    /// holding it; null when none covers it.
+    ProjectServer* covering_project(Fid path_id);
 
-    /// The claimant, else the first project.
+    /// The file's project (covering_project), else the first project.
     ProjectServer& route(Fid path_id);
 
     /// Move the open documents of `from` routing now sends elsewhere,
@@ -363,7 +350,7 @@ private:
     void fold_index_progress();
 
     /// The pool's callbacks, routed to the projects owning the documents.
-    void wire();
+    void route_pool_callbacks();
 
     /// Cancellation scope of the serving phase. run_serve_mode serves until
     /// it fires; schedule_shutdown() cancels the source, unwinding the

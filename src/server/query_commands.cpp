@@ -31,12 +31,12 @@ Lines lines_of(const index::Site& site) {
 }
 
 /// The file a path names in the index. An error for a path that is not a
-/// file; nullopt (noted as unindexed) for one the index has no rows for.
+/// file; nullopt (noted as unindexed) for one the index has no shard for.
 Outcome<std::optional<Fid>> indexed_file(Context& ctx, const Spelling& path) {
     if(!vfs::is_file(path)) {
         return std::unexpected(std::format("no such file: {}", path));
     }
-    // Interning only names the file; whether the index holds rows for
+    // Interning only names the file; whether the index holds a shard for
     // it is the shard fetch's answer.
     auto file = ctx.project.file_table.intern(path);
     if(!ctx.project.project_index.shard(file)) {
@@ -47,9 +47,9 @@ Outcome<std::optional<Fid>> indexed_file(Context& ctx, const Spelling& path) {
 }
 
 /// Anchor a query's paths in the workspace. The file of a place, and the
-/// one holding an id's rows, is one file, workspace-relative or absolute
+/// one holding an id's entries, is one file, workspace-relative or absolute
 /// as the command's own path arguments are; false when the index holds no
-/// rows for it, which the caller answers as not found with the file
+/// shard for it, which the caller answers as not found with the file
 /// noted. A path filter spelling a path names its file or directory by
 /// identity, a relative one from the workspace root.
 Outcome<bool> anchor_paths(Context& ctx, index::SymbolQuery& query) {
@@ -75,7 +75,7 @@ Outcome<bool> anchor_paths(Context& ctx, index::SymbolQuery& query) {
 }
 
 /// The locator an answer names a symbol by: one only some files see is
-/// anchored at the file of its site, which holds its rows.
+/// anchored at the file of its site, which holds its entries.
 std::string symbol_of(const index::IndexQuery::Located& located) {
     bool external = located.symbol.scope == index::SymbolScope::External;
     return index::symbol_locator(located.symbol.hash,
@@ -103,7 +103,7 @@ SymbolEntry symbol_entry(Context& ctx, const index::IndexQuery::Located& located
 
 /// The symbols a locator names, held to its filters: an id or a place
 /// names its symbols outright, which a pattern's lookup filters itself.
-/// An id's paths name the file holding its rows, no filter.
+/// An id's paths name the file holding its entries, no filter.
 std::vector<index::IndexQuery::Located> located_by(Context& ctx, const index::SymbolQuery& query) {
     auto located = ctx.query.locate(query);
     if(query.by_pattern()) {
@@ -124,7 +124,7 @@ std::vector<index::IndexQuery::Located> located_by(Context& ctx, const index::Sy
 }
 
 /// The symbols a locator names; none is an unknown symbol. A locator
-/// naming a file the index has no rows for answers as unknown and notes
+/// naming a file the index has no shard for answers as unknown and notes
 /// the file.
 Outcome<std::vector<index::IndexQuery::Located>> resolve(Context& ctx, index::SymbolQuery query) {
     auto anchored = anchor_paths(ctx, query);
@@ -163,18 +163,49 @@ Outcome<index::IndexQuery::Located> resolve_unique(Context& ctx, index::SymbolQu
     return std::move(candidates->front());
 }
 
+/// Hold a name query to the whole name: a near match is no symbol to act
+/// on, and a pattern names many. False for a pattern.
+bool hold_to_whole_name(index::SymbolQuery& locator) {
+    using Mode = index::SymbolQuery::Mode;
+    if(!locator.by_pattern() || locator.mode == Mode::Exact) {
+        return true;
+    }
+    if(locator.mode == Mode::Fuzzy) {
+        locator.mode = Mode::Exact;
+        return true;
+    }
+    return false;
+}
+
+/// Whether the symbols are the overloads of one scope. One of internal
+/// linkage shares a scope only within its file — two units' `static`
+/// helpers are no overload set.
+bool one_overload_set(llvm::ArrayRef<const index::IndexQuery::Located*> symbols) {
+    auto& first = *symbols.front();
+    auto overloaded = [&](const index::IndexQuery::Located* located) {
+        auto& symbol = located->symbol;
+        return (symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Method ||
+                symbol.kind == SymbolKind::Operator) &&
+               symbol.parent == first.symbol.parent;
+    };
+    auto internal = [](const index::IndexQuery::Located* located) {
+        return located->symbol.scope != index::SymbolScope::External;
+    };
+    auto one_file = [&](const index::IndexQuery::Located* located) {
+        return located->site.file == first.site.file;
+    };
+    return llvm::all_of(symbols, overloaded) &&
+           (llvm::none_of(symbols, internal) || llvm::all_of(symbols, one_file));
+}
+
 /// The rename target of the symbols a locator names: one symbol's, or,
 /// for a name the overloads of one scope spell, all of theirs — renamed
 /// together, a call a template leaves open between them stays theirs.
 Outcome<index::RenameTarget> target_of(Context& ctx, index::SymbolQuery locator) {
-    using Mode = index::SymbolQuery::Mode;
-    bool by_pattern = locator.by_pattern();
-    // A near match is no symbol to rewrite a workspace for.
-    if(by_pattern && locator.mode == Mode::Fuzzy) {
-        locator.mode = Mode::Exact;
-    } else if(by_pattern && locator.mode != Mode::Exact) {
+    if(!hold_to_whole_name(locator)) {
         return std::unexpected("a rename names its symbol by its whole name, not by a pattern");
     }
+    bool by_pattern = locator.by_pattern();
     auto candidates = resolve(ctx, std::move(locator));
     if(!candidates) {
         return std::unexpected(candidates.error());
@@ -195,24 +226,14 @@ Outcome<index::RenameTarget> target_of(Context& ctx, index::SymbolQuery locator)
             targets.push_back(std::move(*target));
         }
     }
-    // Overloads share a scope; one of internal linkage shares it only
-    // within its file — two units' `static` helpers are no overload set.
-    auto& first = targets.front().symbol;
-    auto overloaded = [&](const index::RenameTarget& target) {
-        auto& symbol = target.symbol.symbol;
-        return (symbol.kind == SymbolKind::Function || symbol.kind == SymbolKind::Method) &&
-               symbol.parent == first.symbol.parent;
-    };
-    auto internal = [](const index::RenameTarget& target) {
-        return target.symbol.symbol.scope != index::SymbolScope::External;
-    };
-    auto one_file = [&](const index::RenameTarget& target) {
-        return target.symbol.site.file == first.site.file;
-    };
-    bool overloads = by_pattern && llvm::all_of(targets, overloaded) &&
-                     (llvm::none_of(targets, internal) || llvm::all_of(targets, one_file));
-    if(targets.size() > 1 && !overloads) {
-        return ambiguous(ctx, *candidates);
+    if(targets.size() > 1) {
+        llvm::SmallVector<const index::IndexQuery::Located*> roots;
+        for(auto& target: targets) {
+            roots.push_back(&target.symbol);
+        }
+        if(!by_pattern || !one_overload_set(roots)) {
+            return ambiguous(ctx, *candidates);
+        }
     }
     auto merged = std::move(targets.front());
     for(auto& other: llvm::drop_begin(targets)) {
@@ -581,28 +602,28 @@ PlannedRename rename(Context& ctx, llvm::ArrayRef<RenameRequest> requests) {
     }
     std::vector<std::string> sources;
     llvm::StringSet<> walked;
-    llvm::StringMap<index::SweptText> swept;
-    auto sweep = [&](llvm::StringRef path) -> const index::SweptText* {
+    llvm::StringMap<index::ScannedText> scanned;
+    auto scan = [&](llvm::StringRef path) -> const index::ScannedText* {
         walked.insert(path);
         auto text = vfs::read(path);
         if(!text) {
             return nullptr;
         }
-        auto spelled = index::sweep_text((*text)->getBuffer().str(), names);
-        return spelled ? &swept.try_emplace(path, std::move(*spelled)).first->second : nullptr;
+        auto spelled = index::scan_text((*text)->getBuffer().str(), names);
+        return spelled ? &scanned.try_emplace(path, std::move(*spelled)).first->second : nullptr;
     };
     for(auto& source: workspace_sources(root, cache_dir)) {
-        sweep(sources.emplace_back(source.str()));
+        scan(sources.emplace_back(source.str()));
     }
     auto editable = [&](llvm::StringRef path) {
         return workspace_file(root, cache_dir, CanonicalPath(Spelling::absolute(path)));
     };
-    auto read = [&](llvm::StringRef path) -> const index::SweptText* {
-        if(auto found = swept.find(path); found != swept.end()) {
+    auto read = [&](llvm::StringRef path) -> const index::ScannedText* {
+        if(auto found = scanned.find(path); found != scanned.end()) {
             return &found->second;
         }
         // An edited file the walk's suffixes left out.
-        return walked.contains(path) ? nullptr : sweep(path);
+        return walked.contains(path) ? nullptr : scan(path);
     };
     planned.plan = index::plan_renames(ctx.query,
                                        ctx.project.file_table,
@@ -680,6 +701,35 @@ Outcome<CallGraphResult> call_graph(Context& ctx,
         .callers = graph_entries(graph.callers),
         .callees = graph_entries(graph.callees),
     };
+}
+
+Outcome<std::vector<index::SymbolHash>> declaration(Context& ctx, index::SymbolQuery locator) {
+    if(!hold_to_whole_name(locator)) {
+        return std::unexpected("a declaration is named by its whole name, not by a pattern");
+    }
+    bool by_pattern = locator.by_pattern();
+    auto candidates = resolve(ctx, std::move(locator));
+    if(!candidates) {
+        return std::unexpected(candidates.error());
+    }
+    llvm::erase_if(*candidates, [](const index::IndexQuery::Located& candidate) {
+        return candidate.symbol.kind == SymbolKind::Macro;
+    });
+    if(candidates->empty()) {
+        return std::unexpected("the name spells only a macro, not a declaration");
+    }
+    llvm::SmallVector<const index::IndexQuery::Located*> symbols;
+    for(auto& candidate: *candidates) {
+        symbols.push_back(&candidate);
+    }
+    if(symbols.size() > 1 && (!by_pattern || !one_overload_set(symbols))) {
+        return ambiguous(ctx, *candidates);
+    }
+    std::vector<index::SymbolHash> hashes;
+    for(auto& candidate: *candidates) {
+        hashes.push_back(candidate.symbol.hash);
+    }
+    return hashes;
 }
 
 Outcome<TypeHierarchyResult> type_hierarchy(Context& ctx,

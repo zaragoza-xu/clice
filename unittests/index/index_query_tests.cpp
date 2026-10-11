@@ -35,11 +35,11 @@ struct CountingSessions : index::LiveSources {
         return false;
     }
 
-    std::optional<index::RowSource> claim(Fid) const override {
+    std::optional<index::IndexSource> buffer_index(Fid) const override {
         return std::nullopt;
     }
 
-    void each_session(llvm::function_ref<bool(const index::RowSource&)>) const override {}
+    void each_session(llvm::function_ref<bool(const index::IndexSource&)>) const override {}
 
     void each_session_index(llvm::function_ref<bool(const index::TUIndex&)> visit) const override {
         for(auto& table: tables) {
@@ -50,7 +50,7 @@ struct CountingSessions : index::LiveSources {
         }
     }
 
-    void each_preamble(llvm::function_ref<bool(const index::RowSource&)>) const override {}
+    void each_preamble(llvm::function_ref<bool(const index::IndexSource&)>) const override {}
 
     void each_overlay(llvm::function_ref<bool(const index::TUIndex&)>) const override {}
 
@@ -510,7 +510,7 @@ ZEST_CASE(DivergedBufferWithdrawsShard) {
     auto edited = unit->main_content().str() + "// edited\n";
     store.apply_open(*session, edited, 1);
 
-    // The buffer no longer matches the rows' content: the shard withdraws
+    // The buffer no longer matches the shard's content: the shard withdraws
     // and the un-compiled session resolves nothing.
     ZASSERT(!query.serving(main_id).has_value());
     ZASSERT(!query.symbol_at(main_id, point("use")).has_value());
@@ -562,9 +562,9 @@ ZEST_CASE(StaleContributionSuppressed) {
     });
     ZASSERT(!query.sites(symbol, Fid{}, RelationKind::Reference).empty());
 
-    // Rows of text the disk no longer holds point nowhere: the file's
-    // contribution disappears from cross-file results until its rows
-    // describe the disk again.
+    // Entries of text the disk no longer holds point nowhere: the file's
+    // contribution disappears from cross-file results until its index
+    // describes the disk again.
     project.file_table.observe(main_id, DiskObservation{.hash = 1});
     ZASSERT(query.sites(symbol, Fid{}, RelationKind::Reference).empty());
 }
@@ -630,7 +630,7 @@ ZEST_CASE(DeletedDefinitionFallsBack) {
     merge_into_workspace();
     auto use_id = main_id;
 
-    // The table keeps the definition the first unit reported; the rows
+    // The table keeps the definition the first unit reported; the shards
     // no longer hold it, so the declaration places the symbol — a file
     // that only used it moving on changes nothing.
     clear();

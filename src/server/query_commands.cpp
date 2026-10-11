@@ -50,8 +50,8 @@ Outcome<std::optional<Fid>> indexed_file(Context& ctx, const Spelling& path) {
 /// one holding an id's rows, is one file, workspace-relative or absolute
 /// as the command's own path arguments are; false when the index holds no
 /// rows for it, which the caller answers as not found with the file
-/// noted. A rooted path filter names its file by identity, however the
-/// command line spelled it.
+/// noted. A path filter spelling a path names its file or directory by
+/// identity, a relative one from the workspace root.
 Outcome<bool> anchor_paths(Context& ctx, index::SymbolQuery& query) {
     auto anchor = [&](std::string& path) -> Outcome<bool> {
         Spelling spelled(path, Spelling(ctx.project.config.workspace_root));
@@ -70,11 +70,7 @@ Outcome<bool> anchor_paths(Context& ctx, index::SymbolQuery& query) {
         }
         return true;
     }
-    for(auto& wanted: query.paths) {
-        if(path::is_absolute(wanted)) {
-            wanted = CanonicalPath(Spelling::absolute(wanted)).str();
-        }
-    }
+    query.anchor(Spelling(ctx.project.config.workspace_root));
     return query.position ? anchor(query.position->path) : true;
 }
 
@@ -546,12 +542,36 @@ bool units_pending(Project& project) {
     });
 }
 
-Outcome<PlannedRename> rename(Context& ctx, index::SymbolQuery locator, llvm::StringRef new_name) {
-    auto target = target_of(ctx, std::move(locator));
-    if(!target) {
-        return std::unexpected(target.error());
+PlannedRename rename(Context& ctx, llvm::ArrayRef<RenameRequest> requests) {
+    PlannedRename planned;
+    auto& result = planned.result;
+    std::vector<index::Renaming> renamings;
+    // The answer's entry of each renaming.
+    std::vector<std::size_t> entries;
+    llvm::StringSet<> names;
+    for(auto& request: requests) {
+        auto& entry = result.renames.emplace_back(RenameEntry{
+            .line = request.line,
+            .locator = request.text,
+            .new_name = request.new_name,
+        });
+        auto target = target_of(ctx, request.locator);
+        if(!target) {
+            entry.error = std::move(target.error());
+            if(!ctx.candidates.empty()) {
+                entry.candidates = std::exchange(ctx.candidates, {});
+            }
+            continue;
+        }
+        auto& symbol = target->symbol.symbol;
+        entry.name = symbol.display_name();
+        entry.kind = kind_name(symbol.kind);
+        entry.symbol = symbol_of(target->symbol);
+        names.insert(symbol.name);
+        names.insert(request.new_name);
+        entries.push_back(result.renames.size() - 1);
+        renamings.push_back({.target = std::move(*target), .new_name = request.new_name});
     }
-    auto& symbol = target->symbol.symbol;
 
     auto& config = ctx.project.config;
     CanonicalRef root = config.workspace_root;
@@ -560,56 +580,83 @@ Outcome<PlannedRename> rename(Context& ctx, index::SymbolQuery locator, llvm::St
         cache_dir = CanonicalPath(Spelling::absolute(config.project.cache_dir));
     }
     std::vector<std::string> sources;
+    llvm::StringSet<> walked;
+    llvm::StringMap<index::SweptText> swept;
+    auto sweep = [&](llvm::StringRef path) -> const index::SweptText* {
+        walked.insert(path);
+        auto text = vfs::read(path);
+        if(!text) {
+            return nullptr;
+        }
+        auto spelled = index::sweep_text((*text)->getBuffer().str(), names);
+        return spelled ? &swept.try_emplace(path, std::move(*spelled)).first->second : nullptr;
+    };
     for(auto& source: workspace_sources(root, cache_dir)) {
-        sources.push_back(source.str());
+        sweep(sources.emplace_back(source.str()));
     }
     auto editable = [&](llvm::StringRef path) {
         return workspace_file(root, cache_dir, CanonicalPath(Spelling::absolute(path)));
     };
-    auto read = [&](llvm::StringRef path) -> std::optional<index::SweptText> {
-        auto text = vfs::read(path);
-        if(!text) {
-            return std::nullopt;
+    auto read = [&](llvm::StringRef path) -> const index::SweptText* {
+        if(auto found = swept.find(path); found != swept.end()) {
+            return &found->second;
         }
-        return index::sweep_text((*text)->getBuffer().str(), symbol.name, new_name);
+        // An edited file the walk's suffixes left out.
+        return walked.contains(path) ? nullptr : sweep(path);
     };
-    auto plan = index::plan_rename(ctx.query,
-                                   ctx.project.file_table,
-                                   *target,
-                                   new_name,
-                                   {.files = sources,
-                                    .editable = editable,
-                                    .read = read,
-                                    .units_pending = units_pending(ctx.project)});
-    RenameResult result{
-        .name = symbol.display_name(),
-        .kind = kind_name(symbol.kind),
-        .symbol = symbol_of(target->symbol),
-        .new_name = new_name.str(),
-        .conflicts = plan.conflicts,
-        .warnings = plan.warnings,
-        .stale = plan.stale,
-    };
-    for(auto& edit: plan.edits) {
-        if(result.files.empty() || result.files.back().file != edit.site.path) {
-            result.files.push_back({.file = edit.site.path});
+    planned.plan = index::plan_renames(ctx.query,
+                                       ctx.project.file_table,
+                                       renamings,
+                                       {.files = sources,
+                                        .editable = editable,
+                                        .read = read,
+                                        .units_pending = units_pending(ctx.project)});
+
+    auto& plans = planned.plan.plans;
+    std::set<std::string> stale;
+    std::set<std::tuple<std::string, std::uint32_t, std::string>> noted;
+    for(std::size_t i = 0; i < plans.size(); i += 1) {
+        auto& plan = plans[i];
+        auto& entry = result.renames[entries[i]];
+        entry.edits = static_cast<int>(plan.edits.size());
+        entry.conflicts = plan.conflicts;
+        entry.warnings = plan.warnings;
+        stale.insert(plan.stale.begin(), plan.stale.end());
+        for(auto& note: plan.unconfirmed) {
+            if(!noted.insert({note.site.path, note.site.range.begin, plan.old_name}).second) {
+                continue;
+            }
+            result.unconfirmed.push_back({
+                .file = note.site.path,
+                .line = static_cast<int>(note.site.begin.line) + 1,
+                .column = static_cast<int>(note.site.begin.column) + 1,
+                .name = plan.old_name,
+                .reason = note.reason,
+                .text = note.line,
+            });
+        }
+    }
+    std::ranges::sort(result.unconfirmed,
+                      [](const RenameNoteEntry& lhs, const RenameNoteEntry& rhs) {
+                          return std::tie(lhs.file, lhs.line, lhs.column, lhs.name) <
+                                 std::tie(rhs.file, rhs.line, rhs.column, rhs.name);
+                      });
+    for(auto& [edit, owner]: planned.plan.edits) {
+        auto& site = edit.site;
+        if(result.files.empty() || result.files.back().file != site.path) {
+            result.files.push_back({.file = site.path});
         }
         result.files.back().edits.push_back({
-            .line = static_cast<int>(edit.site.begin.line) + 1,
-            .column = static_cast<int>(edit.site.begin.column) + 1,
+            .line = static_cast<int>(site.begin.line) + 1,
+            .column = static_cast<int>(site.begin.column) + 1,
+            .name = plans[owner].old_name,
+            .new_name = plans[owner].new_name,
             .heuristic = edit.heuristic,
         });
     }
-    for(auto& note: plan.unconfirmed) {
-        result.unconfirmed.push_back({
-            .file = note.site.path,
-            .line = static_cast<int>(note.site.begin.line) + 1,
-            .column = static_cast<int>(note.site.begin.column) + 1,
-            .reason = note.reason,
-            .text = note.line,
-        });
-    }
-    return PlannedRename{.result = std::move(result), .plan = std::move(plan)};
+    result.conflicts = planned.plan.conflicts;
+    result.stale.assign(stale.begin(), stale.end());
+    return planned;
 }
 
 Outcome<CallGraphResult> call_graph(Context& ctx,

@@ -1113,16 +1113,13 @@ kota::task<std::optional<Features::Renamed>, kota::ipc::Error>
     if(!config.project.cache_dir.empty()) {
         cache_dir = CanonicalPath(Spelling::absolute(config.project.cache_dir));
     }
-    auto swept = co_await kota::queue([root = config.workspace_root,
-                                       cache_dir,
-                                       old_name = at->target.symbol.symbol.name,
-                                       new_name] {
+    llvm::StringSet<> names{at->target.symbol.symbol.name, new_name};
+    auto swept = co_await kota::queue([root = config.workspace_root, cache_dir, names] {
         Swept result;
         for(auto& source: workspace_sources(root, cache_dir)) {
             auto path = source.str();
             if(auto text = vfs::read(path)) {
-                if(auto spelled =
-                       index::sweep_text((*text)->getBuffer().str(), old_name, new_name)) {
+                if(auto spelled = index::sweep_text((*text)->getBuffer().str(), names)) {
                     result.texts.try_emplace(path, std::move(*spelled));
                 }
             }
@@ -1156,21 +1153,29 @@ kota::task<std::optional<Features::Renamed>, kota::ipc::Error>
     auto editable = [&](llvm::StringRef path) {
         return workspace_file(root, cache_dir, CanonicalPath(Spelling::absolute(path)));
     };
-    auto read = [&](llvm::StringRef path) -> std::optional<index::SweptText> {
+    // Open buffers, and edited files the walk's suffixes left out, are
+    // swept on first read.
+    llvm::StringMap<std::optional<index::SweptText>> late;
+    auto read = [&](llvm::StringRef path) -> const index::SweptText* {
         auto file = project.file_table.find(Spelling::absolute(path));
-        if(auto document = file ? sessions.find(*file) : nullptr) {
-            return index::sweep_text(document->text, old_name, new_name);
-        }
-        if(auto it = swept.texts.find(path); it != swept.texts.end()) {
-            return it->second;
-        }
-        // An edited file the walk's suffixes left out.
-        if(!walked.contains(path)) {
-            if(auto text = vfs::read(path)) {
-                return index::sweep_text((*text)->getBuffer().str(), old_name, new_name);
+        auto document = file ? sessions.find(*file) : nullptr;
+        if(!document) {
+            if(auto it = swept.texts.find(path); it != swept.texts.end()) {
+                return &it->second;
+            }
+            if(walked.contains(path)) {
+                return nullptr;
             }
         }
-        return std::nullopt;
+        auto [it, inserted] = late.try_emplace(path);
+        if(inserted) {
+            if(document) {
+                it->second = index::sweep_text(document->text, names);
+            } else if(auto text = vfs::read(path)) {
+                it->second = index::sweep_text((*text)->getBuffer().str(), names);
+            }
+        }
+        return it->second ? &*it->second : nullptr;
     };
     auto plan = index::plan_rename(query,
                                    project.file_table,
@@ -1607,6 +1612,7 @@ std::vector<protocol::SymbolInformation> Features::workspace_symbol(llvm::String
     if(!parsed) {
         return results;
     }
+    parsed->anchor(Spelling(project.config.workspace_root));
     // Some clients (VS Code) filter the replies against the query text
     // again, where a bare name would fail a qualified query: those
     // replies carry the qualified name.

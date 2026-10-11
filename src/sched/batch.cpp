@@ -20,6 +20,7 @@ import :sched.stack;
 import :support.anomaly;
 import :support.logging;
 import :support.process;
+import :support.signal;
 import :support.timer;
 import :vfs.cache_store;
 import :vfs.file_system;
@@ -82,6 +83,30 @@ kota::task<> progress_ticker(BatchStack& stack, const BatchOptions& options) {
         co_await kota::sleep(pace);
         report_progress(stack, options);
     }
+}
+
+/// Test hook: CLICE_TEST_PAUSE="<units> <file>" parks a run once that many
+/// units are indexed, nothing else dispatched, and creates the file, so a
+/// test can signal the run at a known point.
+struct TestPause {
+    std::size_t units = 0;
+    std::string file;
+    bool reached = false;
+};
+
+std::optional<TestPause> test_pause() {
+    auto value = llvm::sys::Process::GetEnv("CLICE_TEST_PAUSE");
+    if(!value) {
+        return std::nullopt;
+    }
+    auto [count, file] = llvm::StringRef(*value).split(' ');
+    TestPause pause;
+    if(count.getAsInteger(10, pause.units) || pause.units == 0 || file.empty()) {
+        LOG_WARN("CLICE_TEST_PAUSE is '<units> <file>', not '{}'", *value);
+        return std::nullopt;
+    }
+    pause.file = file.str();
+    return pause;
 }
 
 /// Quiesce the pump, then the shared contract-11 tail.
@@ -233,6 +258,18 @@ kota::task<> run(BatchStack& stack, const BatchOptions& options, BatchResult& re
             report_progress(stack, options);
         }
     });
+    Signal<>::Connection parked;
+    if(auto pause = test_pause()) {
+        stack.sched.pump.pause_after(pause->units);
+        parked = stack.sched.pump.on_progress_changed.connect([&stack, pause = *pause]() mutable {
+            if(!pause.reached && stack.sched.pump.progress().completed >= pause.units) {
+                pause.reached = true;
+                if(auto error = vfs::write(pause.file, "")) {
+                    LOG_WARN("CLICE_TEST_PAUSE cannot create {}: {}", pause.file, error.message());
+                }
+            }
+        });
+    }
     BatchLifetime lifetime(stack);
     lifetime.aux.spawn(progress_ticker(stack, options));
     co_await kota::with_token(wait_until_indexed(stack.sched.pump), lifetime.token());

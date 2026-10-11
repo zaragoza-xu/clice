@@ -37,10 +37,15 @@ function crashing(env: Record<string, string> = {}) {
 }
 
 /// A workspace whose crashes are the compile's own: clang-tidy, whose
-/// crash a compile first retries without (clang_tidy.test.ts), stays off.
+/// crash a compile first retries without (clang_tidy.test.ts), stays off;
+/// so does indexing, whose rows of the disk text would answer the requests
+/// a crashed compile leaves unanswered.
 function crashWorkspace(session: SessionFactory): Workspace {
     const workspace = session.tmpdir();
-    workspace.write("clice.toml", "[diagnostics]\nclang_tidy = false\n");
+    workspace.write(
+        "clice.toml",
+        "[diagnostics]\nclang_tidy = false\n\n[project]\nenable_indexing = false\n",
+    );
     return workspace;
 }
 
@@ -414,6 +419,25 @@ test("victims are not blamed", async ({ session }) => {
     expect(notes(client, uri).length).toBe(1);
 });
 
+test("outside kill blames nobody", async ({ session }) => {
+    const workspace = crashWorkspace(session);
+    workspace.write("main.cpp", HEALTHY);
+    workspace.writeCDB(["main.cpp"]);
+    workspace.write("kill", "query:Hover");
+    const client = session.spawn(
+        workspace,
+        crashing({ CLICE_TEST_KILL_REQUEST: workspace.path("kill") }),
+    );
+    await client.initialize(workspace);
+
+    // The hover's worker dies unannounced under it; a fresh one answers.
+    const [uri] = client.open("main.cpp");
+    expect(JSON.stringify(await client.hoverAt(uri, 0, 5))).toContain("int add(int a, int b)");
+    expect(workspace.exists("kill.taken"), "the kill went off").toBe(true);
+    expect(everNoted(client, uri)).toBe(false);
+    expect(workspace.log("master.log")).toContain("[anomaly:WorkerCrash]");
+});
+
 test.skipIf(process.platform !== "linux")("shared deaths blame nobody", async ({ session }) => {
     const workspace = crashWorkspace(session);
     const names = ["a.cpp", "b.cpp", "c.cpp"];
@@ -489,9 +513,7 @@ test("hung compile is killed", async ({ session }) => {
     );
     workspace.writeCDB(["hang.cpp"], { extraArgs: ["-fconstexpr-steps=2147483647"] });
     const client = session.spawn(workspace, crashing({ CLICE_TEST_REQUEST_DEADLINE_MS: "2000" }));
-    await client.initialize(workspace, {
-        initializationOptions: { project: { enable_indexing: false } },
-    });
+    await client.initialize(workspace);
 
     const [uri] = client.open("hang.cpp");
     expect(await client.hoverAt(uri, 0, 16)).toBeNull();

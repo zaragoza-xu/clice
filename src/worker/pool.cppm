@@ -8,6 +8,7 @@ module clice:worker.pool;
 
 import :support.logging;
 import :support.signal;
+import :worker.probe;
 import :worker.protocol;
 
 namespace clice::worker {
@@ -282,6 +283,11 @@ public:
 
     /// Callback invoked when a worker process crashes.
     std::function<void(const WorkerCrashInfo&)> on_crash;
+
+    /// The server's test instrumentation while test hooks are on, null
+    /// otherwise: it counts the builds sent and parks the replies a test
+    /// holds (see BuildProbe).
+    BuildProbe* probe = nullptr;
 
     /// Callback invoked when a stateful worker sends an EvictedParams
     /// notification, with the slot index of the evicting worker. The master
@@ -801,15 +807,87 @@ private:
 
     void install_evict_handler(WorkerProcess& worker, std::size_t index);
 
+    /// Hand the worker's gate parks (a test gate, see BuildProbe::gate) to
+    /// the probe.
+    void install_gate_handler(WorkerProcess& worker);
+
     kota::task<> monitor_worker(std::size_t index, bool stateful);
+
+    /// The sends without the probe, which parks a reply only once its
+    /// dispatch released the slot. `sent` tells whether the request reached
+    /// a worker: one that failed before has no build to count or hold.
+    template <typename Params>
+    RequestResult<Params> dispatch_stateful(std::uint32_t path_id,
+                                            const Params& params,
+                                            kota::ipc::request_options opts,
+                                            bool& sent);
+
+    template <typename Params>
+    RequestResult<Params> dispatch_stateless(const Params& params,
+                                             worker::Priority priority,
+                                             kota::cancellation_token cancel,
+                                             bool& sent);
 
     friend struct testing::WorkerPoolFixture;
 };
+
+/// The build a worker ran to its end, as the probe counts it: its kind and
+/// file. The request reached the worker, and it answered or died running
+/// it; a build the master withdrew — preempted, superseded — comes back
+/// cancelled whatever the worker had done, or as a compile the worker
+/// stopped. None for the other requests.
+template <typename Params, typename Result>
+std::optional<std::pair<BuildKind, llvm::StringRef>> ran_build(const Params& params,
+                                                               const Result& result,
+                                                               bool sent) {
+    if(!sent || (!result.has_value() && result.error().code == worker::dispatch_errc::cancelled)) {
+        return std::nullopt;
+    }
+    if constexpr(std::same_as<Params, worker::CompileParams>) {
+        if(result.has_value() && result->status == worker::CompileStatus::Cancelled) {
+            return std::nullopt;
+        }
+        return std::pair{BuildKind::Compile, llvm::StringRef(params.path)};
+    } else if constexpr(std::same_as<Params, worker::BuildPCHParams>) {
+        return std::pair{BuildKind::PCH, llvm::StringRef(params.file)};
+    } else if constexpr(std::same_as<Params, worker::BuildPCMParams>) {
+        return std::pair{BuildKind::PCM, llvm::StringRef(params.file)};
+    } else if constexpr(std::same_as<Params, worker::TURunParams>) {
+        return std::pair{BuildKind::Index, llvm::StringRef(params.file)};
+    } else {
+        return std::nullopt;
+    }
+}
 
 template <typename Params>
 RequestResult<Params> WorkerPool::send_stateful(std::uint32_t path_id,
                                                 const Params& params,
                                                 kota::ipc::request_options opts) {
+    bool sent = false;
+    auto result = co_await dispatch_stateful(path_id, params, std::move(opts), sent);
+    if(auto build = ran_build(params, result, sent); build && probe) {
+        co_await probe->returned(build->first, build->second);
+    }
+    co_return std::move(result);
+}
+
+template <typename Params>
+RequestResult<Params> WorkerPool::send_stateless(const Params& params,
+                                                 worker::Priority priority,
+                                                 kota::cancellation_token cancel) {
+    bool sent = false;
+    auto result = co_await dispatch_stateless(params, priority, std::move(cancel), sent);
+    if(auto build = ran_build(params, result, sent); build && probe) {
+        co_await probe->returned(build->first, build->second);
+    }
+    co_return std::move(result);
+}
+
+template <typename Params>
+RequestResult<Params> WorkerPool::dispatch_stateful(std::uint32_t path_id,
+                                                    const Params& params,
+                                                    kota::ipc::request_options opts,
+                                                    bool& sent) {
     // Every stateful request is user-facing: note the activity and hold the
     // foreground window open for as long as it flies.
     note_foreground();
@@ -835,8 +913,13 @@ RequestResult<Params> WorkerPool::send_stateful(std::uint32_t path_id,
     auto peer = assigned.peer;
     auto gen = assigned.generation;
     auto death = assigned.death;
+    sent = true;
     Dispatch dispatch(*this, idx, true, worker::crash_tag(params), worker::is_build<Params>);
+    auto gate = probe ? probe->sending(dispatch.tag, peer) : std::nullopt;
     auto result = co_await peer->send_request(params, opts);
+    if(gate) {
+        probe->answered(*gate);
+    }
     if(result.has_value() || !worker::is_transport_error(result.error()))
         co_return std::move(result);
 
@@ -850,9 +933,10 @@ RequestResult<Params> WorkerPool::send_stateful(std::uint32_t path_id,
 }
 
 template <typename Params>
-RequestResult<Params> WorkerPool::send_stateless(const Params& params,
-                                                 worker::Priority priority,
-                                                 kota::cancellation_token cancel) {
+RequestResult<Params> WorkerPool::dispatch_stateless(const Params& params,
+                                                     worker::Priority priority,
+                                                     kota::cancellation_token cancel,
+                                                     bool& sent) {
     // High-priority stateless work (PCH, completion builds, foreground
     // PCMs) is foreground by the priority taxonomy; while it runs or
     // queues, foreground_busy() holds the window open.
@@ -905,8 +989,13 @@ RequestResult<Params> WorkerPool::send_stateless(const Params& params,
         w.cancel_requested_at = std::chrono::steady_clock::now();
     });
 
+    sent = true;
     Dispatch dispatch(*this, idx, false, worker::crash_tag(params), worker::is_build<Params>);
+    auto gate = probe ? probe->sending(dispatch.tag, peer) : std::nullopt;
     auto result = co_await peer->send_request(params, {.token = preempt_src->token()});
+    if(gate) {
+        probe->answered(*gate);
+    }
     // The worker link broke mid-request: declare the slot dead now so a
     // caller-side retry cannot land on the same corpse before the monitor
     // observed the exit. This must precede the cancel classification — a

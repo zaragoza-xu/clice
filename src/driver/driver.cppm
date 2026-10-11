@@ -18,6 +18,7 @@ import :project.configuration;
 import :sched.batch;
 import :server.control_client;
 import :support.logging;
+import :support.process;
 import :vfs.file_system;
 import :vfs.path;
 import :worker.serialize;
@@ -82,18 +83,25 @@ inline void add_commands(kota::deco::cli::SubCommander& root, const char* self_p
     }
 }
 
-/// Write command output. stdout carries the command's answer: a reader
-/// that went away (`clice … | head`) ends the process by SIGPIPE, as it
-/// ends any command-line tool — clice ignores SIGPIPE, or a dead worker's
-/// pipe would take the master down — and any other failure (a full disk
-/// under a redirect) is reported and exits 1. stderr carries progress and
-/// complaints, which, like log lines, are dropped when they cannot be
-/// written: a progress line must not end a run before it saves.
+/// Write command output. stdout carries the command's answer. On a pipe
+/// or a socket, a write fails only because the reader went away (`clice …
+/// | head`), under whatever error the kernel picks for the descriptor and
+/// the timing (EPIPE, ECONNRESET, ENOTCONN on macOS, EINVAL on Windows),
+/// and the process ends as a command-line tool does there: by SIGPIPE,
+/// which clice otherwise ignores (a dead worker's pipe must not take the
+/// master down), or on Windows, which has none, quietly with 141, the
+/// status a POSIX shell reports for it. The exception is EAGAIN: a
+/// non-blocking pipe, shared from a parent's own, refuses while its reader
+/// lags. That and any other failure (a full disk under a redirect) are
+/// reported and exit 1. stderr carries progress and complaints, which,
+/// like log lines, are dropped when they cannot be written: a progress
+/// line must not end a run before it saves.
 inline void write_output(std::FILE* stream, std::string_view text) {
+    int fd = ::fileno(stream);
 #ifdef _WIN32
     // A console takes UTF-16: std::print converts for it, where fwrite
     // would show UTF-8 in the console's code page.
-    if(::_isatty(::_fileno(stream))) {
+    if(::_isatty(fd)) {
         std::print(stream, "{}", text);
         return;
     }
@@ -106,15 +114,14 @@ inline void write_output(std::FILE* stream, std::string_view text) {
         return;
     }
     int error = errno;
-#ifndef _WIN32
-    // A socket reader (Node's stdio pipes are socketpairs) that went away
-    // with output still unread fails the write with ECONNRESET instead, or
-    // on macOS at times with EPROTOTYPE, which libuv maps the same way.
-    if(error == EPIPE || error == ECONNRESET || error == EPROTOTYPE) {
+    if(error != EAGAIN && is_pipe_or_socket(fd)) {
+#ifdef _WIN32
+        std::_Exit(141);
+#else
         std::signal(SIGPIPE, SIG_DFL);
         std::raise(SIGPIPE);
-    }
 #endif
+    }
     LOG_ERROR("Cannot write the output: {}",
               std::error_code(error, std::generic_category()).message());
     std::_Exit(1);

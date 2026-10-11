@@ -1,5 +1,5 @@
 /// How a server ends when its client goes away abruptly: the client closes
-/// the server's input, kills it, or dies itself.
+/// the server's input or output, kills it, or dies itself.
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -109,3 +109,19 @@ test.for([false, true])(
         client.dispose();
     },
 );
+
+test("closed output ends the server", async ({ session }) => {
+    const { client, workspace } = session.tmp();
+    workspace.write("main.cpp", "int main() { return 0; }\n");
+    workspace.writeCDB(["main.cpp"]);
+    await client.initialize(workspace, {
+        initializationOptions: { project: { enable_indexing: false } },
+    });
+    // An editor that stops reading the server: the reply cannot be written.
+    client.child.stdout.destroy();
+    void client
+        .sendRequest(proto.WorkspaceSymbolRequest.type, { query: "main" })
+        .catch(() => undefined);
+    await client.assertExitedCleanly(15_000);
+    client.dispose();
+});

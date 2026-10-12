@@ -43,7 +43,46 @@ struct QualifiedName {
     std::string name;
     /// The chain's span in the main file.
     LocalSourceRange range;
+    /// The number of arguments of the call the name is the callee of.
+    std::optional<std::size_t> arguments;
 };
+
+/// The number of arguments of the argument list `tokens` open; nullopt
+/// when they open none, it is never closed, a bracket in it is closed by
+/// another kind, or it holds a `<`: the text alone cannot tell a less-than
+/// from a template argument list, whose commas separate no arguments.
+std::optional<std::size_t> call_arguments(llvm::ArrayRef<clang::syntax::Token> tokens) {
+    if(tokens.empty() || tokens.front().kind() != clang::tok::l_paren) {
+        return std::nullopt;
+    }
+    std::size_t commas = 0;
+    llvm::SmallVector<clang::tok::TokenKind, 4> closers;
+    for(const auto& token: tokens) {
+        switch(token.kind()) {
+            case clang::tok::l_paren: closers.push_back(clang::tok::r_paren); break;
+            case clang::tok::l_square: closers.push_back(clang::tok::r_square); break;
+            case clang::tok::l_brace: closers.push_back(clang::tok::r_brace); break;
+            case clang::tok::r_paren:
+            case clang::tok::r_square:
+            case clang::tok::r_brace:
+                if(closers.pop_back_val() != token.kind()) {
+                    return std::nullopt;
+                }
+                if(closers.empty()) {
+                    return &token == &tokens[1] ? 0 : commas + 1;
+                }
+                break;
+            case clang::tok::comma:
+                if(closers.size() == 1) {
+                    commas += 1;
+                }
+                break;
+            case clang::tok::less: return std::nullopt;
+            default: break;
+        }
+    }
+    return std::nullopt;
+}
 
 /// None for a member named through `.` or `->`: the object's class
 /// declares it, not a header.
@@ -95,7 +134,37 @@ std::optional<QualifiedName> qualified_name_at(CompilationUnitRef unit, std::uin
     }
     result.name = tokens[last].text(SM).str();
     result.range = {offset_of(tokens[first]), offset_of(tokens[last]) + tokens[last].length()};
+    result.arguments = call_arguments(tokens.drop_front(last + 1));
     return result;
+}
+
+/// The header of a standard function the mapping leaves out because its
+/// overloads live in different headers, told apart as include-cleaner does,
+/// by the number of arguments of the call.
+std::optional<clang::tooling::stdlib::Header>
+    overloaded_standard_header(llvm::StringRef scope, const QualifiedName& name) {
+    struct Overload {
+        llvm::StringRef name;
+        std::size_t arguments;
+        llvm::StringRef header;
+    };
+
+    constexpr std::array overloads = {
+        Overload{"move",   1, "<utility>"  },
+        Overload{"move",   3, "<algorithm>"},
+        Overload{"move",   4, "<algorithm>"},
+        Overload{"remove", 1, "<cstdio>"   },
+        Overload{"remove", 3, "<algorithm>"},
+    };
+    if(scope != "std::") {
+        return std::nullopt;
+    }
+    for(const auto& overload: overloads) {
+        if(overload.name == name.name && overload.arguments == name.arguments) {
+            return clang::tooling::stdlib::Header::named(overload.header);
+        }
+    }
+    return std::nullopt;
 }
 
 /// Where the text the user edits ends: a header compiled in its
@@ -113,6 +182,22 @@ std::uint32_t text_end(CompilationUnitRef unit) {
     return content.size();
 }
 
+/// The start of the line after the comments opening the file, up to the
+/// last one a blank line sets apart from what follows: a license header,
+/// not the comment of the first declaration. 0 when there is none.
+std::uint32_t after_leading_comments(llvm::StringRef content, const clang::LangOptions& options) {
+    std::uint32_t offset = 0;
+    Lexer lexer(content, {.keep_comments = true, .lang_opts = &options});
+    for(auto token = lexer.advance(); token.kind == clang::tok::comment;) {
+        auto next = lexer.advance();
+        if(content.slice(token.range.end, next.range.begin).count('\n') > 1) {
+            offset = line_end(content, token.range.end);
+        }
+        token = next;
+    }
+    return offset;
+}
+
 }  // namespace
 
 /// After the last `#include` of the file's leading directives — those
@@ -122,11 +207,11 @@ std::uint32_t text_end(CompilationUnitRef unit) {
 /// code (an X-macro list, a `.tpp` body) is no place for one that must
 /// always apply. Without one, after the leading `#pragma once`, the
 /// guard's `#define` or the `module;` opening the global module fragment,
-/// else at the file's start. A module unit without that fragment opens
-/// it at the start: no include may follow the module declaration. Only an `#ifndef`/`#define` pair
-/// enclosing the whole file is a guard; a leading `#ifndef _GNU_SOURCE` block is not. A raw lex of
-/// the text rather than the directive table: the preamble's directives are compiled into the PCH
-/// and never reach this AST.
+/// else after the comments opening the file. A module unit without that
+/// fragment opens it there: no include may follow the module declaration. Only an
+/// `#ifndef`/`#define` pair enclosing the whole file is a guard; a leading `#ifndef _GNU_SOURCE`
+/// block is not. A raw lex of the text rather than the directive table: the preamble's directives
+/// are compiled into the PCH and never reach this AST.
 IncludeInsertion include_insertion(CompilationUnitRef unit) {
     auto content = unit.main_content();
     auto end = text_end(unit);
@@ -221,10 +306,14 @@ IncludeInsertion include_insertion(CompilationUnitRef unit) {
     // header compiled in its includer's context is none, whatever the
     // includer is.
     if(declares_module && !fragment && unit.is_named_module()) {
-        return {.offset = 0, .opens_fragment = true};
+        return {.offset = after_leading_comments(content, unit.lang_options()),
+                .opens_fragment = true};
     }
     const auto& level = levels[guard == Guard::Closed ? 1 : 0];
-    return {.offset = level.include.value_or(level.prologue.value_or(0))};
+    if(auto anchor = level.include ? level.include : level.prologue) {
+        return {.offset = *anchor};
+    }
+    return {.offset = after_leading_comments(content, unit.lang_options())};
 }
 
 void add_include(CompilationUnitRef unit,
@@ -255,15 +344,19 @@ void add_include(CompilationUnitRef unit,
         scopes.push_back("");
     }
     for(auto scope: scopes) {
-        auto symbol = stdlib::Symbol::named(scope, name->name, language);
-        if(!symbol) {
+        std::optional<stdlib::Header> header;
+        if(auto symbol = stdlib::Symbol::named(scope, name->name, language)) {
+            header = symbol->header();
+        } else if(auto overloaded = overloaded_standard_header(scope, *name)) {
+            header = overloaded;
+        } else {
             continue;
         }
-        for(auto header: symbol->headers()) {
+        if(header) {
             out.push_back(CodeAction{
-                .title = std::format("Add #include {}", header.name()),
+                .title = std::format("Add #include {}", header->name()),
                 .kind = protocol::CodeActionKind::QuickFix,
-                .edits = {{{insertion.offset, insertion.offset}, insertion.text(header.name())}},
+                .edits = {{{insertion.offset, insertion.offset}, insertion.text(header->name())}},
             });
         }
         // A standard library name spelled with its namespace: the index

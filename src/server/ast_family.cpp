@@ -146,6 +146,49 @@ static std::vector<protocol::Diagnostic> with_preamble(std::vector<protocol::Dia
     return merged;
 }
 
+/// clang reports the import of a module whose build failed as not found:
+/// the import says instead why the module did not build.
+static void explain_failed_imports(std::vector<protocol::Diagnostic>& diagnostics,
+                                   llvm::ArrayRef<Fid> imports,
+                                   const PCMFamily& pcm,
+                                   const DependencyGraph& modules) {
+    for(auto module: imports) {
+        auto failure = pcm.build_failure(module);
+        if(!failure) {
+            continue;
+        }
+        llvm::ArrayRef<Fid> chain = failure->chain;
+        std::string message;
+        for(auto unit: chain.take_front(failure->cycle.value_or(chain.size()))) {
+            message += std::format("could not build module '{}': ", modules.module_of(unit));
+        }
+        if(failure->cycle) {
+            auto cycle = chain.drop_front(*failure->cycle);
+            message +=
+                std::format("cyclic dependency in module '{}': ", modules.module_of(cycle.front()));
+            for(auto unit: cycle) {
+                message += std::format("{} -> ", modules.module_of(unit));
+            }
+            message += modules.module_of(cycle.front());
+        } else {
+            message += failure->error;
+        }
+        auto not_found = std::format("module '{}' not found", modules.module_of(module));
+        for(auto& diagnostic: diagnostics) {
+            auto* code =
+                diagnostic.code ? std::get_if<protocol::string>(&*diagnostic.code) : nullptr;
+            auto* text = std::get_if<protocol::string>(&diagnostic.message);
+            if(code && *code == "err_module_not_found" && text && *text == not_found) {
+                diagnostic.message = message;
+                // As clang codes it: a cycle only where the imported module
+                // is on it, not built where the message starts with one
+                // that is not.
+                diagnostic.code = failure->cycle == 0 ? "err_module_cycle" : "err_module_not_built";
+            }
+        }
+    }
+}
+
 ASTFamily::PCHPlan ASTFamily::plan_pch(Fid path_id,
                                        llvm::StringRef text,
                                        const std::string& directory,
@@ -400,61 +443,48 @@ void ASTFamily::publish_output(const std::shared_ptr<Session>& session, CompileO
     on_output.emit(session);
 }
 
-bool ASTFamily::is_stale(const Session& session) {
-    // No early return: the changes one check finds cascade together.
-    bool stale = false;
-    auto it = projections.entries.find(session.path_id);
-    if(it != projections.entries.end() && it->second.deps.has_value()) {
-        stale = deps_changed(project.file_table, *it->second.deps);
-    }
-
-    // Chain files of a header context are embedded in the synthesized
-    // preamble, invisible to the deps snapshot — check them explicitly.
-    if(auto* header_context = contexts.header_context(session.path_id)) {
-        stale = deps_changed(project.file_table, header_context->deps) || stale;
-    }
-
-    // Check PCH staleness via the projection's pch_key.
-    auto projection = projections.projection(session.path_id);
-    if(projection && projection->pch_key.has_value()) {
-        auto pch_it = project.pch_cache.find(*projection->pch_key);
-        if(pch_it != project.pch_cache.end()) {
-            stale = deps_changed(project.file_table, pch_it->second.deps) || stale;
-        }
-    }
-
-    return stale;
-}
-
-void ASTFamily::closure(Fid path_id, llvm::SmallVectorImpl<Fid>& files) {
-    auto add = [&](const DepsSnapshot& deps) {
-        for(auto& dep: deps) {
-            files.push_back(dep.path_id);
-        }
-    };
+void ASTFamily::each_input(Fid path_id, llvm::function_ref<void(const DepsSnapshot&)> visit) {
     if(auto it = projections.entries.find(path_id);
        it != projections.entries.end() && it->second.deps) {
-        add(*it->second.deps);
+        visit(*it->second.deps);
     }
+    // Chain files of a header context are embedded in the synthesized
+    // preamble, invisible to the deps snapshot.
     if(auto* header_context = contexts.header_context(path_id)) {
-        add(header_context->deps);
+        visit(header_context->deps);
     }
     if(auto projection = projections.projection(path_id); projection && projection->pch_key) {
         if(auto it = project.pch_cache.find(*projection->pch_key); it != project.pch_cache.end()) {
-            add(it->second.deps);
+            visit(it->second.deps);
         }
     }
     // A module's snapshot covers the modules it imports in turn.
     for(auto dep: graph.dependencies(node(path_id))) {
-        if(dep.family != Family::PCM) {
+        if(dep.family != Family::PCM || PCMFamily::is_unresolved(dep)) {
             continue;
         }
-        Fid module{static_cast<std::uint32_t>(dep.key)};
-        if(auto it = project.pcm_cache.find(module); it != project.pcm_cache.end()) {
-            files.push_back(module);
-            add(it->second.deps);
+        if(auto it = project.pcm_cache.find(Fid{static_cast<std::uint32_t>(dep.key)});
+           it != project.pcm_cache.end()) {
+            visit(it->second.deps);
         }
     }
+}
+
+bool ASTFamily::is_stale(const Session& session) {
+    // No early return: the changes one check finds cascade together.
+    bool stale = false;
+    each_input(session.path_id, [&](const DepsSnapshot& deps) {
+        stale = deps_changed(project.file_table, deps) || stale;
+    });
+    return stale;
+}
+
+void ASTFamily::closure(Fid path_id, llvm::SmallVectorImpl<Fid>& files) {
+    each_input(path_id, [&](const DepsSnapshot& deps) {
+        for(auto& dep: deps) {
+            files.push_back(dep.path_id);
+        }
+    });
 }
 
 void ASTFamily::touch(Fid path_id) {
@@ -782,6 +812,9 @@ kota::task<RoundOutcome> ASTFamily::run(RoundContext& ctx, Fid path_id) {
     if(project.config.diagnostics.clang_tidy &&
        project.build.lintable(project.file_table.resolve(path_id))) {
         tidy_config = tidy::resolve_tidy_params(project.file_table.spelling(path_id));
+        if(!tidy_config->error.empty()) {
+            LOG_WARN("{}", tidy_config->error);
+        }
         if(!session->tidy_crash && session->crashed_pch.empty() &&
            !session->quarantine->crashed(compile_kind) &&
            !session->quarantine->barred(tidy_kind, Quarantine::Clock::now())) {
@@ -1160,6 +1193,7 @@ kota::task<RoundOutcome> ASTFamily::run(RoundContext& ctx, Fid path_id) {
         if(preamble_state && preamble_state->matches_prefix(params.text)) {
             diagnostics = with_preamble(std::move(diagnostics), *preamble_state, file_path);
         }
+        explain_failed_imports(diagnostics, imports->resolved, pcm, project.dep_graph);
 
         // Self-containment trial result. Scored once per stable input
         // state: trial_done is reset whenever compile inputs change for

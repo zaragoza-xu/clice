@@ -23,7 +23,6 @@
     "client/**/*.ts",
     "compat/**/*.ts",
     "docs/**/*.ts",
-    "snap/**/*.ts",
     "protocol/**/*.ts",
     "testing/**/*.ts",
     "*.ts"

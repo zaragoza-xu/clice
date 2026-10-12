@@ -6,6 +6,7 @@ module;
 
 module clice;
 
+import :config.config;
 import :driver.driver;
 import :index.database;
 import :index.query;
@@ -16,6 +17,7 @@ import :project.open_index;
 import :project.project;
 import :sched.batch;
 import :server.control_client;
+import :support.text;
 import :support.timer;
 
 namespace clice::driver {
@@ -73,16 +75,6 @@ struct IndexOptions {
     LogLevelOption log;
 };
 
-std::string format_size(std::uint64_t bytes) {
-    if(bytes >= 1024 * 1024) {
-        return std::format("{:.1f} MB", bytes / (1024.0 * 1024.0));
-    }
-    if(bytes >= 1024) {
-        return std::format("{:.1f} KB", bytes / 1024.0);
-    }
-    return std::format("{} B", bytes);
-}
-
 std::string format_hash(std::uint64_t hash) {
     return std::format("#{:016x}", hash);
 }
@@ -129,7 +121,8 @@ int run_indexing(Spelling root,
                  std::uint32_t workers,
                  const char* self_path) {
     auto config = Config::load_from_workspace(CanonicalPath(root));
-    if(!check_requested_configuration(config, configuration)) {
+    if(auto checked = check_requested_configuration(config, configuration); !checked) {
+        LOG_ERROR("{}", checked.error());
         return 1;
     }
     auto& cache_dir = config.project.cache_dir;
@@ -162,6 +155,7 @@ int run_indexing(Spelling root,
 
     auto result = run_batch_index({
         .root = std::move(root),
+        .config = std::move(config),
         .configuration = std::move(configuration),
         .workers = workers,
         .self_path = self_path,
@@ -189,7 +183,7 @@ int run_indexing(Spelling root,
                     result.seconds,
                     result.shard_count,
                     plural_s(result.shard_count),
-                    format_size(result.shard_bytes),
+                    format_bytes(result.shard_bytes),
                     result.symbol_count,
                     plural_s(result.symbol_count));
     if(result.standalone_headers != 0) {
@@ -405,7 +399,7 @@ void print_stats(const Project& project,
     auto column = [&](llvm::StringRef name, std::uint64_t bytes, std::uint64_t whole) {
         driver::println("  {:<24} {:>10}  {:>5.1f}%",
                         name,
-                        format_size(bytes),
+                        format_bytes(bytes),
                         share(bytes, whole));
     };
 
@@ -416,11 +410,11 @@ void print_stats(const Project& project,
     }
     driver::println("Translation units: {} (manifests {}), {} internal symbols spanning files",
                     project_index.manifests.size(),
-                    format_size(stats.manifest_bytes),
+                    format_bytes(stats.manifest_bytes),
                     stats.local_fanout);
     driver::println("File shards: {} ({}), {} occurrences, {} relations",
                     stats.shards.size(),
-                    format_size(stats.shard_bytes),
+                    format_bytes(stats.shard_bytes),
                     stats.occurrences,
                     stats.relations);
     driver::println("Global symbols: {}, file versions: {}",
@@ -428,7 +422,7 @@ void print_stats(const Project& project,
                     project.file_table.versions.size());
     driver::println("Search index: {} symbols ({}), {} merged since its build",
                     project.project_index.search_index.size(),
-                    format_size(stats.search_bytes),
+                    format_bytes(stats.search_bytes),
                     project.project_index.search_pending.size());
     if(!dropped.empty()) {
         driver::println(
@@ -440,7 +434,7 @@ void print_stats(const Project& project,
     auto payload = stats.columns.total();
     driver::println();
     driver::println("Shard payload by column ({}; the rest of the file size is format framing):",
-                    format_size(payload));
+                    format_bytes(payload));
     column("occurrence rows", stats.columns.occ_entries, payload);
     column("occurrence masks", stats.columns.occ_masks, payload);
     column("relation rows", stats.columns.rel_entries, payload);
@@ -454,7 +448,7 @@ void print_stats(const Project& project,
     auto column_bytes =
         global.names + global.args + global.bitmaps + global.fixed + global.contributors;
     driver::println();
-    driver::println("Global blob ({}):", format_size(stats.global_bytes));
+    driver::println("Global blob ({}):", format_bytes(stats.global_bytes));
     column("symbol names", global.names, stats.global_bytes);
     column("specialization args", global.args, stats.global_bytes);
     column("reference bitmaps", global.bitmaps, stats.global_bytes);
@@ -478,7 +472,7 @@ void print_stats(const Project& project,
     driver::println("Top {} file shards by size:", std::min<std::size_t>(top, stats.shards.size()));
     for(auto& stat: stats.shards | std::views::take(top)) {
         driver::println("  {:>10}  {:>4} variants  {:>9} occs  {:>9} rels  {}",
-                        format_size(stat.bytes),
+                        format_bytes(stat.bytes),
                         stat.variants,
                         stat.occurrences,
                         stat.relations,
@@ -662,7 +656,7 @@ int run_show_file(Project& project, llvm::StringRef argument) {
     auto& shard = shard_it->second;
     driver::println("file {}", project.file_table.display(*file));
     driver::println("  blob={}  content size={}  content hash={}  text={}",
-                    format_size(shard.bytes().size()),
+                    format_bytes(shard.bytes().size()),
                     shard.content_size(),
                     format_hash(shard.content_hash()),
                     shard.content().empty() ? "not stored (ASCII)" : "stored");
@@ -796,7 +790,9 @@ CommandHandler build(const char* self_path) {
         logging::stderr_logger("index", logging::options);
 
         auto spelling = workspace_spelling(opts.workspace.value_or(""));
-        CanonicalPath ws(spelling);
+        if(!workspace_exists(spelling)) {
+            return 1;
+        }
         auto configuration = opts.configuration.value_or("");
         std::size_t modes = (opts.show_symbol ? 1 : 0) + (opts.show_file ? 1 : 0) +
                             (opts.show_tu ? 1 : 0) + (opts.stats || opts.variants ? 1 : 0);
@@ -807,12 +803,21 @@ CommandHandler build(const char* self_path) {
             return 1;
         }
         if(opts.show_symbol || opts.show_file || opts.show_tu || opts.stats || opts.variants) {
+            auto config = Config::load_from_workspace(CanonicalPath(spelling));
+            if(auto checked = check_requested_configuration(config, configuration); !checked) {
+                LOG_ERROR("{}", checked.error());
+                return 1;
+            }
             FileTable files;
             // Answers name files under the workspace as the command line does.
             files.spell_root(spelling);
             Project project{files};
             CommandResolver commands{project};
-            auto loaded = load_index(project, commands, ws, configuration, /*with_build=*/false);
+            auto loaded = load_index(project,
+                                     commands,
+                                     std::move(config),
+                                     configuration,
+                                     /*with_build=*/false);
             if(!loaded) {
                 return 1;
             }

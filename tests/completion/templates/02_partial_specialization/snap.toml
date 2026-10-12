@@ -1,0 +1,8 @@
+[answers.pos.completion]
+items = [
+    { label = "pointer_field", kind = "Field", detail = "int" },
+    { label = "template", kind = "Keyword" },
+]
+
+[answers.filtered.completion]
+items = []

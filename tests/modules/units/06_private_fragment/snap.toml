@@ -1,0 +1,27 @@
+[answers.use.hover]
+markdown = '''
+### function `public_fn`
+
+---
+→ `int`
+
+---
+```cpp
+export int public_fn()
+```
+'''
+range = "return ⟦public_fn⟧();"
+
+[answers.defined.hover]
+markdown = '''
+### function `private_helper`
+
+---
+→ `int`
+
+---
+```cpp
+int private_helper()
+```
+'''
+range = "return ⟦private_helper⟧();"

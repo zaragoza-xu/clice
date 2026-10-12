@@ -28,8 +28,9 @@ struct IndexSource {
         /// An open buffer's preamble region as its PCH overlay indexed it,
         /// in buffer coordinates.
         PreambleShard,
-        /// A header entry of a PCH overlay, in the coordinates of the text
-        /// the overlay indexed.
+        /// A header entry of a PCH overlay, or an imported module's
+        /// declarations an open buffer's index holds, in the coordinates of
+        /// the text the index read.
         Overlay,
     };
 
@@ -76,7 +77,8 @@ public:
     virtual void each_session(llvm::function_ref<bool(const IndexSource&)> visit) const = 0;
 
     /// The same buffers' TU indexes, which name (find_symbol) every
-    /// symbol of the unsaved text.
+    /// symbol of the unsaved text and hold the declarations of what it
+    /// names from imported modules.
     virtual void each_session_index(llvm::function_ref<bool(const TUIndex&)> visit) const = 0;
 
     /// Every open buffer's preamble index whose overlay was built from that
@@ -354,9 +356,12 @@ public:
     /// included.
     std::vector<PlacedHighlight> document_highlights(const Cursor& cursor) const;
 
-    /// One canonical site per distinct relation target — the two-hop query
-    /// behind go-to-type-definition.
-    std::vector<Site> target_sites(SymbolHash hash, Fid anchor, RelationKind kind) const;
+    /// Go-to-type-definition of a cursor's symbol: the declarations its
+    /// type names — at a name of a member of a template's specialization,
+    /// the type the specialization gives it (TypeDefinition relations
+    /// spanning the cursor in the index serving its file), elsewhere the
+    /// type it is declared with (the relations without a range).
+    std::vector<Site> type_definition(const Cursor& cursor, SymbolHash symbol) const;
 
     /// Whether the cursor stands on a keyword standing for `symbol` — an
     /// `auto` or `decltype` the type names, not a name of it (a Deduced
@@ -375,13 +380,16 @@ public:
     /// re-read for pure-ASCII blobs — verified against the index's content
     /// hash, so a moved-on file degrades to no text rather than mismatched
     /// text).
-    struct Definition {
+    struct DeclaredText {
         Site extent;
         std::string text;
         std::string comment;
     };
 
-    std::optional<Definition> definition_text(SymbolHash hash, Fid anchor) const;
+    std::optional<DeclaredText> definition_text(SymbolHash hash, Fid anchor) const;
+
+    /// The same of a declaration.
+    std::optional<DeclaredText> declaration_text(SymbolHash hash, Fid anchor) const;
 
     /// The source line a site lies on, for previews; empty when the text
     /// is unavailable (see definition_text on the disk re-read).
@@ -462,13 +470,9 @@ public:
     /// under a cursor, or those defined on a line of the file's serving
     /// source; or by pattern, where every symbol spelling the name exactly
     /// (in any case) is the answer when there is one, and the ranked
-    /// matches stand as candidates otherwise.
+    /// matches stand as candidates otherwise. A template's name without
+    /// arguments names the template, not its specializations.
     std::vector<Located> locate(const SymbolQuery& query) const;
-
-    /// Every project symbol and internal-linkage symbol with a definition
-    /// site in the file's serving source, anchored at the definition's
-    /// name token.
-    std::vector<Located> definitions_in(Fid file) const;
 
     /// The include edges of a document, the input of the document-link
     /// projection: from its own TU manifest when it has one, else from the
@@ -510,6 +514,8 @@ private:
     };
 
     RankedHits ranked_search(const SymbolQuery& query, std::size_t limit) const;
+
+    std::optional<DeclaredText> declared_text(SymbolHash hash, Fid anchor, RelationKind kind) const;
 
     /// Relations of `kind` grouped by their target symbol, each with the
     /// sites spelling it, the targets resolved to their canonical sites.
@@ -558,11 +564,12 @@ private:
                            SourceMask mask,
                            RelationVisitor visitor) const;
 
-    /// The `kind` relations of `hash` in the header entries of an overlay that
-    /// may contribute results: files that are themselves open serve
-    /// a buffer-true index through their sessions, and entries of text the
-    /// disk no longer holds point nowhere (clause 2). False once the
-    /// visitor stopped.
+    /// The `kind` relations of `hash` in the entries of a live TU index's
+    /// other files than its main file (an overlay's headers, a buffer's
+    /// imported declarations) that may contribute results: files that are
+    /// themselves open serve a buffer-true index through their sessions,
+    /// and entries of text the disk no longer holds point nowhere (clause
+    /// 2). False once the visitor stopped.
     bool visit_overlay_relations(const TUIndex& state,
                                  SymbolHash hash,
                                  RelationKind kind,
@@ -583,7 +590,7 @@ private:
 /// The comment block immediately preceding the line containing `offset`:
 /// contiguous //- or /*-style lines directly above it, comment markers
 /// stripped. Empty when a blank line or code intervenes. An approximation
-/// of clang's comment attachment, pinned as such by the read-only corpus.
+/// of clang's comment attachment, pinned as such by the index/read_only cases.
 auto preceding_comment(llvm::StringRef content, std::uint32_t offset) -> std::string;
 
 }  // namespace clice::index

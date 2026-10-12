@@ -73,6 +73,16 @@ std::size_t WorkerPool::alive_stateless() const {
     });
 }
 
+std::vector<std::uint32_t> WorkerPool::worker_pids(bool stateful) const {
+    std::vector<std::uint32_t> pids;
+    for(auto& w: stateful ? stateful_workers : stateless_workers) {
+        if(w.state == SlotState::Alive) {
+            pids.push_back(static_cast<std::uint32_t>(w.proc.pid()));
+        }
+    }
+    return pids;
+}
+
 std::size_t WorkerPool::schedulable_stateless() const {
     // A stopped pool serves nothing more, though its slots read Alive until
     // the workers are reaped: a dispatcher counting them would feed its

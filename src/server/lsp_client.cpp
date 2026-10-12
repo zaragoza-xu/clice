@@ -542,6 +542,7 @@ void LSPClient::register_lifecycle() {
 
     peer.on_notification([this]([[maybe_unused]] const protocol::ExitParams& params) {
         LOG_INFO("Exit notification received");
+        this->server.exit_before_shutdown |= !past_shutdown(this->server.lifecycle);
         this->server.schedule_shutdown();
     });
 }
@@ -1286,6 +1287,21 @@ void LSPClient::register_extensions() {
                         co_return to_raw(ext::ReleaseResult{});
                     });
 
+    peer.on_request("clice/internal/watch",
+                    [this](RequestContext& ctx, const ext::WatchParams& params) -> RawResult {
+                        auto& srv = this->server;
+                        if(!srv.test_hooks()) {
+                            co_await kota::fail(hooks_off());
+                        }
+                        auto event = parse_loop_event(params.event);
+                        if(!event) {
+                            co_await kota::fail(kota::ipc::Error{
+                                protocol::ErrorCode::InvalidParams,
+                                R"(a watch names "databaseChange", "diskChange" or "checkpoint")"});
+                        }
+                        co_return to_raw(ext::HoldResult{srv.probe.watch(*event)});
+                    });
+
     peer.on_request("clice/internal/logFlood",
                     [this](RequestContext& ctx, const ext::LogFloodParams& params) -> RawResult {
                         // Load-generating hook: a stray client must not be able to
@@ -1343,6 +1359,8 @@ void LSPClient::register_extensions() {
                 stats.import_scans += served->sched.pcm.import_scans;
                 stats.index_idle = stats.index_idle && served->sched.pump.is_idle();
             }
+            stats.workers = {.stateful = this->server.pool.worker_pids(true),
+                             .stateless = this->server.pool.worker_pids(false)};
             stats.checks_looked = this->server.files.disk.checks.looked;
             stats.checks_trusted = this->server.files.disk.checks.trusted;
             for(auto& entry: this->server.probe.builds) {

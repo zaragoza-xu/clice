@@ -94,7 +94,7 @@ static worker::ArtifactBuildResult finish_artifact(llvm::StringRef label,
                                                    const std::string& tmp_path,
                                                    std::int64_t build_at,
                                                    const auto& deps,
-                                                   std::string errors,
+                                                   llvm::ArrayRef<std::string> errors,
                                                    bool internal_error) {
     worker::ArtifactBuildResult result;
     result.build_at = build_at;
@@ -107,7 +107,11 @@ static worker::ArtifactBuildResult finish_artifact(llvm::StringRef label,
     vfs::remove(tmp_path);
     result.success = false;
     result.has_user_errors = !internal_error && !errors.empty();
-    result.error = errors.empty() ? std::format("{} compilation failed", label) : std::move(errors);
+    result.error =
+        errors.empty() ? std::format("{} compilation failed", label) : llvm::join(errors, "; ");
+    if(result.has_user_errors) {
+        result.first_error = errors.front();
+    }
     return result;
 }
 
@@ -140,7 +144,7 @@ static worker::ArtifactBuildResult handle_build_pch(const worker::BuildPCHParams
     bool success = unit.completed() && !stop->load(std::memory_order_relaxed);
     auto build_at = unit.build_at().count();
 
-    std::string errors;
+    std::vector<std::string> errors;
     if(!success)
         errors = collect_errors(unit);
 
@@ -167,7 +171,7 @@ static worker::ArtifactBuildResult handle_build_pch(const worker::BuildPCHParams
         if(auto error = write_preamble_index(blob, params.index_output_path)) {
             success = false;
             internal_error = true;
-            errors = std::move(*error);
+            errors = {std::move(*error)};
         }
     }
     auto state_write_ms = state_write_timer.ms();
@@ -184,14 +188,17 @@ static worker::ArtifactBuildResult handle_build_pch(const worker::BuildPCHParams
                  state_write_ms,
                  timer.ms());
     } else {
-        LOG_WARN("BuildPCH failed: file={}, {}ms, errors=[{}]", params.file, timer.ms(), errors);
+        LOG_WARN("BuildPCH failed: file={}, {}ms, errors=[{}]",
+                 params.file,
+                 timer.ms(),
+                 llvm::join(errors, "; "));
     }
     return finish_artifact("PCH",
                            success,
                            *output,
                            build_at,
                            pch_info.deps,
-                           std::move(errors),
+                           errors,
                            internal_error);
 }
 
@@ -218,7 +225,7 @@ static worker::ArtifactBuildResult handle_build_pcm(const worker::BuildPCMParams
     bool success = unit.completed() && !stop->load(std::memory_order_relaxed);
     auto build_at = unit.build_at().count();
 
-    std::string errors;
+    std::vector<std::string> errors;
     if(!success)
         errors = collect_errors(unit);
 
@@ -241,14 +248,14 @@ static worker::ArtifactBuildResult handle_build_pcm(const worker::BuildPCMParams
         LOG_WARN("BuildPCM failed: module={}, {}ms, errors=[{}]",
                  params.module_name,
                  timer.ms(),
-                 errors);
+                 llvm::join(errors, "; "));
     }
     return finish_artifact("PCM",
                            success,
                            *output,
                            build_at,
                            pcm_info.deps,
-                           std::move(errors),
+                           errors,
                            /*internal_error=*/false);
 }
 
@@ -324,16 +331,24 @@ static void collect_tidy_diagnostics(CompilationUnitRef unit,
         if(!start) {
             continue;
         }
+        // clang-tidy's name for a compiler error: its warning's, for one
+        // -Werror raises.
+        std::string check(raw.id.name);
+        if(clang_error) {
+            auto option =
+                unit.context().getDiagnostics().getDiagnosticIDs()->getWarningOptionForDiag(
+                    raw.id.value);
+            check = std::format("clang-diagnostic-{}", option.empty() ? "error" : option);
+        }
         out.push_back({
             .file = std::string(file),
             .line = start->line + 1,
             .column = start->character + 1,
             .error =
                 raw.id.level == DiagnosticLevel::Error || raw.id.level == DiagnosticLevel::Fatal,
+            .compiler_error = clang_error,
             .message = raw.message,
-            // clang-tidy's name for compiler errors; plain errors carry no
-            // warning-option name of their own.
-            .check = clang_error ? "clang-diagnostic-error" : std::string(raw.id.name),
+            .check = std::move(check),
         });
         last_kept = true;
     }
@@ -473,7 +488,7 @@ static kota::codec::RawValue handle_signature_help(const worker::SignatureHelpPa
     return to_raw(help);
 }
 
-static kota::codec::RawValue handle_format(const worker::FormatParams& params) {
+static worker::FormatResult handle_format(const worker::FormatParams& params) {
     ScopedTimer timer;
 
     std::optional<LocalSourceRange> range;
@@ -482,9 +497,12 @@ static kota::codec::RawValue handle_format(const worker::FormatParams& params) {
     }
 
     auto edits = feature::document_format(params.file, params.text, range);
-    LOG_DEBUG("Format done: {} edits, {}ms", edits.size(), timer.ms());
-
-    return to_raw(edits);
+    if(!edits) {
+        LOG_DEBUG("Format failed: {}", edits.error());
+        return {.error = std::move(edits.error())};
+    }
+    LOG_DEBUG("Format done: {} edits, {}ms", edits->size(), timer.ms());
+    return {.edits = std::move(*edits)};
 }
 
 /// How serve() runs a request's work.
@@ -591,7 +609,7 @@ int run_stateless_worker_mode(const std::string& worker_name, const std::string&
     serve<worker::SignatureHelpParams>(peer, cancelled_query, &handle_signature_help);
     serve<worker::FormatParams>(
         peer,
-        cancelled_query,
+        worker::FormatResult{},
         [](const worker::FormatParams& params, const std::shared_ptr<std::atomic_bool>&) {
             return handle_format(params);
         });

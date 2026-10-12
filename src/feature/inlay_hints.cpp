@@ -10,6 +10,7 @@ import :feature.feature;
 import :index.tu_index;
 import :index.types;
 import :semantic.decls;
+import :semantic.designators;
 import :semantic.display;
 import :semantic.resolver;
 import :semantic.types;
@@ -652,15 +653,13 @@ private:
         if(!pattern) {
             return param;
         }
-        // A pack expands to any number of parameters: past it, indices
-        // part ways.
-        auto index = param->getFunctionScopeIndex();
-        auto patterns = pattern->parameters().take_front(index + 1);
-        if(patterns.size() <= index ||
-           llvm::any_of(patterns, [](const auto* each) { return each->isParameterPack(); })) {
-            return param;
-        }
-        return patterns.back();
+        // A pack expands to any number of parameters, so past it indices
+        // part ways; an instantiated parameter keeps the location of the
+        // one it was written as, the parameters of a pack all the pack's.
+        auto written = llvm::find_if(pattern->parameters(), [&](const auto* each) {
+            return each->getLocation() == param->getLocation();
+        });
+        return written == pattern->parameters().end() ? param : *written;
     }
 
     /// Append a piece, merging plain text into the plain text before it.
@@ -789,7 +788,7 @@ private:
     /// for the `1` in `Point{1}`. Explicitly written designators and inits
     /// already carrying a `/*name=*/` comment stay bare.
     void add_designators(const clang::InitListExpr* syntactic) {
-        auto designators = clang::tidy::utils::getUnwrittenDesignators(syntactic);
+        auto designators = designators::unwritten(syntactic);
         for(const clang::Expr* init: syntactic->inits()) {
             if(llvm::isa<clang::DesignatedInitExpr>(init)) {
                 continue;
@@ -1211,7 +1210,7 @@ private:
         // the outermost list is the *semantic* form. Designators attach to the
         // syntactic form — the written one, which may have subobject
         // initializers inlined without braces where the semantic form has
-        // nested init-lists. getUnwrittenDesignators will look at the semantic
+        // nested init-lists. designators::unwritten looks at the semantic
         // form to determine the labels.
         if(const auto* syntactic = expr->getSyntacticForm()) {
             expr = syntactic;

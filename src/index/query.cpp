@@ -339,10 +339,14 @@ void IndexQuery::for_each_relation(SymbolHash hash,
         if(!mask.overlay || !live) {
             return true;
         }
-        live->each_overlay([&](const TUIndex& state) {
+        auto visit = [&](const TUIndex& state) {
             stopped = !visit_overlay_relations(state, hash, kind, visitor);
             return !stopped;
-        });
+        };
+        live->each_overlay(visit);
+        if(!stopped) {
+            live->each_session_index(visit);
+        }
         return !stopped;
     };
 
@@ -828,10 +832,37 @@ std::vector<IndexQuery::PlacedHighlight>
     return result;
 }
 
-std::vector<Site> IndexQuery::target_sites(SymbolHash hash, Fid anchor, RelationKind kind) const {
+std::vector<Site> IndexQuery::type_definition(const Cursor& cursor, SymbolHash symbol) const {
+    auto anchor = cursor.site.file;
+    llvm::SmallVector<Target> found;
+    if(auto source = serving(anchor)) {
+        source->shard->lookup(symbol, RelationKind::TypeDefinition, [&](const Relation& relation) {
+            if(relation.range.contains(cursor.site.range)) {
+                found.push_back({.symbol = relation.target_symbol, .anchor = anchor});
+            }
+            return true;
+        });
+    }
+    if(found.empty()) {
+        llvm::DenseSet<SymbolHash> seen;
+        for_each_relation(
+            symbol,
+            anchor,
+            RelationKind::TypeDefinition,
+            Order::DiskFirst,
+            {.preamble = false},
+            [&](const IndexSource& source, const Relation& relation) {
+                if(!relation.range.valid() && seen.insert(relation.target_symbol).second) {
+                    found.push_back({.symbol = relation.target_symbol, .anchor = source.file});
+                }
+                return true;
+            });
+    }
     std::vector<Site> result;
-    for(auto& located: located_targets(hash, anchor, kind)) {
-        result.push_back(located.site);
+    for(auto target: found) {
+        if(auto located = resolve(target.symbol, target.anchor)) {
+            result.push_back(std::move(located->site));
+        }
     }
     return result;
 }
@@ -869,7 +900,11 @@ std::vector<Site> IndexQuery::implementation(SymbolHash hash, Fid anchor) const 
     }
     if(info->kind == SymbolKind::Class || info->kind == SymbolKind::Struct ||
        info->kind == SymbolKind::Union) {
-        return target_sites(hash, anchor, RelationKind::Derived);
+        std::vector<Site> result;
+        for(auto& located: located_targets(hash, anchor, RelationKind::Derived)) {
+            result.push_back(std::move(located.site));
+        }
+        return result;
     }
     // An override that only declares — a pure virtual of an abstract
     // intermediate class — is listed, and its own overriders after it.
@@ -907,17 +942,28 @@ std::optional<llvm::StringRef>
     return disk_text(source.path, *source.shard, storage);
 }
 
-std::optional<IndexQuery::Definition> IndexQuery::definition_text(SymbolHash hash,
-                                                                  Fid anchor) const {
+std::optional<IndexQuery::DeclaredText> IndexQuery::definition_text(SymbolHash hash,
+                                                                    Fid anchor) const {
+    return declared_text(hash, anchor, RelationKind::Definition);
+}
+
+std::optional<IndexQuery::DeclaredText> IndexQuery::declaration_text(SymbolHash hash,
+                                                                     Fid anchor) const {
+    return declared_text(hash, anchor, RelationKind::Declaration);
+}
+
+std::optional<IndexQuery::DeclaredText> IndexQuery::declared_text(SymbolHash hash,
+                                                                  Fid anchor,
+                                                                  RelationKind kind) const {
     // Live sources first: buffer-true indexes also know symbols the project
     // table has never seen (an unsaved definition), the preamble region
     // holds the buffer's own macros, and an overlay is the only source for
-    // a header seen under the live context. The first in-bounds Definition
-    // payload whose text is available wins.
-    std::optional<Definition> found;
+    // a header seen under the live context. The first in-bounds payload
+    // whose text is available wins.
+    std::optional<DeclaredText> found;
     for_each_relation(hash,
                       anchor,
-                      RelationKind::Definition,
+                      kind,
                       Order::LiveFirst,
                       {},
                       [&](const IndexSource& source, const Relation& relation) {
@@ -931,7 +977,7 @@ std::optional<IndexQuery::Definition> IndexQuery::definition_text(SymbolHash has
                               return true;
                           }
                           auto range = extent->range;
-                          found = Definition{
+                          found = DeclaredText{
                               .extent = *extent,
                               .text = std::string(text->substr(range.begin, range.length())),
                               .comment = preceding_comment(*text, range.begin),
@@ -1262,7 +1308,8 @@ std::vector<IndexQuery::Located> IndexQuery::locate(const SymbolQuery& query) co
     }
     // Spelling the name exactly decides it; otherwise every match stands.
     // A class and its constructors spell one name: asked by it, the class
-    // answers.
+    // answers. So does a template asked by its bare name: a specialization
+    // is named with its arguments.
     llvm::DenseSet<SymbolHash> exact;
     for(auto& hit: ranked.hits) {
         if(hit.rank.tier <= 1) {
@@ -1278,45 +1325,17 @@ std::vector<IndexQuery::Located> IndexQuery::locate(const SymbolQuery& query) co
            exact.contains(hit.symbol.parent)) {
             continue;
         }
+        if(query.args.empty() && has_flag(hit.symbol.flags, SymbolFlags::Specialization) &&
+           llvm::any_of(targets(hit.symbol.hash, hit.anchor, RelationKind::Primary),
+                        [&](const Target& primary) { return exact.contains(primary.symbol); })) {
+            continue;
+        }
         if(auto placed = canonical_placed(hit.symbol.hash, hit.anchor)) {
             results.push_back(
                 {.symbol = std::move(hit.symbol), .site = placed->site, .extent = placed->extent});
         }
     }
     return results;
-}
-
-std::vector<IndexQuery::Located> IndexQuery::definitions_in(Fid file) const {
-    auto source = serving(file);
-    if(!source) {
-        return {};
-    }
-    // The relations themselves say what is defined in the file, in shard order:
-    // the project table's symbols and the file's internal ones — a
-    // function's locals are no part of it.
-    std::vector<Located> result;
-    source->shard->for_each_relation([&](SymbolHash hash, const Relation& r) {
-        if(r.kind != RelationKind::Definition) {
-            return true;
-        }
-        auto identity = index.identity_of(hash);
-        if(!identity) {
-            identity = source->shard->find_symbol(hash);
-            if(identity && identity->scope != SymbolScope::TULocal) {
-                return true;
-            }
-        }
-        if(!identity || identity->name.empty()) {
-            return true;
-        }
-        if(auto site = source->site(r.range)) {
-            result.push_back({.symbol = SymbolRef::from(hash, *identity),
-                              .site = *site,
-                              .extent = extent_of(*source, r).value_or(*site)});
-        }
-        return true;
-    });
-    return result;
 }
 
 std::vector<IncludeEdge> IndexQuery::include_edges(Fid file) const {

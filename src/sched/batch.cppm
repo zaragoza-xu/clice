@@ -4,6 +4,7 @@ module;
 
 module clice:sched.batch;
 
+import :config.config;
 import :worker.protocol;
 
 namespace clice {
@@ -22,8 +23,12 @@ struct BatchOptions {
     /// under this spelling.
     Spelling root;
 
-    /// The build configuration to activate (`--configuration`); empty
-    /// takes the persisted selection, else the default.
+    /// The workspace's configuration, as the command loaded it.
+    Config config;
+
+    /// The build configuration to activate (`--configuration`), one
+    /// `config` declares (check_requested_configuration); empty takes the
+    /// persisted selection, else the default.
     std::string configuration;
 
     /// Stateless worker count override; 0 keeps the config's values.
@@ -86,8 +91,12 @@ struct BatchLintOptions {
     /// under this spelling.
     Spelling root;
 
-    /// The build configuration to activate (`--configuration`); empty
-    /// takes the persisted selection, else the default.
+    /// The workspace's configuration, as the command loaded it.
+    Config config;
+
+    /// The build configuration to activate (`--configuration`), one
+    /// `config` declares (check_requested_configuration); empty takes the
+    /// persisted selection, else the default.
     std::string configuration;
 
     /// Stateless worker count override; 0 keeps the config's values.
@@ -138,13 +147,11 @@ struct BatchFormatOptions {
     /// file is formatted whether or not the build knows it.
     std::vector<Spelling> paths;
 
-    /// The clang-format executable: a name looked up in PATH, or a path.
-    std::string clang_format = "clang-format";
-
-    /// Concurrent clang-format processes; 0 takes the hardware concurrency.
+    /// Files formatted at once, each on a thread; 0 takes the hardware
+    /// concurrency.
     std::uint32_t jobs = 0;
 
-    /// Report the files clang-format would change instead of rewriting
+    /// Report the files formatting would change instead of rewriting
     /// them.
     bool check = false;
 };
@@ -152,16 +159,17 @@ struct BatchFormatOptions {
 struct BatchFormatResult {
     /// 0 = every file formatted (or, with --check, nothing to change),
     /// 1 = --check found files to format, 2 = the run could not complete:
-    /// the configuration is invalid, clang-format was not found or failed.
+    /// the configuration is invalid, a file's style could not be read, a
+    /// file could not be read or written.
     int exit_code = 0;
 
-    /// Files handed to clang-format.
+    /// Files formatted or checked.
     std::size_t files = 0;
 
-    /// --check: the files clang-format would change, sorted.
+    /// --check: the files formatting would change, sorted.
     std::vector<std::string> unformatted;
 
-    /// What clang-format wrote to stderr, for the user.
+    /// --check: where each of them needs formatting, for the user.
     std::string output;
 
     /// Why the run could not complete, for the user; empty otherwise.
@@ -170,11 +178,11 @@ struct BatchFormatResult {
     double seconds = 0;
 };
 
-/// Format the workspace with clang-format: load the build, take its own
-/// files (the translation units and the workspace files they include,
-/// outside the build trees and the commands' system include directories,
-/// no rule saying `format = false`), and run one clang-format process per
-/// chunk of them, `jobs` at a time.
+/// Format the workspace as the editor formats a document: load the build,
+/// take its own files (the translation units and the workspace files they
+/// include, outside the build trees and the commands' system include
+/// directories, no rule saying `format = false`), and format them in
+/// process, `jobs` at a time.
 BatchFormatResult run_batch_format(const BatchFormatOptions& options);
 
 /// Lint the workspace through TURun {tidy} (or {index, tidy}): bootstrap,

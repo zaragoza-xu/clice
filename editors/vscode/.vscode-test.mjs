@@ -6,16 +6,24 @@ import { fileURLToPath } from "url";
 const extensionRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(extensionRoot, "../..");
 
-// Each fixture under tests/data becomes one test run with that workspace.
-// Run tests/tools/prepare.py first to generate compile databases.
+// Each fixture, a copy of a case under .cache/editors, becomes one test run
+// with that workspace. `pixi run -e editor editor-prepare` makes the copies.
 // Keep in sync with the editor tasks in pixi.toml.
-const fixtures = ["hello_world", "modules/hover_on_imported_symbol", "header_context"];
+const fixturesDir = path.join(repoRoot, ".cache", "editors");
+const fixtures = ["hello_world", "imported_symbol", "two_hosts"];
+
+// The fixtures' databases name a bare clang++, which the server resolves on
+// the PATH the task set: xclang's. VS Code would replace that PATH with the
+// login shell's, which macOS's path_helper starts with /usr/bin, and Apple's
+// clang++ has no C++20 modules.
+const keepEnv = "--force-disable-user-env";
 
 const configs = fixtures.map((fixture) => ({
     label: fixture,
     files: "out/test/**/*.test.js",
-    workspaceFolder: path.join(repoRoot, "tests/data", fixture),
+    workspaceFolder: path.join(fixturesDir, fixture),
     mocha: { timeout: 300 * 1000 },
+    launchArgs: [keepEnv],
 }));
 
 // Stage the real server under clice/ so it looks like a platform-specific vsix
@@ -52,13 +60,14 @@ if (process.env.CLICE_EXECUTABLE) {
     configs.push({
         label: "bundled-hello_world",
         files: "out/test/**/*.test.js",
-        workspaceFolder: path.join(repoRoot, "tests/data", "hello_world"),
+        workspaceFolder: path.join(fixturesDir, "hello_world"),
         mocha: { timeout: 300 * 1000 },
         env: {
             CLICE_EXECUTABLE: "",
             CLICE_E2E_BUNDLED_FROM: process.env.CLICE_EXECUTABLE,
         },
         launchArgs: [
+            keepEnv,
             "--user-data-dir",
             path.join(extensionRoot, ".vscode-test", "user-data-bundled"),
         ],

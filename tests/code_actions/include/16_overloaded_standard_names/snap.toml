@@ -1,0 +1,25 @@
+[[answers.move.code_actions]]
+kind = "quickfix"
+title = "Add #include <utility>"
+
+[answers.move.code_actions.edits]
+"main.cpp" = '''
+
+ #include "config.h"
++#include <utility>
+
+ struct Box {};
+'''
+
+[[answers.size_t.code_actions]]
+kind = "quickfix"
+title = "Add #include <cstddef>"
+
+[answers.size_t.code_actions.edits]
+"main.cpp" = '''
+
+ #include "config.h"
++#include <cstddef>
+
+ struct Box {};
+'''

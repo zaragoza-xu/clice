@@ -1,0 +1,8 @@
+[answers.const_member_function.completion]
+items = [
+    { label = "template", kind = "Keyword" },
+    { label = "view()", kind = "Method", detail = "void" },
+]
+
+[answers.unbindable_object.completion]
+items = []

@@ -5,12 +5,11 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { parse, printParseErrorCode, type ParseError } from "jsonc-parser";
-import { parseAnnotations } from "../../snap/annotation.ts";
+import { REPO_ROOT } from "../../repo.ts";
+import { parseAnnotations } from "./annotation.ts";
 
-export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-export const CASES_DIR = path.join(REPO_ROOT, "tests-next");
+export const CASES_DIR = path.join(REPO_ROOT, "tests");
 
 export type UnitArgs = string[] | string[][];
 
@@ -31,7 +30,7 @@ export const RESERVED = new Set([
     "project.jsonc",
     "test.ts",
     "README.md",
-    "output.snap",
+    "snap.toml",
     "trace.jsonl",
 ]);
 

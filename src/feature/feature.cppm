@@ -429,9 +429,14 @@ auto selection_range_to_protocol(llvm::ArrayRef<LocalSourceRange> ranges,
                                  const PositionMap& map,
                                  PositionEncoding encoding) -> protocol::SelectionRange;
 
+/// The outline of the main file, a `#define` in it only outside the
+/// inactive regions. The overload without a regions argument scans the
+/// unit itself — correct only for units compiled without a PCH, as with
+/// semantic_tokens.
 auto document_symbols(CompilationUnitRef unit) -> std::vector<DocumentSymbol>;
-auto document_symbols(CompilationUnitRef unit, PositionEncoding encoding)
-    -> std::vector<protocol::DocumentSymbol>;
+auto document_symbols(CompilationUnitRef unit,
+                      llvm::ArrayRef<std::uint32_t> inactive_regions,
+                      PositionEncoding encoding) -> std::vector<protocol::DocumentSymbol>;
 
 auto document_symbols_to_protocol(llvm::ArrayRef<DocumentSymbol> symbols,
                                   const PositionMap& map,
@@ -516,11 +521,13 @@ auto hover(CompilationUnitRef unit,
 auto signature_help(CompilationParams& params, const SignatureHelpOptions& options = {})
     -> protocol::SignatureHelp;
 
+/// The edits formatting `content`, or its `range`, with the clang-format
+/// style of `file`: the nearest `.clang-format` above it, else LLVM's. Why
+/// that style cannot be read otherwise.
 auto document_format(llvm::StringRef file,
                      llvm::StringRef content,
-                     std::optional<LocalSourceRange> range,
-                     PositionEncoding encoding = PositionEncoding::UTF16)
-    -> std::vector<protocol::TextEdit>;
+                     std::optional<LocalSourceRange> range = std::nullopt)
+    -> std::expected<std::vector<TextReplacement>, std::string>;
 
 /// One kind per refactoring, below the standard `refactor.rewrite` and
 /// `refactor.inline`, so that a client can ask for one alone: an editor
@@ -645,7 +652,7 @@ auto format_snippet(llvm::StringRef file, llvm::StringRef text) -> std::string;
 /// narrow resolvers, never index storage — the caller extracts entries from
 /// shard/ProjectIndex and hands them over. Each projection's output is an
 /// honest subset of its AST twin's: missing pieces (Sema modifiers, outline
-/// detail, statement folds, ...) are pinned by the read-only test corpus.
+/// detail, statement folds, ...) are pinned by the index/read_only cases.
 
 /// One Decl/Def relation of the document: the name-token anchor, the
 /// declaration's full extent (invalid when the index recorded none — a
@@ -700,6 +707,19 @@ auto index_semantic_tokens(llvm::StringRef content,
 /// navigation surfaces layer their own policy for the kinds whose display
 /// differs (see to_lsp::symbol_kind).
 auto to_protocol_symbol_kind(SymbolKind kind) -> protocol::SymbolKind;
+
+/// One declaration the outline lists: its symbol, its whole extent and the
+/// name within it.
+struct IndexOutlineEntry {
+    index::SymbolRef symbol;
+    LocalSourceRange range;
+    LocalSourceRange selection_range;
+};
+
+/// The declarations an outline lists, one per symbol and extent, in source
+/// order: a declaration before the ones its extent holds.
+auto index_outline(llvm::ArrayRef<IndexDecl> decls, IndexSymbolResolver resolve)
+    -> std::vector<IndexOutlineEntry>;
 
 /// Outline tree built from declaration extents by range containment;
 /// extents that merely overlap (macro-generated siblings collapse onto one

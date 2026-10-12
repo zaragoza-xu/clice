@@ -1,0 +1,11 @@
+[answers.method]
+definition = ["virtual void ⟦refresh⟧() = 0;"]
+
+[answers.function]
+definition = ["int ⟦probe⟧(int value);"]
+
+[answers.variable]
+definition = ["extern int ⟦threshold⟧;"]
+
+[answers.constant]
+definition = ["static const int ⟦margin⟧ = 4;"]

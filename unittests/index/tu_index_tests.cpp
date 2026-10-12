@@ -323,6 +323,24 @@ ZEST_CASE(ClassTemplate) {
     GO_TO_DEFINITION("implicit_full", "full_spec");
 }
 
+ZEST_CASE(InheritedConstructorCall) {
+    build_index(R"(
+            struct Base {
+                §(base)⟦Base⟧(int x) {}
+            };
+            struct Derived : Base {
+                using Base::Base;
+            };
+            void build() {
+                Derived d §(paren)(3);
+                Derived e §(brace){4};
+            }
+        )");
+
+    GO_TO_DEFINITION("paren", "base");
+    GO_TO_DEFINITION("brace", "base");
+}
+
 ZEST_CASE(FunctionTemplate) {
     build_index(R"(
             template <typename T> void §(primary_decl)foo();
@@ -786,11 +804,38 @@ ZEST_CASE(TypeDefinitionRelations) {
             using §(alias)⟦§(alias)Alias⟧ = S;
 
             enum §(e)⟦§(e)E⟧ { §(ec)⟦§(ec)A⟧ };
+
+            S §(make)⟦§(make)make⟧();
         )");
 
     ZASSERT(has_pair("field", RelationKind::TypeDefinition, "s"));
     ZASSERT(has_pair("alias", RelationKind::TypeDefinition, "s"));
     ZASSERT(has_pair("ec", RelationKind::TypeDefinition, "e"));
+    ZASSERT(has_pair("make", RelationKind::TypeDefinition, "s"));
+}
+
+ZEST_CASE(SpecializedMemberType) {
+    build_index(R"(
+            struct §(widget)Widget {};
+
+            template <typename T>
+            struct Box {
+                T §(value)value;
+            };
+
+            Widget read(Box<Widget>& box) { return box.§(use)⟦§(use)value⟧; }
+        )");
+
+    // At a name of the member in Box<Widget>, a relation spanning the name
+    // gives the type the member has there.
+    auto& relations = tu_index.main_file_index.relations;
+    auto it = relations.find(select("value").front().target);
+    ZASSERT(it != relations.end());
+    auto widget = select("widget").front().target;
+    ZASSERT(llvm::any_of(it->second, [&](const index::Relation& relation) {
+        return relation.kind == RelationKind::TypeDefinition && relation.range == range("use") &&
+               relation.target_symbol == widget;
+    }));
 }
 
 ZEST_CASE(ConstructorDestructorRelations) {
@@ -1033,6 +1078,49 @@ int main() {
     auto occs = select("use");
     ZASSERT(!occs.empty());
     ZEXPECT(occs.front().target == symbol_named("make").first);
+}
+
+ZEST_CASE(ImportedDeclarationsNamed) {
+    add_files("main.cpp", R"(
+#[widget.h]
+struct Widget {
+    int value;
+};
+
+#[foo.cppm]
+module;
+#include "widget.h"
+export module foo;
+export Widget make();
+export struct Point {
+    int x;
+};
+export int unused();
+
+#[main.cpp]
+import foo;
+
+int main() {
+    return make().value + Point{1}.x;
+}
+)");
+    ZASSERT(compile_with_modules());
+    decode_index(index::build_tu_index(*unit, {.main_file_only = true}));
+
+    // The main file's index declares what it names from the module, in the
+    // module's file; the header behind the module is the module's to index.
+    ZASSERT(tu_index.file_indices.size() == 1U);
+    auto& [path_id, module_index] = tu_index.file_indices.front();
+    ZEXPECT(tu_index.view.path(path_id).ends_with("foo.cppm"));
+    ZEXPECT(module_index.relations.size() == 3U);
+    auto& make = module_index.relations[symbol_named("make").first];
+    ZASSERT(make.size() == 1U);
+    ZEXPECT(make.front().kind == RelationKind::Declaration);
+    for(auto name: {"Point", "x"}) {
+        auto& defined = module_index.relations[symbol_named(name).first];
+        ZASSERT(defined.size() == 1U);
+        ZEXPECT(defined.front().kind == RelationKind::Definition);
+    }
 }
 
 ZEST_CASE(ImplementationUnitReference) {
@@ -2313,7 +2401,7 @@ ZEST_CASE(SynthesizedCallsKeepRelations) {
                 {"s",                SymbolKind::Variable,  {RelationKind::Definition}                     },
                 {"__builtin_invoke",
                  SymbolKind::Method,
-                 {RelationKind::Reference, RelationKind::Caller}                                           },
+                 {RelationKind::Reference, RelationKind::TypeDefinition, RelationKind::Caller}             },
                 {"S",                SymbolKind::Struct,    {RelationKind::Reference}                      },
                 {"func",             SymbolKind::Method,    {RelationKind::Reference}                      },
                 {"std",              SymbolKind::Namespace, {RelationKind::Reference}                      },

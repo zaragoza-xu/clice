@@ -1,0 +1,50 @@
+[[answers.initialized.code_actions]]
+kind = "refactor.rewrite.generateMemberwiseConstructor"
+title = "Generate a memberwise constructor for 'Settings'"
+compiles = true
+
+[answers.initialized.code_actions.edits]
+"main.cpp" = '''
+     int timeout;
+     static int instances;
++    Settings(int retries, int timeout) : retries(retries), timeout(timeout) {}
+ };
+'''
+
+[[answers.bit_fields.code_actions]]
+kind = "refactor.rewrite.generateMemberwiseConstructor"
+title = "Generate a memberwise constructor for 'Flags'"
+compiles = true
+
+[answers.bit_fields.code_actions.edits]
+"main.cpp" = '''
+     unsigned visible : 1;
+     unsigned level : 7;
++    Flags(unsigned int visible, unsigned int level) : visible(visible), level(level) {}
+ };
+'''
+
+[[answers.template_fields.code_actions]]
+kind = "refactor.rewrite.generateMemberwiseConstructor"
+title = "Generate a memberwise constructor for 'Range'"
+compiles = true
+
+[answers.template_fields.code_actions.edits]
+"main.cpp" = '''
+ // by value and moved from. An array field or an anonymous union offers no
+ // constructor.
++#include <utility>
+
+ struct Settings {
+…
+     T first;
+     T last;
++    Range(T first, T last) : first(std::move(first)), last(std::move(last)) {}
+ };
+'''
+
+[answers.array]
+code_actions = []
+
+[answers.anonymous_union]
+code_actions = []

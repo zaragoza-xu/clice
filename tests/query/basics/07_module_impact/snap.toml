@@ -1,0 +1,97 @@
+[test."$ clice index"]
+stdout = '''
+Indexed 4 translation units in #s: 6 file shards (# KB), 6 symbols.
+Session log: ${WS}/.clice/logs/${SESSION}
+'''
+exit = 0
+
+[test."$ clice query --method impactAnalysis --path base.h"]
+stdout = '''
+{
+  "result": {
+    "directDependents": [
+      "${WS}/shapes.cppm",
+      "${WS}/mid.h"
+    ],
+    "transitiveDependents": [
+      "${WS}/mid.cpp",
+      "${WS}/main.cpp",
+      "${WS}/use.cpp"
+    ],
+    "affectedModules": [
+      "shapes"
+    ]
+  },
+  "stale": []
+}
+'''
+exit = 0
+
+[test."$ clice query --method impactAnalysis --path shapes.cppm"]
+stdout = '''
+{
+  "result": {
+    "directDependents": [],
+    "transitiveDependents": [
+      "${WS}/use.cpp"
+    ],
+    "affectedModules": [
+      "shapes"
+    ]
+  },
+  "stale": []
+}
+'''
+exit = 0
+
+[test."$ clice query --method fileDeps --path base.h --direction includers --depth 0"]
+stdout = '''
+{
+  "result": {
+    "file": "${WS}/base.h",
+    "includes": [],
+    "includers": [
+      {
+        "path": "${WS}/shapes.cppm",
+        "depth": 1
+      },
+      {
+        "path": "${WS}/mid.h",
+        "depth": 1
+      },
+      {
+        "path": "${WS}/main.cpp",
+        "depth": 2
+      },
+      {
+        "path": "${WS}/mid.cpp",
+        "depth": 2
+      }
+    ]
+  },
+  "stale": []
+}
+'''
+exit = 0
+
+[test."$ clice query --method fileDeps --path main.cpp --direction includes --depth 0"]
+stdout = '''
+{
+  "result": {
+    "file": "${WS}/main.cpp",
+    "includes": [
+      {
+        "path": "${WS}/mid.h",
+        "depth": 1
+      },
+      {
+        "path": "${WS}/base.h",
+        "depth": 2
+      }
+    ],
+    "includers": []
+  },
+  "stale": []
+}
+'''
+exit = 0

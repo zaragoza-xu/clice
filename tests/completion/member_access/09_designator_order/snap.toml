@@ -1,0 +1,17 @@
+[answers.order.completion]
+items = [
+    { label = "width", kind = "Field", detail = "int" },
+    { label = "height", kind = "Field", detail = "int" },
+    { label = "fullscreen", kind = "Field", detail = "bool" },
+]
+
+[answers.after_width.completion]
+items = [
+    { label = "height", kind = "Field", detail = "int" },
+    { label = "fullscreen", kind = "Field", detail = "bool" },
+]
+
+[answers.after_height.completion]
+items = [
+    { label = "fullscreen", kind = "Field", detail = "bool" },
+]

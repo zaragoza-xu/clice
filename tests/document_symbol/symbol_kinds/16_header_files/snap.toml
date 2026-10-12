@@ -1,0 +1,31 @@
+[answers.outline]
+document_symbols = [
+    { name = "WIDGET_H", kind = "Constant", at = "#define ⟦WIDGET_H⟧" },
+    { name = "WIDGET_LIMIT", kind = "Constant", at = "#define ⟦WIDGET_LIMIT⟧ 8" },
+    {
+        name = "Widget",
+        kind = "Struct",
+        at = "struct ⟦Widget⟧ {",
+        detail = "struct",
+        children = [
+            { name = "size", kind = "Field", at = "int ⟦size⟧;", detail = "int" },
+        ],
+    },
+    { name = "widget_count", kind = "Function", at = "int ⟦widget_count⟧();", detail = "int ()" },
+]
+
+[answers.extents]
+document_symbols = [
+    { name = "WIDGET_H", kind = "Constant", at = "#define ⟦WIDGET_H⟧", range = "#define ⟦WIDGET_H⟧" },
+    { name = "WIDGET_LIMIT", kind = "Constant", at = "#define ⟦WIDGET_LIMIT⟧ 8", range = "#define ⟦WIDGET_LIMIT 8⟧" },
+    {
+        name = "Widget",
+        kind = "Struct",
+        at = "struct ⟦Widget⟧ {",
+        range = "⟦struct Widget { … }⟧ (3 lines)",
+        children = [
+            { name = "size", kind = "Field", at = "int ⟦size⟧;", range = "⟦int size⟧;" },
+        ],
+    },
+    { name = "widget_count", kind = "Function", at = "int ⟦widget_count⟧();", range = "⟦int widget_count()⟧;" },
+]

@@ -1,11 +1,10 @@
 module;
 
 #include "modules/prelude.h"
-/// What each code action renders is pinned by the snapshot corpus
-/// (tests/snap/code_action/); these cases apply one action and compile the
-/// result, which the corpus cannot: the edited file must be the expected
-/// text, compile cleanly and, for a definition, define the function the
-/// action was offered on.
+/// What each code action renders is pinned by the cases
+/// (tests/code_actions/); these tests apply one action and compile the
+/// result: the edited file must be the expected text, compile cleanly and,
+/// for a definition, define the function the action was offered on.
 
 module clice;
 
@@ -1114,6 +1113,69 @@ void Widget::draw(int scale) {
         apply("d", "Define missing members of 'Widget'");
         EXPECT_APPENDED(expected);
     }
+}
+
+ZEST_CASE(StandardNamesFromPreamble) {
+    llvm::StringRef code = R"(
+#[cstddef.h]
+#pragma once
+namespace std {
+using size_t = decltype(sizeof 0);
+}
+#[main.cpp]
+#include "cstddef.h"
+
+§(size)auto size = sizeof(int);
+)";
+    for(bool pch: {true, false}) {
+        clear();
+        add_files("main.cpp", code);
+        ZASSERT((pch ? compile_with_pch("-std=c++23") : compile("-std=c++23")));
+        apply("size", "Replace 'auto' with 'std::size_t'");
+        EXPECT_COMPILES(R"(#include "cstddef.h"
+
+std::size_t size = sizeof(int);
+)");
+    }
+}
+
+ZEST_CASE(OverridesKeepAccess) {
+    run(R"(
+class Base {
+public:
+    virtual void run() = 0;
+
+protected:
+    virtual void prepare() = 0;
+
+private:
+    virtual void step() = 0;
+};
+struct §(d)Derived : Base {
+    int state;
+};
+)");
+    apply("d", "Implement pure virtual methods of 'Derived'");
+    EXPECT_COMPILES(R"(
+class Base {
+public:
+    virtual void run() = 0;
+
+protected:
+    virtual void prepare() = 0;
+
+private:
+    virtual void step() = 0;
+};
+struct Derived : Base {
+    int state;
+    void run() override;
+protected:
+    void prepare() override;
+private:
+    void step() override;
+};
+)");
 }
 
 };  // ZEST_SUITE(code_action)

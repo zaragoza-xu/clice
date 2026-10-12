@@ -1,0 +1,6 @@
+["exit without shutdown"."exit code"]
+value = 1
+
+[SIGTERM.exit]
+code = 0
+signal = ""

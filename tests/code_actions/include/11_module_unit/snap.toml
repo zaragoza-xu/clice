@@ -1,0 +1,14 @@
+[[answers.string.code_actions]]
+kind = "quickfix"
+title = "Add #include <string>"
+compiles = true
+
+[answers.string.code_actions.edits]
+"main.cpp" = '''
+ // A module unit without a global module fragment opens one for the
+ // directive: no include may follow the module declaration.
++module;
++#include <string>
+
+ export module demo;
+'''

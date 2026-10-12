@@ -1,0 +1,10 @@
+[answers.member.completion]
+items = [
+    { label = "draw()", kind = "Method" },
+    { label = "resize(int, int)", kind = "Method" },
+]
+
+[answers.nested.completion]
+items = [
+    { label = "unit", kind = "TypeParameter" },
+]

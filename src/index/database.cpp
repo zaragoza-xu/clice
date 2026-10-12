@@ -22,6 +22,7 @@ module clice;
 
 import :index.database;
 import :support.logging;
+import :support.text;
 import :vfs.cache_store;
 import :vfs.file_system;
 import :vfs.path;
@@ -478,6 +479,15 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef library,
                                             bool read_only) {
     auto path = path::join(library, lmdb_file_name);
 
+    // LMDB takes an empty file for a new database and writes its first
+    // pages, which a read-only open cannot.
+    if(read_only) {
+        if(auto status = vfs::status(path); status && status->stamp.size == 0) {
+            LOG_WARN("Index database at {} is empty; run `clice index` to repair it", path);
+            return nullptr;
+        }
+    }
+
     auto mapsize = initial_mapsize != 0 ? initial_mapsize : default_mapsize();
 
     // One recovery retry: confirmed corruption (or a meta mismatch) is
@@ -586,11 +596,11 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef library,
                 mdb_txn_abort(txn);
                 mdb_env_close(env);
                 LOG_WARN(
-                    "Index database at {} is shorter than its pages ({} of {} bytes); run "
+                    "Index database at {} is shorter than its pages ({} of {}); run "
                     "`clice index` to repair it",
                     path,
-                    length,
-                    declared);
+                    format_bytes(length),
+                    format_bytes(declared));
                 return nullptr;
             }
         } else if(int cover_rc = cover_declared_pages(env)) {
@@ -690,6 +700,10 @@ std::string library_directory(const CacheStore& store, llvm::StringRef configura
     return path::join(store.base_dir(), "index", name);
 }
 
+bool library_exists(const CacheStore& store, llvm::StringRef configuration) {
+    return vfs::exists(path::join(library_directory(store, configuration), lmdb_file_name));
+}
+
 std::unique_ptr<BlobDatabase> open_lmdb_database(CacheStore& store,
                                                  llvm::StringRef configuration,
                                                  std::size_t initial_mapsize,
@@ -697,7 +711,7 @@ std::unique_ptr<BlobDatabase> open_lmdb_database(CacheStore& store,
     read_only = read_only || store.read_only();
     auto library = library_directory(store, configuration);
     if(read_only) {
-        if(!vfs::exists(path::join(library, lmdb_file_name))) {
+        if(!library_exists(store, configuration)) {
             return nullptr;
         }
     } else if(auto ec = vfs::create_directories(library)) {

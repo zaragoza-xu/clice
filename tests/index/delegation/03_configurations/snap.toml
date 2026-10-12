@@ -1,0 +1,9 @@
+[test."$ clice index --configuration release"]
+stderr = [
+    "error: request failed: the running clice server indexes configuration 'debug', not 'release'",
+]
+exit = 1
+
+[test."$ clice index --configuration debug"]
+stdout = "Indexed through the running clice server (pid #)."
+exit = 0

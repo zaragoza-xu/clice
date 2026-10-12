@@ -39,6 +39,7 @@ std::optional<std::string> override_declaration(clang::ASTContext& context,
                                                 const clang::CXXMethodDecl* method,
                                                 const clang::CXXRecordDecl* record,
                                                 bool is_nothrow) {
+    auto at = record->getBraceRange().getEnd();
     std::string declarator;
     llvm::raw_string_ostream os(declarator);
     os << display::name_of(method, {.qualified = false}) << '(';
@@ -46,7 +47,8 @@ std::optional<std::string> override_declaration(clang::ASTContext& context,
         if(index) {
             os << ", ";
         }
-        auto declaration = type_name(context, param->getOriginalType(), record, param->getName());
+        auto declaration =
+            type_name(context, param->getOriginalType(), record, at, param->getName());
         if(!declaration) {
             return std::nullopt;
         }
@@ -81,7 +83,7 @@ std::optional<std::string> override_declaration(clang::ASTContext& context,
     // parameters or the exception specification. No spelling of a type
     // holds the placeholder's control character.
     constexpr llvm::StringRef placeholder = "_\x01";
-    auto text = type_name(context, method->getReturnType(), record, placeholder);
+    auto text = type_name(context, method->getReturnType(), record, at, placeholder);
     if(!text) {
         return std::nullopt;
     }
@@ -94,8 +96,11 @@ std::optional<std::string> override_declaration(clang::ASTContext& context,
 void implement_pure_virtuals(const Context& ctx, std::vector<CodeAction>& out) {
     auto unit = ctx.unit;
     const auto* record = ctx.node.get<clang::CXXRecordDecl>();
+    // A class still being typed has no closing brace for the overrides to
+    // go before.
     if(!record || !record->isThisDeclarationADefinition() || record->isDependentType() ||
-       record->getNumBases() == 0 || !record->isAbstract()) {
+       record->getNumBases() == 0 || !record->isAbstract() ||
+       record->getBraceRange().getEnd().isInvalid()) {
         return;
     }
 
@@ -126,7 +131,9 @@ void implement_pure_virtuals(const Context& ctx, std::vector<CodeAction>& out) {
         }
     }
 
-    std::vector<std::string> lines;
+    // An override keeps its base's access (the non-virtual interface idiom
+    // keeps it private); the sections go public, protected, private.
+    std::vector<Member> members;
     for(const auto& group: groups) {
         auto specs = llvm::map_range(group, requires_noexcept);
         bool is_nothrow = llvm::is_contained(specs, std::optional(true));
@@ -137,15 +144,18 @@ void implement_pure_virtuals(const Context& ctx, std::vector<CodeAction>& out) {
         // nameably here.
         for(const auto* method: group) {
             if(auto line = override_declaration(context, method, record, is_nothrow)) {
-                lines.push_back(std::move(*line));
+                members.push_back({method->getAccess(), std::move(*line)});
                 break;
             }
         }
     }
-    if(lines.empty()) {
+    if(members.empty()) {
         return;
     }
-    if(auto edit = insert_members(unit, record, lines)) {
+    llvm::stable_sort(members, [](const Member& left, const Member& right) {
+        return left.access < right.access;
+    });
+    if(auto edit = insert_members(unit, record, members)) {
         out.push_back(CodeAction{
             .title = std::format("Implement pure virtual methods of '{}'", record->getName()),
             .kind = action_kind::implement_pure_virtuals,

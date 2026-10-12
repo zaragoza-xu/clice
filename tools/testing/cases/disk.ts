@@ -24,6 +24,11 @@ export function describeChange(change: Change): string {
     return `remove ${JSON.stringify(change.remove)}`;
 }
 
+/// What a damaged stretch reads. Whether clang's reader crashes on damage
+/// past its checks depends on the bytes it hits, so a test's server crashes
+/// on a PCH holding this instead (CLICE_TEST_DAMAGE).
+export const DAMAGE = "clice test: damaged past the checks";
+
 export class Disk {
     private readonly root: string;
     private readonly project: Project;
@@ -85,6 +90,19 @@ export class Disk {
         fs.rmSync(this.path(file), { recursive: true });
     }
 
+    /// Move a file or a directory with what it holds.
+    move(from: string, to: string): void {
+        this.steps.note(`disk: move ${from} to ${to}`);
+        fs.mkdirSync(path.dirname(this.path(to)), { recursive: true });
+        fs.renameSync(this.path(from), this.path(to));
+    }
+
+    /// Cut a file short at `bytes`, as a crash mid-write leaves it.
+    truncate(file: string, bytes: number): void {
+        this.steps.note(`disk: truncate ${file} to ${String(bytes)} bytes`);
+        fs.truncateSync(this.path(file), bytes);
+    }
+
     symlink(link: string, target: string): void {
         this.steps.note(`disk: link ${link} to ${target}`);
         fs.mkdirSync(path.dirname(this.path(link)), { recursive: true });
@@ -111,16 +129,18 @@ export class Disk {
     }
 
     /// Damage a file as a crash or a bad disk would, its size and time kept:
-    /// every byte, or a stretch in its middle.
+    /// every byte, or a stretch in its middle that reads `DAMAGE`.
     corrupt(file: string, where: "all" | "middle"): void {
         this.steps.note(`disk: corrupt ${where === "all" ? "all of" : "the middle of"} ${file}`);
         const target = this.path(file);
         const { atime, mtime } = fs.statSync(target);
         const bytes = fs.readFileSync(target);
-        const begin = where === "all" ? 0 : Math.max(0, Math.floor(bytes.length / 2) - 32);
-        const end = where === "all" ? bytes.length : Math.min(bytes.length, begin + 64);
-        for (let i = begin; i < end; i += 1) {
-            bytes[i] = (bytes[i] ?? 0) ^ 0xff;
+        if (where === "all") {
+            for (let i = 0; i < bytes.length; i += 1) {
+                bytes[i] = (bytes[i] ?? 0) ^ 0xff;
+            }
+        } else {
+            bytes.write(DAMAGE, Math.max(0, Math.floor((bytes.length - DAMAGE.length) / 2)));
         }
         fs.writeFileSync(target, bytes);
         fs.utimesSync(target, atime, mtime);

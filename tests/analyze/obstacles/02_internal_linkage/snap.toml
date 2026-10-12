@@ -1,0 +1,54 @@
+[test."$ clice index"]
+stdout = '''
+Indexed 2 translation units in #s: 3 file shards (# KB), 4 symbols.
+Session log: ${WS}/.clice/logs/${SESSION}
+'''
+exit = 0
+
+[test."$ clice analyze modules --view obstacles --scope \"core/**,util/**,feature/**,app/**\""]
+stdout = '''
+{
+  "variantHeaders": [],
+  "contextMacros": [],
+  "borrowedMacros": [],
+  "internalUses": [
+    {
+      "entity": "helper",
+      "owner": "core/str.h",
+      "reason": "static",
+      "users": [
+        "app/main.cpp",
+        "core/str.cpp"
+      ],
+      "exposedInOwner": true
+    },
+    {
+      "entity": "hidden",
+      "owner": "core/str.h",
+      "reason": "anonymous namespace",
+      "users": [
+        "app/main.cpp"
+      ],
+      "exposedInOwner": false
+    },
+    {
+      "entity": "limit",
+      "owner": "core/str.h",
+      "reason": "static",
+      "users": [
+        "app/main.cpp",
+        "core/str.cpp"
+      ],
+      "exposedInOwner": false
+    }
+  ],
+  "crossModuleRedeclarations": [],
+  "foreignDeclarations": [],
+  "splitDefinitions": [],
+  "duplicateDefinitions": [],
+  "configuringMacros": [],
+  "implicitProviders": [],
+  "specializations": []
+}
+'''
+exit = 0

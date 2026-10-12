@@ -41,7 +41,6 @@ benchmarks/workloads/
 
 .clice/
 compile_commands.json
-!tests/data/**/compile_commands.json
 perf.data
 flamegraph.svg
 
@@ -49,18 +48,18 @@ flamegraph.svg
 *.vsix
 dist/
 out/
-!tests/data/cdb/**/out/
 cache/
 node_modules/
 .vscode-test/
 
-# A case under tests-next/ is whatever project its check needs: the build
-# output names above are inputs there.
-!tests-next/**/*build*/
-!tests-next/**/temp/
-!tests-next/**/cache/
-!tests-next/**/out/
-!tests-next/**/dist/
+# A case under tests/ is whatever project its check needs: the build
+# output names above are inputs there. The docs cards follow the cases' paths.
+!tests/**/*build*/
+!tests/**/temp/
+!tests/**/cache/
+!docs/cards/**/cache/
+!tests/**/out/
+!tests/**/dist/
 
 # Python & Testing
 __pycache__/

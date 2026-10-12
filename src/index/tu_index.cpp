@@ -165,6 +165,17 @@ bool is_specialization(const clang::NamedDecl* decl) {
     return false;
 }
 
+/// The declaration go-to-type-definition reaches from a value or a
+/// function: the one its type names — a function's, the type it returns —
+/// once pointers, references and arrays are stripped.
+const clang::NamedDecl* type_definition_of(const clang::ValueDecl* decl) {
+    auto type = decl->getType();
+    if(auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+        type = function->getReturnType();
+    }
+    return types::decl_of(types::unwrap(type));
+}
+
 /// Occurrences cover disjoint ranges: a name inside another symbol's
 /// written name — the class in `~Foo` — is that name's, and the symbol it
 /// names keeps only its relation there.
@@ -296,15 +307,16 @@ public:
     }
 
     /// The only gate through which entries enter `file_indices`. With
-    /// main_file_only, the index covers just the main file — yet
-    /// AST nodes reachable from its top-level decls can carry locations
-    /// in other files: inherited default arguments and base specifiers
-    /// of classes defined in a preamble header end up there. Such entries
-    /// belong to the preamble's own index, so they are dropped here. So
-    /// are the entries of a header's borrowed includer context: its host
-    /// indexes them.
+    /// main_file_only, the index covers just the main file and the
+    /// declarations project_imported adds last — yet AST nodes reachable
+    /// from its top-level decls can carry locations in other files:
+    /// inherited default arguments and base specifiers of classes defined
+    /// in a preamble header end up there. Such entries belong to the
+    /// preamble's own index, so they are dropped here. So are the entries
+    /// of a header's borrowed includer context: its host indexes them.
     FileIndex* file_index(clang::FileID fid) {
-        if((main_file_only && fid != unit.main_file()) || unit.from_context(fid)) {
+        if((main_file_only && fid != unit.main_file() && !module_files.contains(fid)) ||
+           unit.from_context(fid)) {
             return nullptr;
         }
         return &file_indices[fid];
@@ -318,6 +330,10 @@ public:
         auto [it, success] = symbols.try_emplace(hash);
         if(success) {
             it->second = describe(decl);
+            if(main_file_only && decl->isFromASTFile() && decl->isInNamedModule() &&
+               !llvm::isa<clang::NamespaceDecl>(decl)) {
+                imported.push_back(decl);
+            }
         }
         return hash;
     }
@@ -493,6 +509,41 @@ public:
             .target_symbol = ensure_symbol(decls::normalize(target)),
         };
         index->relations[ensure_symbol(decls::normalize(decl))].emplace_back(relation);
+    }
+
+    /// A member of a class template's specialization, or a variable
+    /// template's specialization, can have another type than its pattern
+    /// declares (`T value` is a Widget in `Box<Widget>`): at a name of one,
+    /// a TypeDefinition relation spanning the name holds that type, beside
+    /// the pattern's own, which carries no range.
+    void add_specialized_type(const clang::NamedDecl* decl, clang::SourceRange name) {
+        if(!llvm::isa<clang::FieldDecl, clang::VarDecl, clang::FunctionDecl>(decl)) {
+            return;
+        }
+        auto* pattern = decls::normalize(decl);
+        if(pattern == decl->getCanonicalDecl()) {
+            return;
+        }
+        auto* target = type_definition_of(llvm::cast<clang::ValueDecl>(decl));
+        if(!target) {
+            return;
+        }
+        target = decls::normalize(target);
+        auto* declared = type_definition_of(llvm::cast<clang::ValueDecl>(pattern));
+        if(declared && unit.entity(decls::normalize(declared)) == unit.entity(target)) {
+            return;
+        }
+        auto [fid, range] = unit.decompose_range(name);
+        auto* index = file_index(fid);
+        if(!index) {
+            return;
+        }
+        Relation relation{
+            .kind = RelationKind::TypeDefinition,
+            .range = range,
+            .target_symbol = ensure_symbol(target),
+        };
+        index->relations[ensure_symbol(pattern)].emplace_back(relation);
     }
 
     /// A call edge, recorded at the call expression's location.
@@ -749,13 +800,7 @@ public:
             if(!CCE->getParenOrBraceRange().isValid()) {
                 return;
             }
-            // An inherited constructor is an implicit declaration standing
-            // in for the base constructor `using Base::Base` names.
-            const clang::CXXConstructorDecl* ctor = CCE->getConstructor();
-            if(auto inherited = ctor->getInheritedConstructor()) {
-                ctor = inherited.getConstructor();
-            }
-            call(ctor, CCE->getParenOrBraceRange().getBegin());
+            call(decls::constructor_of(CCE), CCE->getParenOrBraceRange().getBegin());
             return;
         }
 
@@ -820,7 +865,7 @@ public:
             }
 
             auto* VD = llvm::cast<clang::ValueDecl>(D);
-            if(auto target = types::decl_of(types::unwrap(VD->getType()))) {
+            if(auto target = type_definition_of(VD)) {
                 add_pair_relation(VD, RelationKind::TypeDefinition, target, VD->getLocation());
             }
             return;
@@ -895,6 +940,10 @@ public:
                 case clang::TSK_ExplicitSpecialization: {
                     break;
                 }
+            }
+
+            if(auto target = type_definition_of(FD)) {
+                add_pair_relation(FD, RelationKind::TypeDefinition, target, FD->getLocation());
             }
 
             if(auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(FD)) {
@@ -1002,6 +1051,80 @@ public:
         }
     }
 
+    /// The entries every name occurrence makes: the occurrence where its
+    /// token spells the name, and the self-relation spanning the whole
+    /// name, whose range it returns.
+    clang::SourceRange add_name(const NameOccurrence& occurrence) {
+        // Macro-generated names anchor at written source, following
+        // clang's file-location rule: argument tokens at their
+        // spelling in the invocation, body and pasted tokens at the
+        // invocation point. Nothing may anchor inside a `#define`
+        // body — those tokens have no meaning of their own, each
+        // expansion assigns one, and projecting a TU's expansion
+        // back into the shared definition is deliberately banned.
+        auto location = unit.file_location(occurrence.location);
+        auto spelled = location == unit.spelling_location(occurrence.location);
+
+        // A name of several tokens spans them all where they are
+        // written in one file; a macro that spells part of it
+        // leaves the first token alone.
+        clang::SourceRange name(location);
+        if(occurrence.name_end.isValid()) {
+            auto end = unit.file_location(occurrence.name_end);
+            if(spelled && end == unit.spelling_location(occurrence.name_end) &&
+               unit.file_id(end) == unit.file_id(location) &&
+               unit.file_offset(location) <= unit.file_offset(end)) {
+                name.setEnd(end);
+            }
+        }
+
+        // An occurrence says "this range spells the name", so it
+        // exists only where that holds. Names conjured by a macro
+        // body or token paste still get the self-relation below —
+        // reference lists and jump targets keep the invocation relation —
+        // but the invocation token itself stays the macro's, not
+        // theirs.
+        if(spelled) {
+            add_occurrence(occurrence.decl,
+                           occurrence.owns_whole_name() ? name : clang::SourceRange(location));
+        }
+
+        // Every occurrence is mirrored as a self-relation spanning
+        // the whole name, so find-references on the occurring decl
+        // finds this relation and cursor-site detection finds the
+        // occurrence inside it.
+        add_self_relation(occurrence.decl, occurrence.kind, name);
+        return name;
+    }
+
+    /// A header the main file names something from has its entries in the
+    /// preamble's index; a module unit has them only once its own unit is
+    /// indexed. Until then, its declarations of what the main file names
+    /// come from the AST the import deserialized, as that unit's index
+    /// records them.
+    void project_imported() {
+        llvm::SmallVector<NameOccurrence> declarations;
+        for(const auto* decl: imported) {
+            for(const auto* redecl: decl->redecls()) {
+                if(!redecl->isFromASTFile() || !redecl->isInNamedModule()) {
+                    continue;
+                }
+                for(auto& reference: resolve_references(SemanticNode(redecl))) {
+                    if(reference.location.isValid() && reference.kind.isDeclOrDef()) {
+                        declarations.push_back({reference.decl,
+                                                reference.kind,
+                                                reference.location,
+                                                reference.name_end});
+                        module_files.insert(unit.file_id(unit.file_location(reference.location)));
+                    }
+                }
+            }
+        }
+        for(auto& declaration: declarations) {
+            add_name(declaration);
+        }
+    }
+
     void project_semantics(const Semantics& semantics) {
         auto entries = semantics.node_entries();
 
@@ -1014,49 +1137,13 @@ public:
             }
 
             for(auto& occurrence: resolve_occurrences(semantics, i, &unit.resolver())) {
-                // Macro-generated names anchor at written source, following
-                // clang's file-location rule: argument tokens at their
-                // spelling in the invocation, body and pasted tokens at the
-                // invocation point. Nothing may anchor inside a `#define`
-                // body — those tokens have no meaning of their own, each
-                // expansion assigns one, and projecting a TU's expansion
-                // back into the shared definition is deliberately banned.
-                auto location = unit.file_location(occurrence.location);
-                auto spelled = location == unit.spelling_location(occurrence.location);
+                auto name = add_name(occurrence);
 
-                // A name of several tokens spans them all where they are
-                // written in one file; a macro that spells part of it
-                // leaves the first token alone.
-                clang::SourceRange name(location);
-                if(occurrence.name_end.isValid()) {
-                    auto end = unit.file_location(occurrence.name_end);
-                    if(spelled && end == unit.spelling_location(occurrence.name_end) &&
-                       unit.file_id(end) == unit.file_id(location) &&
-                       unit.file_offset(location) <= unit.file_offset(end)) {
-                        name.setEnd(end);
+                if(occurrence.kind.is_one_of(RelationKind::Reference)) {
+                    if(is_written(semantics, i)) {
+                        add_self_relation(occurrence.decl, RelationKind::Write, name);
                     }
-                }
-
-                // An occurrence says "this range spells the name", so it
-                // exists only where that holds. Names conjured by a macro
-                // body or token paste still get the self-relation below —
-                // reference lists and jump targets keep the invocation relation —
-                // but the invocation token itself stays the macro's, not
-                // theirs.
-                if(spelled) {
-                    add_occurrence(occurrence.decl,
-                                   occurrence.owns_whole_name() ? name
-                                                                : clang::SourceRange(location));
-                }
-
-                // Every occurrence is mirrored as a self-relation spanning
-                // the whole name, so find-references on the occurring decl
-                // finds this relation and cursor-site detection finds the
-                // occurrence inside it.
-                add_self_relation(occurrence.decl, occurrence.kind, name);
-
-                if(occurrence.kind.is_one_of(RelationKind::Reference) && is_written(semantics, i)) {
-                    add_self_relation(occurrence.decl, RelationKind::Write, name);
+                    add_specialized_type(occurrence.decl, name);
                 }
 
                 if(!occurrence.kind.is_one_of(RelationKind::Declaration,
@@ -1064,7 +1151,7 @@ public:
                                               RelationKind::WeakReference)) {
                     add_pasted_relation(occurrence.decl,
                                         enclosing_top_level(semantics, i),
-                                        location);
+                                        name.getBegin());
                 }
             }
 
@@ -1106,6 +1193,7 @@ public:
         project_semantics(semantics);
 
         index_modules(semantics);
+        project_imported();
         auto project_ms = project_timer.ms_f();
 
         ScopedTimer finish_timer;
@@ -1304,6 +1392,11 @@ private:
     /// nothing outside the compilation, so it never leaves the builder;
     /// the encode step converts it through tree.path_id.
     llvm::DenseMap<clang::FileID, FileIndex> file_indices;
+    /// With main_file_only, the symbols registered that an imported
+    /// module declares, a namespace aside: every unit reopening it
+    /// redeclares it.
+    llvm::SmallVector<const clang::NamedDecl*> imported;
+    llvm::DenseSet<clang::FileID> module_files;
     llvm::DenseMap<std::uint32_t, const clang::NamedDecl*> enclosing_cache;
     llvm::DenseMap<std::uint32_t, const clang::Decl*> top_level_cache;
 };

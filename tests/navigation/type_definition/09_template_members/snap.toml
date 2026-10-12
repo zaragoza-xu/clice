@@ -1,0 +1,11 @@
+[answers.method]
+type_definition = ["struct ⟦Widget⟧ {"]
+
+[answers.alias_member]
+type_definition = ["struct ⟦Gadget⟧ {};"]
+
+[answers.member]
+type_definition = ["struct ⟦Widget⟧ {"]
+
+[answers.variable_template]
+type_definition = ["struct ⟦Widget⟧ {"]

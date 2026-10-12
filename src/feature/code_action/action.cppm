@@ -90,14 +90,15 @@ std::string qualifier_at(const clang::DeclContext* target, const clang::DeclCont
 /// A type spelled for `from`, declaring `name` when one is given
 /// ("int (*name)(int)"): each name drops the namespaces enclosing `from`
 /// as far as it still finds its entity there, and the compiler's internal
-/// names become the standard ones `from` sees. Nullopt for a type `from`
-/// cannot name: a lambda or unnamed type, another function's local type,
-/// a member type the text has no access to. The text has the access of
-/// `access`, `from` when null: an out-of-line member definition has its
-/// class's.
+/// names become the standard ones `from` sees declared before `at`, which
+/// is no later than where the text goes. Nullopt for a type `from` cannot
+/// name: a lambda or unnamed type, another function's local type, a member
+/// type the text has no access to. The text has the access of `access`,
+/// `from` when null: an out-of-line member definition has its class's.
 std::optional<std::string> type_name(clang::ASTContext& context,
                                      clang::QualType type,
                                      const clang::DeclContext* from,
+                                     clang::SourceLocation at,
                                      llvm::StringRef name = {},
                                      const clang::DeclContext* access = nullptr);
 
@@ -108,12 +109,19 @@ std::string template_heads(CompilationUnitRef unit,
                            const clang::Decl* decl,
                            const clang::DeclContext* from);
 
-/// `lines` appended to the class body, on the body's own indentation and
-/// under a `public:` label when the body ends in another section; nullopt
-/// when the class head or brace is spelled by a macro.
+/// A member declaration of one line and the access it is declared with.
+struct Member {
+    clang::AccessSpecifier access;
+    std::string line;
+};
+
+/// `members` appended to the class body in their order, on the body's own
+/// indentation, under an access label wherever the access changes from
+/// the one the body ends in; nullopt when the class head or brace is
+/// spelled by a macro.
 std::optional<TextReplacement> insert_members(CompilationUnitRef unit,
                                               const clang::CXXRecordDecl* record,
-                                              llvm::ArrayRef<std::string> lines);
+                                              llvm::ArrayRef<Member> members);
 
 /// Visit the main file's declarations at file scope — the translation
 /// unit's and, descending, those of namespaces, linkage specifications and

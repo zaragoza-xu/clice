@@ -14,6 +14,7 @@ import :compile.implement;
 import :compile.tokens;
 import :semantic.decls;
 import :support.logging;
+import :vfs.file_system;
 
 namespace clice {
 
@@ -73,6 +74,15 @@ std::unique_ptr<clang::CompilerInvocation>
     }
 
     auto [pch, bound] = params.pch;
+    // Tests stand in for a PCH damaged past clang's checks, which crashes
+    // the parse reading it, by writing CLICE_TEST_DAMAGE into it.
+    const static auto damage = llvm::sys::Process::GetEnv("CLICE_TEST_DAMAGE");
+    if(damage && !pch.empty()) {
+        if(auto file = vfs::read(pch, vfs::Read::Bytes);
+           file && (*file)->getBuffer().contains(*damage)) {
+            LLVM_BUILTIN_TRAP;
+        }
+    }
     pp_opts.ImplicitPCHInclude = std::move(pch);
     if(bound != 0) {
         pp_opts.PrecompiledPreambleBytes = {bound, false};
@@ -87,10 +97,6 @@ std::unique_ptr<clang::CompilerInvocation>
     const static bool pragma_crash =
         llvm::sys::Process::GetEnv("CLICE_TEST_PRAGMA_CRASH").has_value();
     pp_opts.DisablePragmaDebugCrash = !pragma_crash;
-
-    // We don't want to write comment locations into PCM. They are racy and slow
-    // to read back. We rely on dynamic index for the comments instead.
-    pp_opts.WriteCommentListToPCH = false;
 
     auto& header_search_opts = invocation->getHeaderSearchOpts();
     header_search_opts.Verbose = false;
@@ -133,7 +139,10 @@ std::unique_ptr<clang::CompilerInvocation>
 
     auto& lang_opts = invocation->getLangOpts();
     lang_opts.CommentOpts.ParseAllComments = true;
-    lang_opts.RetainCommentsFromSystemHeaders = true;
+    // A PCH carries the comments of every header it holds, and the first
+    // lookup reads them all back: a system library's comments added about
+    // 40 ms to a release build's first hover, a project's own add nothing.
+    lang_opts.RetainCommentsFromSystemHeaders = false;
 
     // MSVC targets defer template bodies by default so SDK headers written
     // for MSVC's lookup rules still parse, but a deferred body has no AST and
@@ -445,10 +454,6 @@ CompilationUnit compile(CompilationParams& params, PCHInfo& out) {
             // reader against offsets past the end of a shrunk file.
             instance.getFrontendOpts().IncludeTimestamps = false;
 
-            // We don't want to write comment locations into PCH. They are racy and slow
-            // to read back. We rely on dynamic index for the comments instead.
-            instance.getPreprocessorOpts().WriteCommentListToPCH = false;
-
             instance.getLangOpts().CompilingPCH = true;
         },
         [&](CompilationUnitRef unit) {
@@ -521,13 +526,11 @@ CompilationUnit complete(CompilationParams& params, clang::CodeCompleteConsumer*
                      });
 }
 
-std::string collect_errors(CompilationUnit& unit) {
-    std::string errors;
+std::vector<std::string> collect_errors(CompilationUnit& unit) {
+    std::vector<std::string> errors;
     for(auto& diag: unit.diagnostics()) {
         if(diag.id.level >= DiagnosticLevel::Error) {
-            if(!errors.empty())
-                errors += "; ";
-            errors += diag.message;
+            errors.push_back(diag.message);
         }
     }
     return errors;

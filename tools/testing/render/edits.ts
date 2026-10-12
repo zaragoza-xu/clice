@@ -1,10 +1,12 @@
 /// Edits rendered as what they do: the files after applying them, as a
 /// diff with two lines of context and no line numbers. Whitespace a line
-/// ends with shows (`·` a space, `→` a tab), and so does a last line with
-/// no newline, so no change to either disappears from the rendering.
+/// ends with shows (`·` a space, `→` a tab, `␍` the carriage return of a
+/// CRLF line), and so does a last line with no newline, so no change to
+/// either disappears from the rendering.
 
 import { structuredPatch } from "diff";
 import type { Range, SourceText } from "./position.ts";
+import type { Table } from "./value.ts";
 
 export interface TextEdit {
     range: Range;
@@ -35,13 +37,15 @@ export function applyEdits(source: SourceText, edits: readonly TextEdit[]): stri
 }
 
 function visibleEnd(line: string): string {
-    return line.replace(/[ \t]+$/, (run) => run.replaceAll(" ", "·").replaceAll("\t", "→"));
+    return line.replace(/[ \t\r]+$/, (run) =>
+        run.replaceAll(" ", "·").replaceAll("\t", "→").replaceAll("\r", "␍"),
+    );
 }
 
-/// The lines of a diff from `before` to `after`, headed by the file.
-export function renderDiff(path: string, before: string, after: string): string[] {
-    const patch = structuredPatch(path, path, before, after, undefined, undefined, { context: 2 });
-    const out = [`--- ${path}`];
+/// The diff from `before` to `after` of a file.
+export function renderDiff(before: string, after: string): string {
+    const patch = structuredPatch("", "", before, after, undefined, undefined, { context: 2 });
+    const out: string[] = [];
     patch.hunks.forEach((hunk, index) => {
         if (index > 0) {
             out.push("…");
@@ -58,18 +62,18 @@ export function renderDiff(path: string, before: string, after: string): string[
     if (patch.hunks.length === 0) {
         out.push("(no change)");
     }
-    return out;
+    return out.join("\n");
 }
 
-/// The diff of every file a workspace edit touches, files sorted.
+/// The diff of every file a workspace edit touches, by file.
 export function renderWorkspaceEdit(
     edits: ReadonlyMap<string, readonly TextEdit[]>,
     file: (path: string) => SourceText,
-): string[] {
-    const out: string[] = [];
-    for (const path of [...edits.keys()].sort()) {
-        const source = file(path);
-        out.push(...renderDiff(path, source.text, applyEdits(source, edits.get(path) ?? [])));
-    }
-    return out;
+): Table {
+    return Object.fromEntries(
+        [...edits.keys()].sort().map((path) => {
+            const source = file(path);
+            return [path, renderDiff(source.text, applyEdits(source, edits.get(path) ?? []))];
+        }),
+    );
 }

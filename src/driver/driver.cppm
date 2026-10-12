@@ -20,6 +20,7 @@ import :server.control_client;
 import :server.query_commands;
 import :support.logging;
 import :support.process;
+import :vfs.file_system;
 import :vfs.path;
 import :worker.serialize;
 
@@ -31,7 +32,6 @@ enum class Command : std::uint8_t {
     serve,
     query,
     refactor,
-    worker,
     index,
     lint,
     format,
@@ -69,6 +69,10 @@ inline bool register_command(Command command, CommandEntry entry) {
     registered = entry;
     return true;
 }
+
+/// `clice worker`, which the master spawns its workers as: no command of a
+/// user's, so no Command and no line of `clice --help`.
+int run_worker(std::span<std::string> args);
 
 /// Add every subcommand to `root`, in the order of Command. One whose file
 /// did not register it stops the program.
@@ -174,6 +178,16 @@ inline Spelling workspace_spelling(llvm::StringRef argument) {
     return Spelling(argument, Spelling::cwd());
 }
 
+/// Whether the workspace a batch subcommand names is a directory; one that
+/// is not is reported, never created for the run's cache and logs.
+inline bool workspace_exists(const Spelling& workspace) {
+    if(vfs::is_directory(workspace)) {
+        return true;
+    }
+    LOG_ERROR("{}: not a directory", workspace);
+    return false;
+}
+
 /// The workspace root of a batch subcommand.
 inline CanonicalPath workspace_root(llvm::StringRef argument) {
     return CanonicalPath(workspace_spelling(argument));
@@ -198,6 +212,23 @@ inline auto subcommand_error_handler(kota::deco::cli::SubCommander& commander) {
         driver::println(stderr, "{}", err.message);
         return kota::deco::cli::parse_error_exit_code;
     };
+}
+
+/// Run a commander of subcommands on `args`. The commander takes whatever
+/// leads them for a subcommand's name; an option other than --help leading
+/// them is reported as the unknown option it is.
+inline int run_subcommands(kota::deco::cli::SubCommander& commander, std::span<std::string> args) {
+    namespace text = kota::deco::cli::text;
+    if(!args.empty() && args.front().starts_with("-") &&
+       !llvm::is_contained(kota::deco::decl::help_names, args.front())) {
+        driver::println(
+            stderr,
+            "{}",
+            text::render_diagnostic(
+                text::diagnostic_at(args, 0, 1, std::format("unknown option '{}'", args.front()))));
+        return kota::deco::cli::parse_error_exit_code;
+    }
+    return commander(args);
 }
 
 /// "s" when `count` warrants a plural noun, for user-facing summaries.
@@ -249,16 +280,13 @@ inline std::expected<index::SymbolQuery, std::string>
 /// through the serving writer when a server holds the lock, else by a
 /// batch run of this process. Either runs a pass over the build under the hash
 /// gate, so only units whose inputs changed are recompiled — and an
-/// absent index gets built from nothing. Returns the units that failed
-/// to index, or why the refresh could not run.
+/// absent index gets built from nothing; `configuration` is one `config`
+/// declares (check_requested_configuration). Returns the units that
+/// failed to index, or why the refresh could not run.
 inline std::expected<std::vector<std::string>, std::string> refresh(const Spelling& workspace,
+                                                                    const Config& config,
                                                                     llvm::StringRef configuration,
                                                                     const char* self_path) {
-    auto config = Config::load_from_workspace(CanonicalPath(workspace));
-    if(!check_requested_configuration(config, configuration)) {
-        return std::unexpected(
-            std::format("unknown configuration '{}'", std::string_view(configuration)));
-    }
     auto& cache_dir = config.project.cache_dir;
     auto writer = index::probe_writer(cache_dir);
     switch(writer.state) {
@@ -284,6 +312,7 @@ inline std::expected<std::vector<std::string>, std::string> refresh(const Spelli
     };
     auto result = run_batch_index({
         .root = workspace,
+        .config = config,
         .configuration = configuration.str(),
         .self_path = self_path,
         .on_progress = report_progress,

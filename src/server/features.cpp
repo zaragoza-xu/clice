@@ -261,7 +261,11 @@ std::optional<feature::HoverInfo> Features::index_hover_card(const Session& sess
     }
     std::string definition;
     std::string comment;
-    if(auto text = query.definition_text(symbol, cursor->site.file)) {
+    auto text = query.definition_text(symbol, cursor->site.file);
+    if(!text) {
+        text = query.declaration_text(symbol, cursor->site.file);
+    }
+    if(text) {
         definition = std::move(text->text);
         comment = std::move(text->comment);
     }
@@ -538,27 +542,42 @@ Features::RawResult Features::hover(Ticket ticket,
     }
     auto path_id = session->path_id;
 
-    auto index_card = [&]() -> std::optional<serde_raw> {
-        if(auto info = index_hover_card(*session, position)) {
-            return to_raw(feature::to_protocol_hover(*info,
-                                                     project.config.hover,
-                                                     session->positions(),
-                                                     PositionEncoding::UTF16));
-        }
-        return std::nullopt;
+    auto index_card = [&](const feature::HoverInfo& info) {
+        return to_raw(feature::to_protocol_hover(info,
+                                                 project.config.hover,
+                                                 session->positions(),
+                                                 PositionEncoding::UTF16));
     };
 
     switch(co_await pick_route(ticket, {})) {
         case Route::Superseded: co_await kota::fail(content_modified());
         case Route::Index: {
-            if(auto card = index_card()) {
-                session->index_served = true;
-                co_return std::move(*card);
+            auto info = index_hover_card(*session, position);
+            if(!info) {
+                co_return serde_raw{"null"};
             }
-            co_return serde_raw{"null"};
+            // Without the definition, the index card tells little past the
+            // name (the entity the buffer's index recorded can be gone, as
+            // after an imported interface changed): while a compile can
+            // run, the AST's card is worth the wait.
+            if(info->definition.empty() && session->serving == ServingMode::Escalated &&
+               !ASTFamily::compile_barred(*session)) {
+                break;
+            }
+            session->index_served = true;
+            co_return index_card(*info);
         }
         case Route::Empty: co_return serde_raw{"null"};
         case Route::Ast: break;
+    }
+
+    // A module name's card names the unit defining the module, which the
+    // worker cannot see across files: this side answers it, from the index.
+    if(auto cursor = cursor_at(path_id, position)) {
+        auto info = query.symbol_info(cursor->symbols.front(), cursor->site.file);
+        if(info && info->kind == SymbolKind::Module) {
+            co_return index_card(module_hover_card(*cursor, *info));
+        }
     }
 
     // A directive's card names its target, which the worker knows only by
@@ -576,18 +595,6 @@ Features::RawResult Features::hover(Ticket ticket,
         }
     }
 
-    // A module name's card names the unit defining the module, which the
-    // worker cannot see across files: this side answers it, from the index.
-    if(auto cursor = cursor_at(path_id, position)) {
-        auto info = query.symbol_info(cursor->symbols.front(), cursor->site.file);
-        if(info && info->kind == SymbolKind::Module) {
-            co_return to_raw(feature::to_protocol_hover(module_hover_card(*cursor, *info),
-                                                        project.config.hover,
-                                                        session->positions(),
-                                                        PositionEncoding::UTF16));
-        }
-    }
-
     auto raw =
         co_await dispatcher.query(worker::QueryKind::Hover, ticket, position, std::move(token));
     if(raw.has_value() && to_lsp::is_null(raw.value()) && ast.projections.current(path_id)) {
@@ -602,8 +609,8 @@ Features::RawResult Features::hover(Ticket ticket,
             if(auto it = project.pch_cache.find(*projection->pch_key);
                it != project.pch_cache.end()) {
                 if(offset && *offset < it->second.bound) {
-                    if(auto card = index_card()) {
-                        co_return std::move(*card);
+                    if(auto info = index_hover_card(*session, position)) {
+                        co_return index_card(*info);
                     }
                 }
             }
@@ -1415,7 +1422,7 @@ Features::RawResult Features::type_definition(Ticket ticket,
             sites,
             gather(symbol, path_id, [&](const index::IndexQuery& from, index::SymbolHash named) {
                 if(!deduced) {
-                    return from.target_sites(named, path_id, RelationKind::TypeDefinition);
+                    return from.type_definition(*cursor, named);
                 }
                 std::vector<index::Site> own;
                 if(auto located = from.resolve(named, path_id)) {

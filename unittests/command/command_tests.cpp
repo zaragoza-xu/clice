@@ -12,7 +12,7 @@ import :command.command;
 import :project.build;
 import :support.shell;
 import :unittests.utils.cdb_helper;
-import :unittests.utils.platform;
+import :unittests.utils.cdb_layouts;
 import :unittests.utils.temp_dir;
 import :unittests.utils;
 import :vfs.path;
@@ -1062,6 +1062,22 @@ ZEST_CASE(LoadCudaHeader) {
     ZEXPECT(database.has_entry(tmp.path("kernels.cuh")));
 };
 
+ZEST_CASE(LoadForcedLanguage) {
+    /// An extension clang does not know is C-family when the command's -x
+    /// says so.
+    TempDir tmp;
+    auto dir = json_escape(tmp.root);
+    FileTable file_table;
+    CompilationDatabase database{file_table};
+    auto count = load_json(database, R"([{"directory": ")" + dir + R"(", "file": "a.ixx",
+          "command": "clang++ -std=c++20 -x c++-module -c a.ixx"},
+         {"directory": ")" + dir + R"(", "file": "b.ixx",
+          "command": "clang++ -std=c++20 -c b.ixx"}])");
+
+    ZASSERT(count == 1U);
+    ZEXPECT(database.has_entry(tmp.path("a.ixx")));
+};
+
 ZEST_CASE(LoadEmptyCommand) {
     /// Whitespace-only or empty "command" should not crash.
     TempDir tmp;
@@ -1207,11 +1223,14 @@ ZEST_CASE(ResourceDir) {
 };
 
 ZEST_CASE(FixtureLayouts) {
-    /// The checked-in layouts under tests/data/cdb go through load() like a
-    /// real project's database; each pins the one property it exists for.
-    /// Macros are asserted by name: the driver render spells -D with a
-    /// separate value.
-    auto layouts = path::join(data_dir(), "cdb");
+    /// The layouts' databases go through load() like a real project's; each
+    /// pins the one property it exists for. Macros are asserted by name: the
+    /// driver render spells -D with a separate value.
+    TempDir dir;
+    for(auto& layout: cdb_layouts()) {
+        write_layout(dir, layout.name);
+    }
+    auto layouts = std::string(dir.root);
     auto load_layout = [&](CompilationDatabase& database,
                            llvm::StringRef layout,
                            llvm::StringRef cdb = "compile_commands.json") {

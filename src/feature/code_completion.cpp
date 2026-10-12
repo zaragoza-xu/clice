@@ -8,6 +8,7 @@ import :feature.feature;
 import :semantic.display;
 import :semantic.resolver;
 import :support.fuzzy_matcher;
+import :syntax.completion;
 
 namespace clice::feature {
 
@@ -112,8 +113,148 @@ auto completion_kind(const clang::NamedDecl* decl) -> protocol::CompletionItemKi
     return protocol::CompletionItemKind::Text;
 }
 
+/// What a member access almost never names: the destructor, the class's
+/// own name, an operator.
+bool rarely_accessed(const clang::NamedDecl* decl) {
+    if(llvm::isa<clang::CXXDestructorDecl>(decl)) {
+        return true;
+    }
+    if(auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(decl)) {
+        return record->isInjectedClassName();
+    }
+    auto kind = decl->getDeclName().getNameKind();
+    return kind == clang::DeclarationName::CXXOperatorName ||
+           kind == clang::DeclarationName::CXXLiteralOperatorName ||
+           kind == clang::DeclarationName::CXXConversionFunctionName;
+}
+
+/// The place of each field a designator in an initializer of `record`
+/// names, in declaration order; a field of an anonymous member by its own
+/// name.
+auto designator_order(const clang::RecordDecl* record) -> llvm::StringMap<std::uint32_t> {
+    llvm::StringMap<std::uint32_t> order;
+    for(auto* decl: record->decls()) {
+        if(llvm::isa<clang::FieldDecl, clang::IndirectFieldDecl>(decl)) {
+            if(auto name = llvm::cast<clang::NamedDecl>(decl)->getName(); !name.empty()) {
+                order.try_emplace(name, order.size());
+            }
+        }
+    }
+    return order;
+}
+
+/// The most open access along the paths of bases from `derived` to `base`;
+/// none when `base` is not one of them. A dependent base is followed to its
+/// primary template, as Sema's lookup of visible members follows it.
+auto base_access(const clang::CXXRecordDecl* derived, const clang::CXXRecordDecl* base)
+    -> std::optional<clang::AccessSpecifier> {
+    auto* target = base->getCanonicalDecl();
+    auto reaches = [&](const clang::CXXBaseSpecifier* specifier, clang::CXXBasePath&) {
+        auto type = specifier->getType();
+        const clang::CXXRecordDecl* record = nullptr;
+        if(!type->isDependentType()) {
+            record = type->getAsCXXRecordDecl();
+        } else if(auto* specialization = type->getAs<clang::TemplateSpecializationType>()) {
+            if(auto* primary = llvm::dyn_cast_or_null<clang::ClassTemplateDecl>(
+                   specialization->getTemplateName().getAsTemplateDecl())) {
+                record = primary->getTemplatedDecl();
+            }
+        }
+        return record && record->getCanonicalDecl() == target;
+    };
+    clang::CXXBasePaths paths;
+    if(!derived->lookupInBases(reaches, paths, /*LookupInDependent=*/true)) {
+        return std::nullopt;
+    }
+    return std::ranges::min_element(paths, {}, &clang::CXXBasePath::Access)->Access;
+}
+
+/// Whether `befriended`, the entity a friend declaration names, is `scope`.
+/// A friend template a class template declares is linked to no declaration
+/// until instantiated: like Sema's access check, one of the same kind, name
+/// and scope counts, a function with as many parameters.
+bool befriends(const clang::NamedDecl* befriended, const clang::NamedDecl* scope) {
+    if(befriended->getCanonicalDecl() == scope->getCanonicalDecl()) {
+        return true;
+    }
+    if(!llvm::isa<clang::RedeclarableTemplateDecl>(befriended) ||
+       befriended->getKind() != scope->getKind() ||
+       befriended->getDeclName() != scope->getDeclName() ||
+       !befriended->getDeclContext()->getRedeclContext()->Equals(
+           scope->getDeclContext()->getRedeclContext())) {
+        return false;
+    }
+    auto* function = befriended->getAsFunction();
+    return !function || function->getNumParams() == scope->getAsFunction()->getNumParams();
+}
+
+/// The dependent class a member access or a qualified name lists the
+/// members of, when the completion point is outside it, the classes
+/// derived from it and its friends. Sema cannot follow its dependent bases
+/// to check access and checks a member found in one as if that base were
+/// named: a member reached only through non-public bases would be offered.
+auto unchecked_naming_class(clang::Sema& sema, clang::CodeCompletionContext& context)
+    -> const clang::CXXRecordDecl* {
+    using Kind = clang::CodeCompletionContext::Kind;
+    const clang::CXXRecordDecl* naming = nullptr;
+    if(context.getKind() == Kind::CCC_DotMemberAccess ||
+       context.getKind() == Kind::CCC_ArrowMemberAccess) {
+        naming = llvm::dyn_cast_or_null<clang::CXXRecordDecl>(
+            clang::HeuristicResolver(sema.getASTContext())
+                .resolveTypeToTagDecl(context.getBaseType()));
+    } else if(auto spec = context.getCXXScopeSpecifier()) {
+        naming = llvm::dyn_cast_or_null<clang::CXXRecordDecl>(
+            sema.computeDeclContext(**spec, /*EnteringContext=*/true));
+    }
+    if(!naming || !naming->isDependentContext()) {
+        return nullptr;
+    }
+    // The classes and functions around the completion point, walked as
+    // Sema's access check walks them: a friend function defined in a class
+    // is in that class. Each counts with its template too, which a friend
+    // declaration may name instead.
+    llvm::SmallVector<const clang::NamedDecl*, 8> scopes;
+    for(const auto* scope = sema.CurContext; !scope->isFileContext();) {
+        if(auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(scope)) {
+            if(record->getCanonicalDecl() == naming->getCanonicalDecl() ||
+               base_access(record, naming)) {
+                return nullptr;
+            }
+            scopes.push_back(record);
+            if(auto* pattern = record->getDescribedClassTemplate()) {
+                scopes.push_back(pattern);
+            } else if(auto* specialization =
+                          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
+                scopes.push_back(specialization->getSpecializedTemplate());
+            }
+            scope = record->getDeclContext();
+        } else if(auto* function = llvm::dyn_cast<clang::FunctionDecl>(scope)) {
+            scopes.push_back(function);
+            if(auto* pattern = function->getDescribedFunctionTemplate()) {
+                scopes.push_back(pattern);
+            }
+            scope = function->getFriendObjectKind() ? function->getLexicalDeclContext()
+                                                    : function->getDeclContext();
+        } else {
+            scope = scope->getParent();
+        }
+    }
+    for(const auto* entry: naming->friends()) {
+        const clang::NamedDecl* befriended = entry->getFriendDecl();
+        if(auto* type = entry->getFriendType()) {
+            befriended = type->getType()->getAsCXXRecordDecl();
+        }
+        if(befriended && llvm::any_of(scopes, [&](const clang::NamedDecl* scope) {
+               return befriends(befriended, scope);
+           })) {
+            return nullptr;
+        }
+    }
+    return naming;
+}
+
 /// In bundle mode several candidates may share one label: a class and its
-/// constructors/deduction guides, or a declaration shadowed by a macro.
+/// constructors, or a declaration shadowed by a macro.
 /// Label dedup keeps the highest-priority item. An active macro always
 /// wins: the preprocessor rewrites the completed token, so a shadowed
 /// declaration is not what the completion would invoke.
@@ -131,11 +272,13 @@ auto dedup_priority(protocol::CompletionItemKind kind, bool is_macro) -> int {
     }
 }
 
-/// Extract the function signature (parameter list) from a CodeCompletionString.
-/// Returns something like "(int x, float y)" for display in labelDetails.detail.
-auto extract_signature(const clang::CodeCompletionString& ccs) -> std::string {
+/// Extract the function signature (parameter list) from a CodeCompletionString,
+/// followed by the function's qualifiers when `qualifiers` is set. Returns
+/// something like "(int x, float y) const" for display in labelDetails.detail.
+auto extract_signature(const clang::CodeCompletionString& ccs, bool qualifiers) -> std::string {
     std::string signature;
     bool in_parens = false;
+    bool closed = false;
 
     for(const auto& chunk: ccs) {
         using CK = clang::CodeCompletionString::ChunkKind;
@@ -147,6 +290,7 @@ auto extract_signature(const clang::CodeCompletionString& ccs) -> std::string {
             case CK::CK_RightParen:
                 signature += ')';
                 in_parens = false;
+                closed = true;
                 break;
             case CK::CK_Placeholder:
             case CK::CK_CurrentParameter:
@@ -162,16 +306,18 @@ auto extract_signature(const clang::CodeCompletionString& ccs) -> std::string {
             case CK::CK_Informative: {
                 // A function that cannot be called where completion happens
                 // (a destructor after `T::`) carries its whole parameter list
-                // as informative chunks, parentheses included.
+                // as informative chunks, parentheses included. After the
+                // list come the function's qualifiers, ` const`.
                 llvm::StringRef text = chunk.Text ? chunk.Text : "";
                 if(text == "(") {
                     in_parens = true;
                 }
-                if(in_parens) {
+                if(in_parens || (closed && qualifiers)) {
                     signature += text;
                 }
                 if(text == ")") {
                     in_parens = false;
+                    closed = true;
                 }
                 break;
             }
@@ -305,6 +451,9 @@ struct Candidate {
     std::string return_type;
     bool deprecated = false;
     bool macro = false;
+
+    /// Breaks ties in score: a field's place in a designated initializer.
+    std::optional<std::uint32_t> order;
 };
 
 struct OverloadItem {
@@ -582,7 +731,11 @@ public:
                 item.filter_text = candidate.filter;
             }
             // Clients sort ascending; scores lie in (0, 2].
-            item.sort_text = std::format("{:.4f}", 2.0F - score);
+            auto sort_text = std::format("{:.4f}", 2.0F - score);
+            if(candidate.order) {
+                sort_text += std::format("{:05}", *candidate.order);
+            }
+            item.sort_text = std::move(sort_text);
             if(!candidate.signature.empty() || !candidate.return_type.empty()) {
                 protocol::CompletionItemLabelDetails details;
                 if(!candidate.signature.empty()) {
@@ -669,6 +822,194 @@ public:
             }
         };
 
+        bool member_access =
+            context.getKind() == clang::CodeCompletionContext::CCC_DotMemberAccess ||
+            context.getKind() == clang::CodeCompletionContext::CCC_ArrowMemberAccess;
+        types::TemplateResolver resolver(sema.getASTContext());
+        auto* naming = unchecked_naming_class(sema, context);
+        // In `{ .` the fields rank in declaration order, the order C++
+        // designates them in: there those before the last one written
+        // cannot follow. A field designated as a whole cannot be again; one
+        // designated in part (`.inner.x = 1`) can (`.inner.y = 2`).
+        llvm::StringMap<std::uint32_t> field_order;
+        llvm::StringSet<> designated;
+        if(member_access && !context.getBaseExpr()) {
+            if(auto* record = llvm::dyn_cast_or_null<clang::RecordDecl>(
+                   clang::HeuristicResolver(sema.getASTContext())
+                       .resolveTypeToTagDecl(context.getBaseType()))) {
+                field_order = designator_order(record);
+            }
+            std::uint32_t passed = 0;
+            for(auto designator: written_designators(content, prefix.typed.begin)) {
+                if(designator.whole) {
+                    designated.insert(designator.field);
+                }
+                if(auto it = field_order.find(designator.field);
+                   sema.getLangOpts().CPlusPlus && it != field_order.end()) {
+                    passed = std::max(passed, it->second);
+                }
+            }
+            for(auto& [name, order]: field_order) {
+                if(order < passed) {
+                    designated.insert(name);
+                }
+            }
+        }
+
+        auto left_out = [&](const clang::CodeCompletionResult& candidate) {
+            auto* declaration = candidate.Declaration;
+            // A hidden declaration is not what its name means here.
+            if(!declaration || candidate.Hidden ||
+               candidate.Availability == CXAvailability_NotAccessible) {
+                return true;
+            }
+            // Clang gives a deduction guide no name to type.
+            if(declaration->getDeclName().getNameKind() ==
+               clang::DeclarationName::CXXDeductionGuideName) {
+                return true;
+            }
+            if(member_access && rarely_accessed(declaration)) {
+                return true;
+            }
+            if(auto* field = llvm::dyn_cast<clang::FieldDecl>(declaration);
+               field && designated.contains(field->getName())) {
+                return true;
+            }
+            // A using-declaration is named where it is, not where its target is.
+            const clang::NamedDecl* found = candidate.ShadowDecl;
+            if(!found) {
+                found = declaration;
+            }
+            auto* owner = llvm::dyn_cast<clang::CXXRecordDecl>(found->getDeclContext());
+            if(!naming || !owner) {
+                return false;
+            }
+            auto access = base_access(naming, owner);
+            return access && *access != clang::AS_public;
+        };
+
+        /// What accepting a call inserts, unless its arguments are written
+        /// already: the arguments to fill in, else, when the name is called
+        /// here, its parentheses.
+        auto insert_call =
+            [&](Candidate& item, const clang::CodeCompletionString& ccs, bool called_here) {
+                if(arguments_follow) {
+                    return;
+                }
+                if(client.snippets && !options.bundle_overloads &&
+                   options.enable_function_arguments_snippet) {
+                    item.insert = build_snippet(ccs);
+                    item.snippet = !item.insert.empty();
+                }
+                if(called_here && options.insert_paren_in_function_call && !item.snippet) {
+                    if(client.snippets) {
+                        item.insert = escape_snippet(item.label) + "($0)";
+                        item.snippet = true;
+                    } else {
+                        item.insert = item.label + "()";
+                    }
+                }
+            };
+
+        /// After `t.`, `t->` or `T::` on a template parameter, Sema offers
+        /// what the constraints on it require as patterns: a name and, for
+        /// a call, the types of the arguments it is called with.
+        bool requirements = false;
+        if(member_access) {
+            requirements = llvm::isa<clang::TemplateTypeParmType>(context.getBaseType());
+        } else if(auto spec = context.getCXXScopeSpecifier()) {
+            auto scope = (*spec)->getScopeRep();
+            requirements = scope.getKind() == clang::NestedNameSpecifier::Kind::Type &&
+                           llvm::isa<clang::TemplateTypeParmType>(scope.getAsType());
+        }
+        auto add_requirement = [&](const clang::CodeCompletionString& pattern) {
+            Candidate item{
+                .label = pattern.getAllTypedText(),
+                .signature = extract_signature(pattern, /*qualifiers=*/false),
+                .return_type = extract_return_type(pattern),
+            };
+            if(item.signature.empty()) {
+                // After `T::` a name without a call is mostly a type the
+                // constraints name, `typename T::value_type`.
+                item.kind = member_access ? protocol::CompletionItemKind::Field
+                                          : protocol::CompletionItemKind::TypeParameter;
+            } else {
+                item.kind = protocol::CompletionItemKind::Method;
+                insert_call(item, pattern, /*called_here=*/true);
+            }
+            add(item);
+        };
+
+        auto add_declaration = [&](clang::CodeCompletionResult& candidate) {
+            auto* declaration = candidate.Declaration;
+            // A qualifier clang does not mark informative must be
+            // written: the name alone does not reach the
+            // declaration (a scoped enumerator outside its enum).
+            std::string qualifier;
+            if(candidate.Qualifier && !candidate.QualifierIsInformative) {
+                llvm::raw_string_ostream stream(qualifier);
+                candidate.Qualifier.print(stream, sema.getPrintingPolicy());
+            }
+
+            auto kind = completion_kind(declaration);
+            auto name = display::name_of(declaration,
+                                         {
+                                             .suppress_ctor_template_args = true,
+                                             .qualified = false,
+                                         });
+            Candidate item{
+                .label = qualifier + name,
+                .kind = kind,
+                .filter = qualifier.empty() ? std::string() : name,
+                .deprecated = candidate.Availability == CXAvailability_Deprecated,
+            };
+
+            if(auto* field = llvm::dyn_cast<clang::FieldDecl>(declaration)) {
+                if(auto it = field_order.find(field->getName()); it != field_order.end()) {
+                    item.order = it->second;
+                }
+            }
+
+            bool is_callable = kind == protocol::CompletionItemKind::Function ||
+                               kind == protocol::CompletionItemKind::Method ||
+                               kind == protocol::CompletionItemKind::Constructor;
+            if(options.bundle_overloads && is_callable) {
+                item.bundle = item.label;
+            }
+
+            auto& ccs = *candidate.CreateCodeCompletionString(sema,
+                                                              context,
+                                                              getAllocator(),
+                                                              getCodeCompletionTUInfo(),
+                                                              /*IncludeBriefComments=*/false);
+            // Clang gives a variable holding a lambda the signature of its
+            // call operator, whose `const` is no part of calling it.
+            bool method = llvm::isa_and_present<clang::CXXMethodDecl>(declaration->getAsFunction());
+            item.signature = extract_signature(ccs, /*qualifiers=*/method);
+            item.return_type = extract_return_type(ccs);
+            if(is_callable) {
+                insert_call(item,
+                            ccs,
+                            kind != protocol::CompletionItemKind::Constructor &&
+                                candidate.FunctionCanBeCall && !candidate.DeclaringEntity &&
+                                !context.isUsingDeclaration());
+            } else if(options.enable_template_arguments_snippet && client.snippets &&
+                      !arguments_follow &&
+                      llvm::isa<clang::ClassTemplateDecl,
+                                clang::TypeAliasTemplateDecl,
+                                clang::VarTemplateDecl>(declaration)) {
+                item.insert = build_snippet(ccs);
+                item.snippet = !item.insert.empty();
+                // Every parameter defaulted: nothing to fill in,
+                // but the name alone does not name a type.
+                if(!item.snippet) {
+                    item.insert = item.label + "<>";
+                }
+            }
+
+            add(item);
+        };
+
         for(auto& candidate: llvm::make_range(candidates, candidates + candidate_count)) {
             switch(candidate.Kind) {
                 case clang::CodeCompletionResult::RK_Keyword:
@@ -693,6 +1034,10 @@ public:
                         });
                         break;
                     }
+                    if(requirements) {
+                        add_requirement(pattern);
+                        break;
+                    }
                     add_pattern(pattern);
                     break;
                 }
@@ -713,7 +1058,7 @@ public:
                                                                 getAllocator(),
                                                                 getCodeCompletionTUInfo(),
                                                                 /*IncludeBriefComments=*/false)) {
-                        item.signature = extract_signature(*ccs);
+                        item.signature = extract_signature(*ccs, /*qualifiers=*/false);
                         if(function_like && options.enable_function_arguments_snippet &&
                            client.snippets) {
                             item.insert = build_snippet(*ccs);
@@ -725,87 +1070,24 @@ public:
                 }
 
                 case clang::CodeCompletionResult::RK_Declaration: {
-                    auto* declaration = candidate.Declaration;
-                    // A hidden declaration is not what its name means here.
-                    if(!declaration || candidate.Hidden ||
-                       candidate.Availability == CXAvailability_NotAccessible) {
+                    if(left_out(candidate)) {
                         break;
                     }
-
-                    // A qualifier clang does not mark informative must be
-                    // written: the name alone does not reach the
-                    // declaration (a scoped enumerator outside its enum).
-                    std::string qualifier;
-                    if(candidate.Qualifier && !candidate.QualifierIsInformative) {
-                        llvm::raw_string_ostream stream(qualifier);
-                        candidate.Qualifier.print(stream, sema.getPrintingPolicy());
+                    // Sema leaves a using-declaration naming a member of a
+                    // dependent base unresolved; it offers what it names.
+                    auto* using_decl =
+                        llvm::dyn_cast<clang::UnresolvedUsingValueDecl>(candidate.Declaration);
+                    auto targets = using_decl ? resolver.lookup(using_decl)
+                                              : types::TemplateResolver::lookup_result();
+                    if(targets.empty()) {
+                        add_declaration(candidate);
+                        break;
                     }
-
-                    auto kind = completion_kind(declaration);
-                    auto name = display::name_of(declaration,
-                                                 {
-                                                     .suppress_ctor_template_args = true,
-                                                     .qualified = false,
-                                                 });
-                    Candidate item{
-                        .label = qualifier + name,
-                        .kind = kind,
-                        .filter = qualifier.empty() ? std::string() : name,
-                        .deprecated = candidate.Availability == CXAvailability_Deprecated,
-                    };
-
-                    bool is_callable = kind == protocol::CompletionItemKind::Function ||
-                                       kind == protocol::CompletionItemKind::Method ||
-                                       kind == protocol::CompletionItemKind::Constructor;
-                    if(options.bundle_overloads && is_callable) {
-                        item.bundle = item.label;
+                    for(auto* target: targets) {
+                        auto named = candidate;
+                        named.Declaration = target->getUnderlyingDecl();
+                        add_declaration(named);
                     }
-
-                    auto* ccs =
-                        candidate.CreateCodeCompletionString(sema,
-                                                             context,
-                                                             getAllocator(),
-                                                             getCodeCompletionTUInfo(),
-                                                             /*IncludeBriefComments=*/false);
-                    if(ccs) {
-                        item.signature = extract_signature(*ccs);
-                        item.return_type = extract_return_type(*ccs);
-                        bool arguments = is_callable && !options.bundle_overloads &&
-                                         options.enable_function_arguments_snippet;
-                        bool template_arguments = options.enable_template_arguments_snippet &&
-                                                  llvm::isa<clang::ClassTemplateDecl,
-                                                            clang::TypeAliasTemplateDecl,
-                                                            clang::VarTemplateDecl>(declaration);
-                        if(client.snippets && !arguments_follow &&
-                           (arguments || template_arguments)) {
-                            item.insert = build_snippet(*ccs);
-                            item.snippet = !item.insert.empty();
-                            // Every parameter defaulted: nothing to fill in,
-                            // but the name alone does not name a type.
-                            if(template_arguments && !item.snippet) {
-                                item.insert = item.label + "<>";
-                            }
-                        }
-                    }
-
-                    // A call gets its parentheses unless it has them already
-                    // or the name is not being called here.
-                    bool callable_here = candidate.FunctionCanBeCall &&
-                                         !candidate.DeclaringEntity &&
-                                         !context.isUsingDeclaration();
-                    if(options.insert_paren_in_function_call && !item.snippet && callable_here &&
-                       !arguments_follow &&
-                       (kind == protocol::CompletionItemKind::Function ||
-                        kind == protocol::CompletionItemKind::Method)) {
-                        if(client.snippets) {
-                            item.insert = escape_snippet(item.label) + "($0)";
-                            item.snippet = true;
-                        } else {
-                            item.insert = item.label + "()";
-                        }
-                    }
-
-                    add(item);
                     break;
                 }
             }

@@ -1,0 +1,13 @@
+[[answers.string.code_actions]]
+kind = "quickfix"
+title = "Add #include <string>"
+compiles = true
+
+[answers.string.code_actions.edits]
+"main.cpp" = '''
+ // directive goes below the comment opening the file without opening a module
+ // fragment.
++#include <string>
+
+ namespace module {
+'''

@@ -32,8 +32,7 @@ describe("renderDiff", () => {
     test("distant hunks are separated", () => {
         const before = Array.from({ length: 12 }, (_, i) => `line ${String(i)}`).join("\n") + "\n";
         const after = before.replace("line 1\n", "line one\n").replace("line 10\n", "line ten\n");
-        expect(renderDiff("a.cpp", before, after)).toEqual([
-            "--- a.cpp",
+        expect(renderDiff(before, after).split("\n")).toEqual([
             " line 0",
             "-line 1",
             "+line one",
@@ -49,8 +48,7 @@ describe("renderDiff", () => {
     });
 
     test("whitespace changes show", () => {
-        expect(renderDiff("a.cpp", "int x;\n\nint y;  \n", "int x;\n\nint y;")).toEqual([
-            "--- a.cpp",
+        expect(renderDiff("int x;\n\nint y;  \n", "int x;\n\nint y;").split("\n")).toEqual([
             " int x;",
             "",
             "-int y;··",
@@ -59,7 +57,13 @@ describe("renderDiff", () => {
         ]);
     });
 
+    test("carriage returns show", () => {
+        expect(renderDiff("int  x;\r\n\r\nint y;\r\n", "int x;\r\n\r\nint y;\r\n")).toBe(
+            ["-int  x;␍", "+int x;␍", " ␍", " int y;␍"].join("\n"),
+        );
+    });
+
     test("no change says so", () => {
-        expect(renderDiff("a.cpp", "x\n", "x\n")).toEqual(["--- a.cpp", "(no change)"]);
+        expect(renderDiff("x\n", "x\n")).toBe("(no change)");
     });
 });

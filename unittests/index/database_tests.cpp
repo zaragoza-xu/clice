@@ -246,6 +246,26 @@ ZEST_CASE(ReadOnlyRefusesTruncated) {
     ZASSERT(index::open_database(store, "") == nullptr);
 }
 
+ZEST_CASE(ReadOnlyRefusesEmpty) {
+    TempDir tmp;
+    std::string file;
+    {
+        auto store = open_store(tmp, "ws");
+        file = populated_database(store, 1);
+    }
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream os(file, ec);
+        require(!ec, "emptying index.mdb failed");
+    }
+    auto store = open_store(tmp, "ws", /*read_only=*/true);
+    ZASSERT(index::library_exists(store, ""));
+    ZASSERT(index::open_database(store, "") == nullptr);
+    std::uint64_t size = 1;
+    ZASSERT(!llvm::sys::fs::file_size(file, size));
+    ZASSERT(size == 0U);
+}
+
 ZEST_CASE(WritesCoverFreedTail) {
     // A batch whose freed pages LMDB hands back to its free list is never
     // written, and when they sit at the end the file stays shorter than
@@ -461,11 +481,9 @@ ZEST_CASE(WriterLockAtCacheRoot) {
     auto db = index::open_database(store, "x");
     ZASSERT(db != nullptr);
     ZASSERT(!llvm::sys::fs::exists(path::join(index::library_directory(store, "x"), "index.lock")));
-#ifndef _WIN32
     auto held = read_file(path::join(store.root_dir(), "index.lock"));
     ZASSERT(held);
     ZASSERT(llvm::StringRef(*held).trim() == std::to_string(llvm::sys::Process::getProcessId()));
-#endif
     lock.reset();
     auto released = read_file(path::join(store.root_dir(), "index.lock"));
     ZASSERT((released.has_value() && released->empty()));

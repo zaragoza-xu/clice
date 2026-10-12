@@ -9,6 +9,7 @@ import :compile.semantics;
 import :feature.feature;
 import :semantic.display;
 import :semantic.symbol;
+import :syntax.lexer;
 
 namespace clice::feature {
 
@@ -101,7 +102,8 @@ auto symbol_detail(clang::ASTContext& context, const clang::NamedDecl& decl) -> 
 /// a symbol's frame stays open while the walk index is inside its subtree.
 class Collector {
 public:
-    explicit Collector(CompilationUnitRef unit) : unit(unit) {}
+    Collector(CompilationUnitRef unit, llvm::ArrayRef<std::uint32_t> inactive_regions) :
+        unit(unit), inactive_regions(inactive_regions) {}
 
     auto collect() -> std::vector<DocumentSymbol> {
         auto nodes = unit.semantics().node_entries();
@@ -134,10 +136,14 @@ public:
 
         for(; index < nodes.size(); index += 1) {
             auto& node = nodes[index].node;
-            if(node.kind() == SemanticNode::Kind::MacroDefine) {
-                add_macro(*node.get<MacroRef>());
-            } else if(node.kind() == SemanticNode::Kind::Module) {
+            if(node.kind() == SemanticNode::Kind::Module) {
                 add_module(*node.get<LexicalInfo::ModuleDeclaration>());
+            }
+        }
+
+        for(auto directive: unit.semantics().macro_definitions()) {
+            if(!inactive(directive.begin)) {
+                add_macro(directive);
             }
         }
 
@@ -145,6 +151,11 @@ public:
     }
 
 private:
+    bool inactive(std::uint32_t offset) const {
+        auto bounds = std::ranges::upper_bound(inactive_regions, offset) - inactive_regions.begin();
+        return bounds % 2 == 1;
+    }
+
     /// Restore the insertion cursor of every symbol whose subtree the walk
     /// has left.
     void close_frames(std::uint32_t index) {
@@ -231,41 +242,45 @@ private:
         return &symbol;
     }
 
-    /// A `#define` written in this file. The AST walk never sees
-    /// directives, so nesting runs by containment instead: one spelled
-    /// between class members outlines under the class.
-    void add_macro(const MacroRef& macro) {
-        auto [fid, selection_range] = unit.decompose_range(macro.loc);
-        auto [def_fid, range] =
-            unit.decompose_range(clang::SourceRange(macro.macro->getDefinitionLoc(),
-                                                    macro.macro->getDefinitionEndLoc()));
+    /// A `#define` written in this file, read from its text: the
+    /// preamble's have no preprocessor record in a compile under a PCH. The
+    /// AST walk never sees directives, so nesting runs by containment
+    /// instead: one spelled between class members outlines under the class.
+    void add_macro(LocalSourceRange directive) {
+        auto content = unit.main_content();
+        auto lexer =
+            Lexer::from_line(content, directive.begin, {.lang_opts = &unit.lang_options()});
+        lexer.advance();
+        lexer.advance();
+        auto name = lexer.advance();
+        if(!name.is_identifier()) {
+            return;
+        }
+
+        auto spelling = [&](const Token& token) {
+            return unit.token_spelling(unit.create_location(unit.main_file(), token.range.begin));
+        };
 
         DocumentSymbol symbol;
         symbol.kind = SymbolKind::Macro;
-        symbol.name = unit.token_spelling(macro.loc);
-        symbol.selection_range = selection_range;
-        symbol.range = range;
+        symbol.name = spelling(name);
+        symbol.selection_range = name.range;
 
-        if(macro.macro->isFunctionLike()) {
+        auto token = lexer.advance();
+        if(token.kind == clang::tok::l_paren && token.range.begin == name.range.end) {
             std::string detail = "(";
-            const auto params = macro.macro->params();
-            for(const auto* param: params) {
-                if(detail.size() > 1) {
-                    detail += ", ";
-                }
-                llvm::StringRef name = param->getName();
-                if(name == "__VA_ARGS__") {
-                    detail += "...";
-                } else {
-                    detail += name;
-                    if(macro.macro->isGNUVarargs() && param == params.back()) {
-                        detail += "...";
-                    }
-                }
+            for(token = lexer.advance(); token.kind != clang::tok::r_paren && !token.is_eod();
+                token = lexer.advance()) {
+                detail += token.kind == clang::tok::comma ? ", " : spelling(token);
             }
             detail += ')';
             symbol.detail = std::move(detail);
         }
+        auto last = name;
+        for(; !token.is_eod() && !token.is_eof(); token = lexer.advance()) {
+            last = token;
+        }
+        symbol.range = {name.range.begin, last.range.end};
 
         auto* level = &symbols;
         for(bool descended = true; descended;) {
@@ -331,6 +346,8 @@ private:
     };
 
     CompilationUnitRef unit;
+    /// Sorted begin/end offset pairs.
+    llvm::ArrayRef<std::uint32_t> inactive_regions;
     std::vector<DocumentSymbol> symbols;
     std::vector<DocumentSymbol>* cursor = &symbols;
     std::vector<Frame> frames;
@@ -382,17 +399,25 @@ auto to_protocol_symbol(const DocumentSymbol& symbol,
     return result;
 }
 
-}  // namespace
-
-auto document_symbols(CompilationUnitRef unit) -> std::vector<DocumentSymbol> {
-    auto result = Collector(unit).collect();
+auto outline(CompilationUnitRef unit, llvm::ArrayRef<std::uint32_t> inactive_regions)
+    -> std::vector<DocumentSymbol> {
+    auto result = Collector(unit, inactive_regions).collect();
     sort_symbols(result);
     return result;
 }
 
-auto document_symbols(CompilationUnitRef unit, PositionEncoding encoding)
-    -> std::vector<protocol::DocumentSymbol> {
-    return document_symbols_to_protocol(document_symbols(unit), unit.positions(), encoding);
+}  // namespace
+
+auto document_symbols(CompilationUnitRef unit) -> std::vector<DocumentSymbol> {
+    return outline(unit, inactive_regions(unit).regions);
+}
+
+auto document_symbols(CompilationUnitRef unit,
+                      llvm::ArrayRef<std::uint32_t> inactive_regions,
+                      PositionEncoding encoding) -> std::vector<protocol::DocumentSymbol> {
+    return document_symbols_to_protocol(outline(unit, inactive_regions),
+                                        unit.positions(),
+                                        encoding);
 }
 
 auto document_symbols_to_protocol(llvm::ArrayRef<DocumentSymbol> symbols,

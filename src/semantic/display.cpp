@@ -984,10 +984,13 @@ using TokenCount = llvm::function_ref<std::size_t(clang::SourceRange)>;
 
 /// Initializers might be huge and result in lots of memory allocations in
 /// some catastrophic cases. Such long lists are not useful in hover cards
-/// anyway.
-bool is_huge(const clang::Expr* init, const clang::PrintingPolicy& policy, TokenCount token_count) {
-    return init &&
-           (token_count(init->getSourceRange()) > 200 || printed_length(*init, policy) > 500);
+/// anyway, and neither is one that does not compile: clang prints the parts
+/// it recovered as `<recovery-expr>`.
+bool hides_initializer(const clang::Expr* init,
+                       const clang::PrintingPolicy& policy,
+                       TokenCount token_count) {
+    return init && (init->containsErrors() || token_count(init->getSourceRange()) > 200 ||
+                    printed_length(*init, policy) > 500);
 }
 
 auto initializer(const clang::Decl& member) -> const clang::Expr* {
@@ -1117,7 +1120,7 @@ struct MemberPrinter {
             }
             os << '\n' << enumerator->getName();
             if(const clang::Expr* init = enumerator->getInitExpr();
-               init && !is_huge(init, policy, token_count)) {
+               init && !hides_initializer(init, policy, token_count)) {
                 os << " = ";
                 init->printPretty(os, nullptr, policy);
             } else if(!enumerator->getType()->isDependentType()) {
@@ -1210,7 +1213,7 @@ struct MemberPrinter {
     }
 
     void print(const clang::Decl& member, clang::PrintingPolicy member_policy) {
-        if(is_huge(initializer(member), member_policy, token_count)) {
+        if(hides_initializer(initializer(member), member_policy, token_count)) {
             member_policy.SuppressInitializers = true;
         }
         member.print(os, member_policy);
@@ -1225,7 +1228,7 @@ auto definition(const clang::Decl* decl,
     assert(decl);
     clang::PrintingPolicy policy = derive_policy(decl->getASTContext(), options);
     if(const auto* var = llvm::dyn_cast<clang::VarDecl>(decl);
-       var && is_huge(var->getInit(), policy, token_count)) {
+       var && hides_initializer(var->getInit(), policy, token_count)) {
         policy.SuppressInitializers = true;
     }
 
@@ -1236,26 +1239,37 @@ auto definition(const clang::Decl* decl,
         llvm::dyn_cast<clang::TagDecl>(class_template ? class_template->getTemplatedDecl() : decl);
     if(!tag || !tag->getDefinition()) {
         decl->print(os, policy);
-        return definition;
+    } else {
+        /// The head comes from the definition too: only a definition prints
+        /// its bases. tag_head() relies on the terse body.
+        assert(options.terse);
+        tag = tag->getDefinition();
+        if(class_template) {
+            os << tag_head(*llvm::cast<clang::CXXRecordDecl>(tag)->getDescribedClassTemplate(),
+                           policy);
+        } else {
+            os << tag_head(*tag, policy);
+        }
+        if(options.max_members > 0) {
+            MemberPrinter printer{
+                .os = os,
+                .policy = policy,
+                .token_count = token_count,
+                .budget = options.max_members,
+            };
+            printer.body(*tag);
+        }
     }
 
-    /// The head comes from the definition too: only a definition prints its
-    /// bases. tag_head() relies on the terse body.
-    assert(options.terse);
-    tag = tag->getDefinition();
-    if(class_template) {
-        os << tag_head(*llvm::cast<clang::CXXRecordDecl>(tag)->getDescribedClassTemplate(), policy);
-    } else {
-        os << tag_head(*tag, policy);
-    }
-    if(options.max_members > 0) {
-        MemberPrinter printer{
-            .os = os,
-            .policy = policy,
-            .token_count = token_count,
-            .budget = options.max_members,
-        };
-        printer.body(*tag);
+    /// The declarations of a private module fragment are module private,
+    /// which clang prints as the `__module_private__` specifier of its own
+    /// module maps: no C++20 code spells it.
+    if(decl->isModulePrivate()) {
+        constexpr llvm::StringLiteral specifier = "__module_private__ ";
+        for(auto at = definition.find(specifier); at != std::string::npos;
+            at = definition.find(specifier, at)) {
+            definition.erase(at, specifier.size());
+        }
     }
     return definition;
 }

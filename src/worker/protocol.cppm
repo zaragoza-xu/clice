@@ -324,6 +324,13 @@ struct FormatParams {
     LocalSourceRange range;  ///< Invalid range = full document.
 };
 
+/// The edits of the request's text, or why the file's style cannot be
+/// read.
+struct FormatResult {
+    std::vector<TextReplacement> edits;
+    std::string error;
+};
+
 /// Result of an artifact build (PCH or PCM).
 struct ArtifactBuildResult {
     bool success = true;
@@ -331,6 +338,10 @@ struct ArtifactBuildResult {
     /// On failure: whether `error` carries user-code compile errors. A failure
     /// without user errors indicates clice infrastructure breakage (anomaly).
     bool has_user_errors = false;
+
+    /// The first of the user errors: the one a module's importers name as
+    /// why it did not build.
+    std::string first_error;
 
     /// The tmp path the artifact was written to.
     std::string output_path;
@@ -361,6 +372,10 @@ struct TidyDiagnostic {
 
     /// Error (warning otherwise): the check is in WarningsAsErrors.
     bool error = false;
+
+    /// The compiler's own error, which no header filter or lint set leaves
+    /// out.
+    bool compiler_error = false;
 
     std::string message;
 
@@ -571,7 +586,7 @@ struct RequestTraits<clice::worker::SignatureHelpParams> {
 
 template <>
 struct RequestTraits<clice::worker::FormatParams> {
-    using Result = kota::codec::RawValue;
+    using Result = clice::worker::FormatResult;
     constexpr inline static std::string_view method = "clice/worker/format";
 };
 

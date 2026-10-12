@@ -1,0 +1,36 @@
+[answers.type.hover]
+markdown = '''
+### struct `Point`
+
+---
+A point in the plane.
+
+---
+```cpp
+// In namespace geometry
+struct Point {
+  int x;
+  int y;
+}
+```
+'''
+range = "geometry::⟦Point⟧ corner{3, 4};"
+
+[answers.function.hover]
+markdown = '''
+### function `norm`
+
+---
+→ `int`
+Parameters:
+- `Point p`
+
+Distance from the origin, in taxicab steps.
+
+---
+```cpp
+// In namespace geometry
+int norm(Point p)
+```
+'''
+range = "return geometry::⟦norm⟧(corner);"

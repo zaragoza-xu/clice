@@ -1,0 +1,9 @@
+["no clang-format on PATH"."$ clice format main.cpp"]
+stdout = "Formatted 1 file in #s."
+exit = 0
+
+["no clang-format on PATH"."$ clice format main.cpp".files]
+"main.cpp" = '''
+-int  main() { return 0; }
++int main() { return 0; }
+'''

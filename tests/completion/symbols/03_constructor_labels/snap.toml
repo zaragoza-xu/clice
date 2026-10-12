@@ -1,0 +1,25 @@
+[default.class_template.completion]
+items = [
+    { label = "Bazzz<typename T, typename U>", kind = "Class" },
+    { label = "bar()", kind = "Function", detail = "void" },
+]
+
+[default.constructor_template.completion]
+items = [
+    { label = "Wrapper<typename T>", kind = "Class" },
+]
+
+[configured.class_template.completion]
+items = [
+    { label = "Bazzz<typename T, typename U>", kind = "Class" },
+    { label = "Bazzz<typename T, typename U>()", kind = "Constructor" },
+    { label = "Bazzz<typename T, typename U>(T x)", kind = "Constructor" },
+    { label = "Bazzz<typename T, typename U>(T x, U y)", kind = "Constructor" },
+    { label = "bar()", kind = "Function", detail = "void" },
+]
+
+[configured.constructor_template.completion]
+items = [
+    { label = "Wrapper<typename T>", kind = "Class" },
+    { label = "Wrapper<typename T>(U value)", kind = "Constructor" },
+]

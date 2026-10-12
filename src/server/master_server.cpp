@@ -671,7 +671,9 @@ kota::task<> MasterServer::poll_task() {
     constexpr auto budget = std::chrono::milliseconds(2);
     while(true) {
         co_await kota::sleep(interval);
-        files.disk.tick(budget);
+        if(files.disk.tick(budget) > 0) {
+            probe.happened(LoopEvent::DiskChange);
+        }
         for(auto& project: projects) {
             project->tick_databases();
         }
@@ -1189,7 +1191,7 @@ int run_serve_mode(const ServerOptions& opts, const char* self_path) {
                 co_await serve(server, peer.run());
             }(server, lsp_peer, ws));
         loop.run();
-        return 0;
+        return server.exit_before_shutdown ? 1 : 0;
     }
 
     if(mode == ServerMode::Socket) {
@@ -1213,7 +1215,7 @@ int run_serve_mode(const ServerOptions& opts, const char* self_path) {
             co_await serve(server, accept_connections(server, std::move(acceptor), connections));
         }(server, std::move(*acceptor), connections, ws));
         loop.run();
-        return 0;
+        return server.exit_before_shutdown ? 1 : 0;
     }
 
     LOG_ERROR("unexpected server mode");

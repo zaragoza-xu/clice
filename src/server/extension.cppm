@@ -182,7 +182,7 @@ struct LogFloodResult {
 /// clice/internal/stats — TEST-ONLY, not a stable API. Ownership gauges
 /// for memory-lifecycle regression tests: instead of brittle RSS
 /// assertions, each leak class is pinned by a deterministic counter
-/// (consumed by tests/integration/server/memory_ownership.test.ts); and
+/// (consumed by the tests/lifecycle/memory cases); and
 /// the counts of freshness checks, which pin what a request looks at.
 /// Absent from capabilities and user docs.
 struct StatsParams {};
@@ -193,6 +193,11 @@ struct FileBuilds {
     std::uint32_t pch = 0;
     std::uint32_t pcm = 0;
     std::uint32_t index = 0;
+};
+
+struct WorkerPids {
+    std::vector<std::uint32_t> stateful;
+    std::vector<std::uint32_t> stateless;
 };
 
 struct StatsResult {
@@ -238,6 +243,9 @@ struct StatsResult {
     /// The builds each file went through, while test hooks are on (see
     /// BuildProbe); empty otherwise.
     std::vector<FileBuilds> builds;
+
+    /// The process ids of the workers in service, by kind.
+    WorkerPids workers;
 };
 
 /// clice/internal/sync — TEST-ONLY, present while project.test_hooks is on.
@@ -295,13 +303,25 @@ struct GateParams {
     std::string uri;
 };
 
+/// clice/internal/watch — TEST-ONLY, present while project.test_hooks is on.
+/// Watches for the next `event` of the server's background loops after it
+/// is placed: "databaseChange", the database loop applied a changed
+/// compilation database; "diskChange", the disk loop's looks found files
+/// changed; "checkpoint", a checkpoint committed index shards (see
+/// LoopEvent). The reply is a hold id: clice/internal/held announces the
+/// event.
+struct WatchParams {
+    std::string event;
+};
+
 struct ReleaseParams {
     std::uint64_t id = 0;
 };
 
 struct ReleaseResult {};
 
-/// Notification: the hold parked a reply.
+/// Notification: the hold parked a reply, the gate a request's work, or the
+/// watch saw its event.
 struct HeldParams {
     std::uint64_t id = 0;
 };

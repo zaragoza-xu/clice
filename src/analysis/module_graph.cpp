@@ -6,9 +6,11 @@ module clice;
 
 import :analysis.module_graph;
 import :command.command;
+import :config.config;
 import :index.serialization;
 import :index.symbol_query;
 import :project.command_resolver;
+import :project.configuration;
 import :project.open_index;
 import :project.project;
 import :syntax.lexer;
@@ -962,21 +964,19 @@ Facts collect(Project& project, llvm::function_ref<bool(llvm::StringRef)> in_sco
         if(internal) {
             linkage =
                 kind == SymbolKind::Variable ? InternalLinkage::Const : InternalLinkage::Static;
-            llvm::DenseSet<index::SymbolHash> visited{hash};
-            for(auto parent = identity->parent; parent != 0 && visited.insert(parent).second;) {
-                auto scope = identity_of(parent, owner_shard);
-                if(!scope) {
-                    break;
-                }
-                if(scope->kind == SymbolKind::Namespace &&
-                   index::has_flag(scope->flags, index::SymbolFlags::Unnamed)) {
-                    linkage = InternalLinkage::AnonymousNamespace;
-                    break;
-                }
-                parent = scope->parent;
-            }
-            if(linkage == InternalLinkage::Const &&
-               has_word(line_text(declared_in, line), "static")) {
+            // A parent skips an anonymous namespace, as a qualified name
+            // does; its definition still encloses the declaration.
+            if(site != scoped.end() &&
+               llvm::any_of(definitions[declared_in], [&](const auto& definition) {
+                   auto scope = identity_of(definition.second, owner_shard);
+                   return definition.first.begin <= site->offset &&
+                          site->offset < definition.first.end && scope &&
+                          scope->kind == SymbolKind::Namespace &&
+                          index::has_flag(scope->flags, index::SymbolFlags::Unnamed);
+               })) {
+                linkage = InternalLinkage::AnonymousNamespace;
+            } else if(linkage == InternalLinkage::Const &&
+                      has_word(line_text(declared_in, line), "static")) {
                 linkage = InternalLinkage::Static;
             }
         }
@@ -1009,6 +1009,7 @@ Facts collect(Project& project, llvm::function_ref<bool(llvm::StringRef)> in_sco
             .line = line,
             .self_uses = raw[owner].lookup(hash).count +
                          (declared_in != owner ? raw[declared_in].lookup(hash).count : 0),
+            .self_line = raw[owner].lookup(hash).line,
             .constant = constant,
             .units =
                 [&] {
@@ -1382,12 +1383,16 @@ std::expected<LoadedFacts, LoadError> load_facts(const Spelling& workspace,
         globs.push_back(std::move(*glob));
     }
 
-    CanonicalPath root(workspace);
+    auto config = Config::load_from_workspace(CanonicalPath(workspace));
+    if(auto checked = check_requested_configuration(config, configuration); !checked) {
+        return std::unexpected(LoadError{.message = std::move(checked.error())});
+    }
     FileTable files;
     files.spell_root(workspace);
     Project project{files};
     CommandResolver commands{project};
-    auto loaded = load_index(project, commands, root, configuration, /*with_build=*/false);
+    auto loaded =
+        load_index(project, commands, std::move(config), configuration, /*with_build=*/false);
     if(!loaded) {
         return std::unexpected(LoadError{.message = "no usable index; run `clice index` first"});
     }
@@ -1413,7 +1418,8 @@ std::expected<LoadedFacts, LoadError> load_facts(const Spelling& workspace,
             return std::unexpected(LoadError{.message = std::move(edited.error())});
         }
     }
-    return LoadedFacts{.root = llvm::StringRef(root).str(), .facts = std::move(facts)};
+    return LoadedFacts{.root = llvm::StringRef(project.config.workspace_root).str(),
+                       .facts = std::move(facts)};
 }
 
 std::expected<void, std::string> move_entities(Facts& facts,
@@ -1460,13 +1466,14 @@ std::expected<void, std::string> move_entities(Facts& facts,
             moved.push_back(entity);
         }
     }
-    auto add = [](std::vector<Use>& uses, std::uint32_t entity, std::uint32_t count) {
-        auto use = std::ranges::lower_bound(uses, entity, {}, &Use::entity);
-        if(use == uses.end() || use->entity != entity) {
-            use = uses.insert(use, {.entity = entity});
-        }
-        use->count += count;
-    };
+    auto add =
+        [](std::vector<Use>& uses, std::uint32_t entity, std::uint32_t count, std::uint32_t line) {
+            auto use = std::ranges::lower_bound(uses, entity, {}, &Use::entity);
+            if(use == uses.end() || use->entity != entity) {
+                use = uses.insert(use, {.entity = entity, .line = line});
+            }
+            use->count += count;
+        };
     auto remove = [](std::vector<Use>& uses, std::uint32_t entity, std::uint32_t count) {
         auto use = std::ranges::lower_bound(uses, entity, {}, &Use::entity);
         assert(use != uses.end() && use->entity == entity && use->count >= count);
@@ -1498,7 +1505,7 @@ std::expected<void, std::string> move_entities(Facts& facts,
         if(used.owner == target) {
             used.self_uses += count;
         } else {
-            add(facts.uses[target], entity, count);
+            add(facts.uses[target], entity, count, 0);
         }
     }
     // A moved entity named by the moved definitions or by the target is
@@ -1517,9 +1524,12 @@ std::expected<void, std::string> move_entities(Facts& facts,
                 remove(facts.uses[from], entity, count);
             }
         }
-        auto behind = info.self_uses - carried[{info.owner, entity}];
+        // The owner's first use stays behind unless a moved definition
+        // holds uses of it, whose lines no entity records apart.
+        auto moving = carried[{info.owner, entity}];
+        auto behind = info.self_uses - moving;
         if(behind != 0) {
-            add(facts.uses[info.owner], entity, behind);
+            add(facts.uses[info.owner], entity, behind, moving == 0 ? info.self_line : 0);
         }
         auto& from_target = facts.uses[target];
         if(auto use = std::ranges::lower_bound(from_target, entity, {}, &Use::entity);
@@ -1528,6 +1538,7 @@ std::expected<void, std::string> move_entities(Facts& facts,
             from_target.erase(use);
         }
         info.self_uses = inside;
+        info.self_line = 0;
     }
     for(auto entity: moved) {
         facts.entities[entity].owner = target;
@@ -2582,7 +2593,8 @@ std::expected<EdgeDetail, std::string> Report::edge(llvm::StringRef from,
             auto& uses = facts.uses[file];
             auto use = std::ranges::lower_bound(uses, entity, {}, &Use::entity);
             if(use != uses.end() && use->entity == entity) {
-                return std::format("{}:{}", facts.files[file].path, use->line);
+                return use->line == 0 ? facts.files[file].path
+                                      : std::format("{}:{}", facts.files[file].path, use->line);
             }
         }
         return facts.files[user].path;

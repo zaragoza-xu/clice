@@ -52,6 +52,66 @@ ZEST_CASE(CursorBeforeOperator) {
 
 };  // ZEST_SUITE(FollowsAccessOperator)
 
+ZEST_SUITE(WrittenDesignators) {
+
+auto designators(llvm::StringRef text, std::size_t offset = llvm::StringRef::npos) {
+    std::vector<std::string> names;
+    for(auto designator: written_designators(text, std::min(offset, text.size()))) {
+        names.push_back(designator.field.str());
+    }
+    return names;
+}
+
+auto whole(llvm::StringRef text) {
+    std::vector<std::string> names;
+    for(auto designator: written_designators(text, text.size())) {
+        if(designator.whole) {
+            names.push_back(designator.field.str());
+        }
+    }
+    return names;
+}
+
+ZEST_CASE(EarlierFields) {
+    ZEXPECT(designators("Size s = { .width = 800, .height{600}, .") ==
+            std::vector<std::string>{"width", "height"});
+}
+
+ZEST_CASE(NestedBraces) {
+    ZEXPECT(designators("Outer o = { .inner = { .x = 1, .") == std::vector<std::string>{"x"});
+    ZEXPECT(designators("Outer o = { .inner = { .x = 1 }, .") == std::vector<std::string>{"inner"});
+}
+
+ZEST_CASE(CommasInCalls) {
+    ZEXPECT(designators("f({ .a = g(1, .5), .") == std::vector<std::string>{"a"});
+}
+
+ZEST_CASE(DesignatedInPart) {
+    llvm::StringRef text = "Shape s = { .origin.x = 1, .items[0] = 2, .id{3}, .color = 4, .";
+    ZEXPECT(designators(text) == std::vector<std::string>{"origin", "items", "id", "color"});
+    ZEXPECT(whole(text) == std::vector<std::string>{"id", "color"});
+}
+
+ZEST_CASE(ContinuedDesignator) {
+    ZEXPECT(designators("Outer o = { .inner = 1, .other.").empty());
+}
+
+ZEST_CASE(MemberAccess) {
+    ZEXPECT(designators("int v = { point.").empty());
+}
+
+ZEST_CASE(DirectiveBraces) {
+    ZEXPECT(designators("#define OPEN {\nSize s = { .width = 1, .") ==
+            std::vector<std::string>{"width"});
+}
+
+ZEST_CASE(TextAfterCursor) {
+    ZEXPECT(designators("Size s = { .width = 1, .height = 2 };", 24) ==
+            std::vector<std::string>{"width"});
+}
+
+};  // ZEST_SUITE(WrittenDesignators)
+
 ZEST_SUITE(DetectCompletionContext) {
 
 ZEST_CASE(IncludeAngled) {

@@ -1,5 +1,6 @@
 /// LSP replies converted into the shapes `answers.ts` renders.
 
+import * as fs from "node:fs";
 import * as proto from "vscode-languageserver-protocol";
 import type { CounterpartsResult } from "../../protocol/protocol.ts";
 import type {
@@ -20,7 +21,14 @@ import type {
     WorkspaceSymbol,
 } from "./answers.ts";
 import type { TextEdit } from "./edits.ts";
-import { displayPath, displayUri, uriToPath, type Root } from "./paths.ts";
+import {
+    displayPath,
+    displayUri,
+    outsidePath,
+    resourceRoot,
+    uriToPath,
+    type Root,
+} from "./paths.ts";
 import { SourceText, type Location, type Named, type Range, type RenderScope } from "./position.ts";
 
 /// What converting and rendering a reply needs to know about the
@@ -31,12 +39,12 @@ export class AnswerContext {
     private readonly read: (path: string) => string;
     private readonly cache = new Map<string, SourceText>();
 
-    /// `read` returns the text requests see for a rendered path: the open
-    /// buffer, else the disk.
-    constructor(workspace: string, read: (path: string) => string, roots: readonly Root[] = []) {
+    /// `read` returns the text requests see for a workspace path: the open
+    /// buffer, else the disk. A file outside reads from the disk.
+    constructor(workspace: string, read: (path: string) => string) {
         this.workspace = workspace;
         this.read = read;
-        this.roots = roots;
+        this.roots = [resourceRoot()];
     }
 
     path(uri: string): string {
@@ -48,7 +56,8 @@ export class AnswerContext {
     }
 
     file(path: string): SourceText {
-        const text = this.read(path);
+        const outside = outsidePath(path, this.roots);
+        const text = outside === undefined ? this.read(path) : fs.readFileSync(outside, "utf8");
         const cached = this.cache.get(path);
         if (cached?.text === text) {
             return cached;
@@ -93,6 +102,7 @@ export class AnswerContext {
             name: item.name,
             kind: enumName(proto.SymbolKind, item.kind),
             selection: { path: this.path(item.uri), range: item.selectionRange },
+            detail: item.detail,
         };
     }
 
@@ -134,12 +144,18 @@ export class AnswerContext {
         if (reply === null) {
             return null;
         }
+        if (proto.MarkupContent.is(reply.contents)) {
+            return {
+                kind: reply.contents.kind,
+                text: reply.contents.value,
+                range: reply.range === undefined ? undefined : { path, range: reply.range },
+            };
+        }
+        // Marked strings, which LSP deprecates, are markdown.
         const parts = Array.isArray(reply.contents) ? reply.contents : [reply.contents];
-        const markdown = parts
-            .map((part) => (typeof part === "string" ? part : part.value))
-            .join("\n");
         return {
-            markdown,
+            kind: "markdown",
+            text: parts.map((part) => (typeof part === "string" ? part : part.value)).join("\n"),
             range: reply.range === undefined ? undefined : { path, range: reply.range },
         };
     }
@@ -162,6 +178,12 @@ export class AnswerContext {
             ),
             source: diagnostic.source,
             code: diagnostic.code === undefined ? undefined : String(diagnostic.code),
+            related: (diagnostic.relatedInformation ?? []).map((info) => ({
+                location: this.location(info.location),
+                message: info.message,
+            })),
+            link: diagnostic.codeDescription?.href,
+            tags: (diagnostic.tags ?? []).map((tag) => enumName(proto.DiagnosticTag, tag)),
         }));
     }
 
@@ -209,6 +231,7 @@ export class AnswerContext {
             selection: { path, range: symbol.selectionRange },
             detail: symbol.detail,
             range: { path, range: symbol.range },
+            tags: (symbol.tags ?? []).map((tag) => enumName(proto.SymbolTag, tag)),
             children: (symbol.children ?? []).map(convert),
         });
         return (reply ?? []).map(convert);
@@ -292,10 +315,12 @@ export class AnswerContext {
 }
 
 /// A worker's way of dying differs by platform (a signal, a Windows
-/// exception): the text names it `${CRASH}`.
+/// exception): the text names it `${CRASH}`. The pool's crash report
+/// gives the bare number, a signal or a Windows exit code, before the
+/// crash streak.
 export function elideCrash(text: string): string {
     return text.replace(
-        /killed by signal \d+ \(\w+\)|terminated by (?:exception )?0x[0-9A-Fa-f]+(?: \([^)]*\))?/g,
+        /killed by signal \d+ \(\w+\)|terminated by (?:exception )?0x[0-9A-Fa-f]+(?: \([^)]*\))?|(?:killed by signal|exited with code) -?\d+(?= \(crash streak)/g,
         "${CRASH}",
     );
 }

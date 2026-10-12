@@ -1,0 +1,13 @@
+[[answers.vector.code_actions]]
+kind = "quickfix"
+title = "Add #include <vector>"
+compiles = true
+
+[answers.vector.code_actions.edits]
+"main.cpp" = '''
+ // inactive is no include guard either: with no include to follow, the
+ // directive goes below the comment opening the file, not into the block.
++#include <vector>
+
+ #ifndef MAX_SIZE
+'''

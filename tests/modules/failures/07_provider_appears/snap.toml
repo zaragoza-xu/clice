@@ -1,0 +1,4 @@
+[test.before]
+errors = [
+    { at = "import ⟦A;⟧", severity = "error", message = "could not build module 'A': module 'M' not found", source = "clang", code = "err_module_not_built" },
+]

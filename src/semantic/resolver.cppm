@@ -6,8 +6,8 @@ module clice:semantic.resolver;
 
 namespace clice::types {
 
-/// What a parameter of a function template stands for when no
-/// instantiation in progress binds it.
+/// What a parameter of the template a query is inside of stands for when
+/// no instantiation in progress binds it.
 struct ResolverOptions {
     /// The argument of the template's only instantiation in the unit. An
     /// index stored for other units to share leaves it off: the index of a
@@ -60,7 +60,9 @@ public:
     clang::QualType arrow_pointee(clang::QualType type);
 
     /// What an `auto` variable a dependent initializer left undeduced
-    /// deduces to, resolved. Null when the initializer does not resolve.
+    /// deduces to, resolved; with `only_instantiation`, inside a class
+    /// template the unit instantiates once, as in that instantiation. Null
+    /// when the initializer does not resolve.
     clang::QualType deduce(const clang::VarDecl* var);
 
     using lookup_result = clang::DeclContext::lookup_result;

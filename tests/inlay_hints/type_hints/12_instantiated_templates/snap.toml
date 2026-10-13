@@ -1,8 +1,13 @@
 [answers.single]
-wrong = "the only instantiation, Single<char>, fixes the type of copy, which should show : char (clangd#2275)"
 inlay_hints = [
     { line = "take(⟨first:⟩1, ⟨second:⟩2);" },
+    { line = "auto copy⟨: char⟩ = T();" },
 ]
 
 [answers.twice]
 inlay_hints = []
+
+[answers.outside]
+inlay_hints = [
+    { line = "auto copy⟨: char⟩ = T();" },
+]

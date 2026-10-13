@@ -73,6 +73,76 @@ void visit_template_decl_contexts(clang::Decl* decl, const Callback& callback) {
     }
 }
 
+/// A parameter list naming the parameters of `owner`, a class template the
+/// unit instantiates once, with that instantiation.
+struct OnlyInstantiation {
+    clang::ClassTemplateDecl* owner;
+    clang::TemplateParameterList* params;
+    const clang::ClassTemplateSpecializationDecl* instantiation;
+};
+
+/// The parameter lists through which `var` can name the parameters of the
+/// class templates around it. Besides each template's own list, a
+/// declaration defined outside its class (`void Holder<T>::f() {}`) names
+/// them through lists of its own, one per enclosing template, outermost
+/// first.
+llvm::SmallVector<OnlyInstantiation> only_instantiations(const clang::VarDecl* var) {
+    /// Innermost first, with a null instantiation for a template that has
+    /// none or several.
+    llvm::SmallVector<OnlyInstantiation> enclosing;
+    /// The lists of a declaration outside its class, and how many enclosing
+    /// templates were met up to it.
+    llvm::SmallVector<std::pair<llvm::ArrayRef<clang::TemplateParameterList*>, unsigned>> outside;
+
+    /// A friend defined inside a class belongs to the enclosing namespace
+    /// but sees the class's parameters.
+    auto scope = [](const clang::Decl* decl) {
+        return decl->getFriendObjectKind() != clang::Decl::FOK_None ? decl->getLexicalDeclContext()
+                                                                    : decl->getDeclContext();
+    };
+    for(const clang::Decl* decl = var; decl && !llvm::isa<clang::TranslationUnitDecl>(decl);
+        decl = llvm::dyn_cast<clang::Decl>(scope(decl))) {
+        auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(decl);
+        if(auto* owner = record ? record->getDescribedClassTemplate() : nullptr) {
+            // The helper keeps its clangd signature, which speaks mutable
+            // pointers; it only reads through them.
+            auto* instantiation = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(
+                decls::only_instantiation(const_cast<clang::CXXRecordDecl*>(record)));
+            enclosing.push_back({owner, owner->getTemplateParameters(), instantiation});
+        }
+        /// A member class template's own list is not among its outer ones.
+        llvm::ArrayRef<clang::TemplateParameterList*> lists;
+        if(auto* declarator = llvm::dyn_cast<clang::DeclaratorDecl>(decl)) {
+            lists = declarator->getTemplateParameterLists();
+        } else if(auto* tag = llvm::dyn_cast<clang::TagDecl>(decl)) {
+            lists = tag->getTemplateParameterLists();
+        }
+        if(!lists.empty()) {
+            outside.emplace_back(lists, enclosing.size());
+        }
+    }
+
+    llvm::SmallVector<OnlyInstantiation> bound;
+    for(auto& entry: enclosing) {
+        if(entry.instantiation) {
+            bound.push_back(entry);
+        }
+    }
+    for(auto& [lists, below]: outside) {
+        auto above = llvm::ArrayRef(enclosing).drop_front(below);
+        if(lists.size() != above.size()) {
+            continue;
+        }
+        for(unsigned i = 0; i < lists.size(); i += 1) {
+            auto& entry = above[above.size() - 1 - i];
+            if(entry.instantiation) {
+                bound.push_back({entry.owner, lists[i], entry.instantiation});
+            }
+        }
+    }
+    return bound;
+}
+
 /// A helper class to record the instantiation stack.
 struct InstantiationStack {
     using Arguments = llvm::SmallVector<clang::TemplateArgument, 4>;
@@ -1022,6 +1092,14 @@ public:
         return AT && AT->getDeducedKind() != clang::DeducedKind::Deduced;
     }
 
+    /// Bind `params`, which name the parameters of `owner`, to `arguments`
+    /// for the rest of this query.
+    void assume(clang::ClassTemplateDecl* owner,
+                clang::TemplateParameterList* params,
+                TemplateArguments arguments) {
+        stack.push(owner, params, arguments);
+    }
+
     /// What the `auto` variable `var` deduces to from its initializer, by
     /// the rules of a function template parameter of its declared type: a
     /// value drops the initializer's cv-qualifiers and decays an array, a
@@ -1080,12 +1158,12 @@ public:
 
         auto argument = source.getNonReferenceType();
         if(auto* RRT = declared->getAs<clang::RValueReferenceType>()) {
-            /// Clang cannot tell what a dependent call or subscript yields;
-            /// the type it returns says.
-            bool lvalue = evaluated && llvm::isa<clang::CallExpr, clang::ArraySubscriptExpr>(
-                                           init->IgnoreParens())
-                              ? source->isLValueReferenceType()
-                              : init->isLValue();
+            /// Clang cannot tell what a dependent call or subscript yields,
+            /// nor what a cast to a dependent reference type collapses to
+            /// (`static_cast<T&&>` with `T = int&`); the type says.
+            bool opaque = evaluated && llvm::isa<clang::CallExpr, clang::ArraySubscriptExpr>(
+                                           init->IgnoreParens());
+            bool lvalue = source->isLValueReferenceType() || (!opaque && init->isLValue());
             auto pointee = RRT->getPointeeType();
             if(lvalue && llvm::isa<clang::AutoType>(pointee) && !pointee.hasLocalQualifiers()) {
                 return context.getLValueReferenceType(argument);
@@ -1916,7 +1994,8 @@ private:
     /// only instantiation: a generic lambda's `auto` parameter stands for
     /// the type the lambda is called with. Several instantiations give no
     /// one answer. A class template's parameters stay as they are: the
-    /// resolver reads its patterns with them unbound.
+    /// resolver reads its patterns with them unbound, save where a query
+    /// binds them first (TemplateResolver::deduce).
     const clang::TemplateArgument*
         only_instantiation_argument(const clang::TemplateTypeParmType* TTPT) const {
         if(!options.only_instantiation) {
@@ -2928,7 +3007,20 @@ clang::TagDecl* TemplateResolver::resolve_tag(clang::QualType type) {
 }
 
 clang::QualType TemplateResolver::deduce(const clang::VarDecl* var) {
-    PseudoInstantiator instantiator(context, resolved, options);
+    /// A variable inside class templates the unit instantiates once deduces
+    /// as in those instantiations. Their parameters are bound for this query
+    /// alone, so what it resolves under them stays out of the unit's cache.
+    llvm::SmallVector<OnlyInstantiation> bindings;
+    if(options.only_instantiation) {
+        bindings = only_instantiations(var);
+    }
+    llvm::DenseMap<const void*, clang::QualType> scoped;
+    PseudoInstantiator instantiator(context, bindings.empty() ? resolved : scoped, options);
+    for(auto& binding: bindings) {
+        instantiator.assume(binding.owner,
+                            binding.params,
+                            binding.instantiation->getTemplateArgs().asArray());
+    }
     auto type = instantiator.deduce_auto(var);
     return type.isNull() ? type : instantiator.resolve(type);
 }

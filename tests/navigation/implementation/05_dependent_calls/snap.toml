@@ -1,7 +1,8 @@
 [answers.template_call]
-wrong = "go to implementation should reach A::foo, the method of the type process is instantiated with"
-implementation = []
+implementation = ["void ⟦foo⟧() {} @+4"]
 
 [answers.lambda_call]
-wrong = "go to implementation should reach B::bar, the method of the type the lambda is called with"
+implementation = ["void ⟦bar⟧() {}"]
+
+[answers.several_calls]
 implementation = []

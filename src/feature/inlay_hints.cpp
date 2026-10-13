@@ -25,6 +25,103 @@ using llvm::dyn_cast_or_null;
 // For now, inlay hints are always anchored at the left or right of their range.
 enum class HintSide : std::uint8_t { Left, Right };
 
+/// The types the code wrote for the parts of a type: every alias and
+/// template specialization in it, through the aliases' own definitions,
+/// keyed by the canonical type each names. Clang substitutes a class
+/// template's members with its canonical arguments, so the `first` of a
+/// `std::map<std::string, Point>` element is a `const basic_string<char>`;
+/// the map as written gives the `std::string` back.
+class WrittenTypes {
+public:
+    explicit WrittenTypes(clang::ASTContext& context) : context(context) {}
+
+    void collect(clang::QualType written) {
+        /// The sugar of one type all names one canonical type: the code
+        /// wrote the outermost, an alias's definition the ones beneath.
+        bool named = false;
+        while(!written.isNull()) {
+            const auto* type = written.getTypePtr();
+            if(llvm::isa<clang::PointerType, clang::ReferenceType>(type)) {
+                written = type->getPointeeType();
+                named = false;
+                continue;
+            }
+            if(!named && llvm::isa<clang::TypedefType, clang::TemplateSpecializationType>(type)) {
+                add(written);
+                named = true;
+            }
+            if(const auto* TST = llvm::dyn_cast<clang::TemplateSpecializationType>(type)) {
+                for(const auto& argument: TST->template_arguments()) {
+                    if(argument.getKind() == clang::TemplateArgument::Type) {
+                        collect(argument.getAsType());
+                    }
+                }
+                written = TST->isTypeAlias() ? TST->getAliasedType() : clang::QualType();
+                continue;
+            }
+            auto desugared = written.getSingleStepDesugaredType(context);
+            if(desugared == written) {
+                /// Writing the type without an alias is one more way of
+                /// writing it.
+                if(!named) {
+                    add(written);
+                }
+                break;
+            }
+            written = desugared;
+        }
+    }
+
+    /// `type` with each part clang left canonical as the code wrote it, when
+    /// the code wrote it one way only.
+    clang::QualType as_written(clang::QualType type) const {
+        auto qualifiers = type.getLocalQualifiers();
+        const auto* bare = type.getTypePtr();
+        while(const auto* subst = llvm::dyn_cast<clang::SubstTemplateTypeParmType>(bare)) {
+            qualifiers.addQualifiers(subst->getReplacementType().getLocalQualifiers());
+            bare = subst->getReplacementType().getTypePtr();
+        }
+        if(!bare->isCanonicalUnqualified()) {
+            return type;
+        }
+        if(auto it = types.find(bare); it != types.end() && !it->second.isNull()) {
+            return context.getQualifiedType(it->second, qualifiers);
+        }
+        if(const auto* pointer = llvm::dyn_cast<clang::PointerType>(bare)) {
+            return context.getQualifiedType(
+                context.getPointerType(as_written(pointer->getPointeeType())),
+                qualifiers);
+        }
+        if(const auto* reference = llvm::dyn_cast<clang::LValueReferenceType>(bare)) {
+            return context.getQualifiedType(
+                context.getLValueReferenceType(as_written(reference->getPointeeType())),
+                qualifiers);
+        }
+        if(const auto* reference = llvm::dyn_cast<clang::RValueReferenceType>(bare)) {
+            return context.getQualifiedType(
+                context.getRValueReferenceType(as_written(reference->getPointeeType())),
+                qualifiers);
+        }
+        return type;
+    }
+
+private:
+    /// Two ways the code wrote one type leave it as clang has it: nothing
+    /// says which one the code meant.
+    void add(clang::QualType type) {
+        auto unqualified = type.getLocalUnqualifiedType();
+        auto [it, inserted] =
+            types.try_emplace(context.getCanonicalType(unqualified).getTypePtr(), unqualified);
+        if(!inserted && !it->second.isNull() &&
+           it->second.getAsString() != unqualified.getAsString()) {
+            it->second = clang::QualType();
+        }
+    }
+
+    clang::ASTContext& context;
+    llvm::DenseMap<const clang::Type*, clang::QualType> types;
+};
+
 // for a ParmVarDecl from a function declaration, returns the corresponding
 // ParmVarDecl from the definition if possible, nullptr otherwise.
 const clang::ParmVarDecl* param_definition(const clang::ParmVarDecl* param) {
@@ -998,15 +1095,27 @@ private:
         // Do not show hints for the aggregate in a structured binding,
         // but show hints for the individual bindings.
         if(auto* decl = dyn_cast<clang::DecompositionDecl>(var)) {
+            // The bindings come out of the type the code wrote for what it
+            // decomposes: a range-for's range, else the initializer.
+            WrittenTypes written_types(unit.context());
+            auto range = range_inits.find(decl);
+            const auto* written = range != range_inits.end() ? range->second : decl->getInit();
+            if(written) {
+                written_types.collect(written->getType());
+            }
             for(auto* binding: decl->bindings()) {
-                // For structured bindings, print canonical types. This is important
-                // because for bindings that use the tuple_element protocol, the
-                // non-canonical types would be "tuple_element<I, A>::type".
-                if(auto type = binding->getType(); !type.isNull() && !type->isDependentType()) {
-                    add_type_hint(binding->getLocation(),
-                                  type.getCanonicalType(),
-                                  /*Prefix=*/": ");
+                auto type = binding->getType();
+                if(type.isNull() || type->isDependentType()) {
+                    continue;
                 }
+                // A tuple-like binding is declared `std::tuple_element<I, E>::type`,
+                // whatever the library's sugar beneath names nothing the code wrote.
+                if(binding->getHoldingVar()) {
+                    type = type.getCanonicalType();
+                }
+                add_type_hint(binding->getLocation(),
+                              written_types.as_written(type),
+                              /*Prefix=*/": ");
             }
             return;
         }
@@ -1021,6 +1130,14 @@ private:
                 // Alternatively, we could place the hint on the `auto`
                 // (and then just print the type deduced for the `auto`).
                 add_type_hint(var->getLocation(), var->getType(), /*Prefix=*/": ");
+            } else if(type->isDependentType() && var->getInit()) {
+                // A dependent initializer leaves `auto` to instantiation;
+                // the resolver still tells the type where the template's
+                // only instantiation or a class template's members do.
+                if(auto deduced = unit.resolver().deduce(var);
+                   !deduced.isNull() && !deduced->isDependentType()) {
+                    add_type_hint(var->getLocation(), deduced, /*Prefix=*/": ");
+                }
             }
         }
 
@@ -1160,6 +1277,7 @@ private:
     }
 
     void handle_range_for(const clang::CXXForRangeStmt* S) {
+        range_inits.try_emplace(S->getLoopVariable(), S->getRangeInit());
         if(options.block_end) {
             // Decomposition loop variables have no identifier: plain "// for".
             mark_block_end(S->getBody(), "for", display::identifier_of(S->getLoopVariable()));
@@ -1275,6 +1393,8 @@ private:
     // For now, the answer is neither, just mark as "if".
     // The ElseIf is a different IfStmt that doesn't know about the outer one.
     llvm::DenseSet<const clang::IfStmt*> else_ifs;  // not eligible for names
+    /// A range-for's loop variable, visited after the loop, by its range.
+    llvm::DenseMap<const clang::VarDecl*, const clang::Expr*> range_inits;
 };
 
 }  // namespace

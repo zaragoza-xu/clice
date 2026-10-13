@@ -1,0 +1,28 @@
+[answers.function]
+inlay_hints = [
+    { line = "auto kept⟨: Point⟩ = value;" },
+]
+
+[answers.lambda]
+inlay_hints = [
+    { line = "auto width⟨: int⟩ = point.x;" },
+]
+
+[answers.several]
+inlay_hints = []
+
+[answers.uninstantiated]
+inlay_hints = [
+    { line = "auto total⟨: int⟩ = items.size();" },
+]
+
+[answers.defaulted]
+inlay_hints = []
+
+[answers.explicit_arguments]
+inlay_hints = [
+    { line = "auto* built = create<B>(⟨args:⟩u);" },
+]
+
+[answers.passed_over]
+inlay_hints = []

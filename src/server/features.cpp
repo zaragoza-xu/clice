@@ -1459,7 +1459,7 @@ Features::RawResult Features::type_definition(Ticket ticket,
     std::vector<index::Site> sites;
     for(auto symbol: cursor->symbols) {
         // The type an `auto` stands for is its own type definition.
-        bool deduced = query.deduced(*cursor, symbol);
+        bool deduced = query.relates(*cursor, symbol, RelationKind::Deduced);
         llvm::append_range(
             sites,
             gather(symbol, path_id, [&](const index::IndexQuery& from, index::SymbolHash named) {
@@ -1489,11 +1489,27 @@ Features::RawResult Features::implementation(Ticket ticket,
     if(!cursor) {
         co_return serde_raw{"[]"};
     }
-    auto sites = gather(cursor->symbols,
-                        path_id,
-                        [&](const index::IndexQuery& from, index::SymbolHash named) {
-                            return from.implementation(named, path_id);
-                        });
+    std::vector<index::Site> sites;
+    for(auto symbol: cursor->symbols) {
+        // What a name may mean — a dependent name's resolution, an overload
+        // set's candidates, a using-declaration's targets — implements it,
+        // as an override implements a virtual function.
+        if(query.relates(*cursor, symbol, RelationKind::WeakReference)) {
+            llvm::append_range(
+                sites,
+                gather(symbol,
+                       path_id,
+                       [&](const index::IndexQuery& from, index::SymbolHash named) {
+                           return from.sites(named, path_id, RelationKind::Definition);
+                       }));
+        }
+        llvm::append_range(
+            sites,
+            gather(symbol, path_id, [&](const index::IndexQuery& from, index::SymbolHash named) {
+                return from.implementation(named, path_id);
+            }));
+    }
+    index::dedup_sites(sites);
     // A function nothing overrides answers with its definition: standing
     // on it, there is nowhere to go.
     std::erase_if(sites,

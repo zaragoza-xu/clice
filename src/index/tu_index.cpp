@@ -13,6 +13,7 @@ import :index.shard;
 import :index.tu_index;
 import :semantic.decls;
 import :semantic.display;
+import :semantic.resolver;
 import :semantic.types;
 import :support.logging;
 import :support.timer;
@@ -175,9 +176,10 @@ clang::QualType value_type(const clang::ValueDecl* decl) {
 
 /// The declaration go-to-type-definition reaches from a value or a
 /// function: the one its value_type names once pointers, references and
-/// arrays are stripped.
-const clang::NamedDecl* type_definition_of(const clang::ValueDecl* decl) {
-    return types::decl_of(types::unwrap(value_type(decl)));
+/// arrays are stripped, and inside a template once the resolver resolved it.
+const clang::NamedDecl* type_definition_of(const clang::ValueDecl* decl,
+                                           types::TemplateResolver& resolver) {
+    return types::decl_of(types::unwrap(resolver.resolve(value_type(decl))), &resolver);
 }
 
 /// Occurrences cover disjoint ranges: a name inside another symbol's
@@ -307,8 +309,8 @@ bool is_completable(const clang::NamedDecl* decl) {
 class Projector {
 public:
     Projector(CompilationUnitRef unit, const TUIndexOptions& options) :
-        unit(unit), main_file_only(options.main_file_only), known_variants(options.known_variants) {
-    }
+        unit(unit), main_file_only(options.main_file_only), known_variants(options.known_variants),
+        resolver(unit.context(), {.only_instantiation = options.only_instantiation}) {}
 
     /// The only gate through which entries enter `file_indices`. With
     /// main_file_only, the index covers just the main file and the
@@ -519,16 +521,16 @@ public:
     /// value): the type it is declared with, and for a smart pointer also
     /// the type it points to.
     void add_type_definitions(const clang::ValueDecl* decl) {
-        auto* target = type_definition_of(decl);
+        auto* target = type_definition_of(decl, resolver);
         if(!target) {
             return;
         }
         add_pair_relation(decl, RelationKind::TypeDefinition, target, decl->getLocation());
-        auto type = types::unwrap(value_type(decl));
+        auto type = types::unwrap(resolver.resolve(value_type(decl)));
         if(!llvm::isa<clang::CXXRecordDecl>(target) || type->isDependentType()) {
             return;
         }
-        if(auto* pointed = types::decl_of(types::unwrap(unit.resolver().arrow_pointee(type)))) {
+        if(auto* pointed = types::decl_of(types::unwrap(resolver.arrow_pointee(type)))) {
             add_pair_relation(decl, RelationKind::TypeDefinition, pointed, decl->getLocation());
         }
     }
@@ -546,12 +548,12 @@ public:
         if(pattern == decl->getCanonicalDecl()) {
             return;
         }
-        auto* target = type_definition_of(llvm::cast<clang::ValueDecl>(decl));
+        auto* target = type_definition_of(llvm::cast<clang::ValueDecl>(decl), resolver);
         if(!target) {
             return;
         }
         target = decls::normalize(target);
-        auto* declared = type_definition_of(llvm::cast<clang::ValueDecl>(pattern));
+        auto* declared = type_definition_of(llvm::cast<clang::ValueDecl>(pattern), resolver);
         if(declared && unit.entity(decls::normalize(declared)) == unit.entity(target)) {
             return;
         }
@@ -809,7 +811,7 @@ public:
             }
             // A dependent call reaches every candidate the resolver finds
             // for it, as its weak references do.
-            for(auto* candidate: unit.resolver().lookup(CE)) {
+            for(auto* candidate: resolver.lookup(CE)) {
                 call(candidate->getUnderlyingDecl(), range);
             }
             return;
@@ -1057,11 +1059,11 @@ public:
             if(!var || !var->getInit()) {
                 return;
             }
-            type = unit.resolver().deduce(var);
+            type = resolver.deduce(var);
         }
 
         clang::SourceRange name(location, unit.file_location(keyword.getEnd()));
-        for(const auto* target: types::decls_of(types::unwrap(type), &unit.resolver())) {
+        for(const auto* target: types::decls_of(types::unwrap(type), &resolver)) {
             // A closure type is declared by no name to reach.
             if(const auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(target);
                record && record->isLambda()) {
@@ -1157,7 +1159,7 @@ public:
                 continue;
             }
 
-            for(auto& occurrence: resolve_occurrences(semantics, i, &unit.resolver())) {
+            for(auto& occurrence: resolve_occurrences(semantics, i, &resolver)) {
                 auto name = add_name(occurrence);
 
                 if(occurrence.kind.is_one_of(RelationKind::Reference)) {
@@ -1407,6 +1409,7 @@ private:
     CompilationUnitRef unit;
     bool main_file_only;
     llvm::ArrayRef<std::uint64_t> known_variants;
+    types::TemplateResolver resolver;
     IncludeTree tree;
     SymbolTable symbols;
     /// Build-time working state keyed by FileID — clang::FileID means

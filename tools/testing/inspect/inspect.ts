@@ -98,7 +98,9 @@ interface RawSignatureHelp {
         | {
               label: string;
               documentation?: string | null;
-              parameters?: { label: string | [number, number] }[] | null;
+              parameters?:
+                  | { label: string | [number, number]; documentation?: string | null }[]
+                  | null;
               active_parameter?: number | null;
           }[]
         | null;
@@ -154,14 +156,6 @@ interface RawLink {
     /// The target's absolute path.
     target: string;
 }
-
-/// The configuration table of each feature that takes options.
-const SECTIONS: Record<string, string> = {
-    code_completion: "code_completion",
-    hover: "hover",
-    inlay_hint: "inlay_hints",
-    signature_help: "signature_help",
-};
 
 /// Twin of SymbolModifiers::Kind (src/semantic/symbol.cppm), in bit order:
 /// the server names them through its legend.
@@ -367,6 +361,9 @@ export class Inspect extends Client {
                     : { documentation: signature.documentation }),
                 parameters: (signature.parameters ?? []).map((parameter) => ({
                     label: parameter.label,
+                    ...(parameter.documentation == null
+                        ? {}
+                        : { documentation: parameter.documentation }),
                 })),
                 ...(signature.active_parameter == null
                     ? {}
@@ -678,10 +675,8 @@ export class Inspect extends Client {
             fs.writeFileSync(table, JSON.stringify(places));
             args.push(`--markers=${table}`);
         }
-        const section = SECTIONS[feature];
-        const options = section === undefined ? undefined : this.config?.[section];
-        if (options !== undefined) {
-            args.push(`--config=${JSON.stringify(options)}`);
+        if (this.config !== undefined) {
+            args.push(`--config=${JSON.stringify(this.config)}`);
         }
         recordInvocation(args);
         const result = await runProcess(cliceExecutable(), args, {

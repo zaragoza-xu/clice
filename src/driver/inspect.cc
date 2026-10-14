@@ -57,8 +57,8 @@ struct InspectOptions {
     <std::string> flags;
 
     DecoKV(help =
-               "Feature options overlay as a JSON object "
-               "(only features that take options accept it)",
+               "Configuration overlay as a JSON object of clice.toml "
+               "sections, over the workspace's configuration",
            required = false)
     <std::string> config;
 
@@ -134,42 +134,23 @@ struct StrictJson {
     constexpr static bool deny_unknown_fields = true;
 };
 
-/// The --config JSON overlaid on the feature's default options.
-/// The options struct doubles as its config section (all fields
-/// `defaulted = true`), so decoding onto a fresh value IS the overlay:
-/// missing keys keep the field initializers, exactly like the server's
-/// config sections. Runners re-parse on each call; --config was validated up
-/// front in run_inspect, so their parse cannot fail.
-template <typename Options>
-std::optional<Options> parse_feature_config(llvm::StringRef config) {
-    Options options;
-    if(config.empty()) {
-        return options;
-    }
-    if(auto result = kota::codec::json::from_string<StrictJson>(config, options); !result) {
-        LOG_ERROR("invalid --config: {}", result.error().message);
-        return std::nullopt;
-    }
-    return options;
-}
-
 std::optional<kota::codec::RawValue> run_folding_ranges(CompilationUnitRef unit,
-                                                        [[maybe_unused]] llvm::StringRef config) {
+                                                        [[maybe_unused]] const Config& config) {
     return to_raw_json(feature::folding_ranges(unit));
 }
 
 std::optional<kota::codec::RawValue> run_semantic_tokens(CompilationUnitRef unit,
-                                                         [[maybe_unused]] llvm::StringRef config) {
+                                                         [[maybe_unused]] const Config& config) {
     return to_raw_json(feature::semantic_tokens(unit));
 }
 
 std::optional<kota::codec::RawValue> run_document_symbols(CompilationUnitRef unit,
-                                                          [[maybe_unused]] llvm::StringRef config) {
+                                                          [[maybe_unused]] const Config& config) {
     return to_raw_json(feature::document_symbols(unit));
 }
 
 std::optional<kota::codec::RawValue> run_document_links(CompilationUnitRef unit,
-                                                        [[maybe_unused]] llvm::StringRef config) {
+                                                        [[maybe_unused]] const Config& config) {
     return to_raw_json(feature::document_links(unit));
 }
 
@@ -199,10 +180,8 @@ struct RawInlayHint {
 /// first as an open buffer's is.
 std::optional<kota::codec::RawValue> run_inlay_hints(CompilationUnitRef unit,
                                                      LocalSourceRange range,
-                                                     llvm::StringRef config) {
-    auto hints = feature::inlay_hints(unit,
-                                      range,
-                                      *parse_feature_config<feature::InlayHintsOptions>(config));
+                                                     const Config& config) {
+    auto hints = feature::inlay_hints(unit, range, config.inlay_hints);
 
     std::string bytes;
     index::TUIndex tu;
@@ -260,7 +239,7 @@ std::optional<kota::codec::RawValue> run_inlay_hints(CompilationUnitRef unit,
 
 std::optional<kota::codec::RawValue> run_selection_range(CompilationUnitRef unit,
                                                          std::uint32_t offset,
-                                                         [[maybe_unused]] llvm::StringRef config) {
+                                                         [[maybe_unused]] const Config& config) {
     return to_raw_json(feature::selection_ranges(unit, {offset}).front());
 }
 
@@ -277,7 +256,7 @@ struct RawCodeAction {
 /// the main file are all kept, no header declares any name.
 std::optional<kota::codec::RawValue> run_code_action(CompilationUnitRef unit,
                                                      LocalSourceRange selection,
-                                                     [[maybe_unused]] llvm::StringRef config) {
+                                                     [[maybe_unused]] const Config& config) {
     std::vector<RawCodeAction> out;
     auto path = unit.file_path(unit.main_file());
     for(auto& action: feature::code_actions(unit, selection)) {
@@ -313,24 +292,18 @@ std::optional<kota::codec::RawValue> run_code_action(CompilationUnitRef unit,
 }
 
 /// nullopt = serialization failure; an empty RawValue serializes as null
-/// and records a marker with no hover.
+/// and records a marker with no hover. The card is markdown, as a client
+/// that shows markdown gets it.
 std::optional<kota::codec::RawValue> run_hover(CompilationUnitRef unit,
                                                std::uint32_t offset,
-                                               llvm::StringRef config) {
-    auto options = *parse_feature_config<feature::HoverOptions>(config);
-    auto info = feature::hover_info(unit, offset, options);
+                                               const Config& config) {
+    auto info = feature::hover_info(unit, offset, config.hover, config.documentation);
     if(!info) {
         return kota::codec::RawValue{};
     }
-    auto document = info->present();
-    auto result = options.parse_comment_as_markdown
-                      ? HoverResult{info->symbol_range,
-                                    feature::protocol::MarkupKind::Markdown,
-                                    document.as_markdown()}
-                      : HoverResult{info->symbol_range,
-                                    feature::protocol::MarkupKind::PlainText,
-                                    document.as_plain_text()};
-    return to_raw_json(result);
+    return to_raw_json(HoverResult{info->symbol_range,
+                                   feature::protocol::MarkupKind::Markdown,
+                                   info->present().as_markdown()});
 }
 
 /// Completion-shaped features (code completion, signature help) drive
@@ -339,28 +312,27 @@ std::optional<kota::codec::RawValue> run_hover(CompilationUnitRef unit,
 /// against one shared unit. `params` arrives fully configured except for
 /// the completion offset.
 std::optional<kota::codec::RawValue> run_code_completion(CompilationParams& params,
-                                                         llvm::StringRef config) {
+                                                         const Config& config) {
     // The replies of an editor client that takes everything an item can carry.
     return to_raw_json(
         feature::code_complete(params,
-                               *parse_feature_config<feature::CodeCompletionOptions>(config),
+                               config.code_completion,
+                               config.documentation,
                                {.snippets = true, .insert_replace = true, .markdown = true})
             .list);
 }
 
 std::optional<kota::codec::RawValue> run_signature_help(CompilationParams& params,
-                                                        llvm::StringRef config) {
+                                                        const Config& config) {
     return to_raw_json(
-        feature::signature_help(params,
-                                *parse_feature_config<feature::SignatureHelpOptions>(config)));
+        feature::signature_help(params, config.signature_help, config.documentation));
 }
 
 /// Marker payload for document_highlight: the unit's own TU index stands
 /// in for the server's file index, the cursor resolved by the same rule.
-std::optional<kota::codec::RawValue>
-    run_document_highlight(CompilationUnitRef unit,
-                           std::uint32_t offset,
-                           [[maybe_unused]] llvm::StringRef config) {
+std::optional<kota::codec::RawValue> run_document_highlight(CompilationUnitRef unit,
+                                                            std::uint32_t offset,
+                                                            [[maybe_unused]] const Config& config) {
     auto bytes = index::build_tu_index(unit, {.only_instantiation = true});
     auto tu = index::TUIndex::from_bytes(bytes);
     const index::Shard& shard = tu.shard_of(tu.path_count() - 1);
@@ -381,48 +353,32 @@ std::optional<kota::codec::RawValue>
 /// point with its own completion compile (`run_complete`).
 struct FeatureSpec {
     llvm::StringRef name;
-    std::optional<kota::codec::RawValue> (*run)(CompilationUnitRef, llvm::StringRef) = nullptr;
+    std::optional<kota::codec::RawValue> (*run)(CompilationUnitRef, const Config&) = nullptr;
     std::optional<kota::codec::RawValue> (*run_at)(CompilationUnitRef,
                                                    std::uint32_t,
-                                                   llvm::StringRef) = nullptr;
+                                                   const Config&) = nullptr;
     std::optional<kota::codec::RawValue> (*run_over)(CompilationUnitRef,
                                                      LocalSourceRange,
-                                                     llvm::StringRef) = nullptr;
+                                                     const Config&) = nullptr;
     std::optional<kota::codec::RawValue> (*run_select)(CompilationUnitRef,
                                                        LocalSourceRange,
-                                                       llvm::StringRef) = nullptr;
+                                                       const Config&) = nullptr;
     std::optional<kota::codec::RawValue> (*run_complete)(CompilationParams&,
-                                                         llvm::StringRef) = nullptr;
-    /// Validates --config JSON for the feature; null for features without
-    /// options.
-    bool (*check_config)(llvm::StringRef) = nullptr;
+                                                         const Config&) = nullptr;
 };
 
-template <typename Options>
-bool check_feature_config(llvm::StringRef config) {
-    return parse_feature_config<Options>(config).has_value();
-}
-
 constexpr std::array features = {
-    FeatureSpec{.name = "code_action", .run_select = run_code_action},
-    FeatureSpec{.name = "code_completion",
-                .run_complete = run_code_completion,
-                .check_config = check_feature_config<feature::CodeCompletionOptions>},
-    FeatureSpec{.name = "document_highlight", .run_at = run_document_highlight},
-    FeatureSpec{.name = "document_links", .run = run_document_links},
-    FeatureSpec{.name = "document_symbol", .run = run_document_symbols},
-    FeatureSpec{.name = "folding_range", .run = run_folding_ranges},
-    FeatureSpec{.name = "hover",
-                .run_at = run_hover,
-                .check_config = check_feature_config<feature::HoverOptions>},
-    FeatureSpec{.name = "inlay_hint",
-                .run_over = run_inlay_hints,
-                .check_config = check_feature_config<feature::InlayHintsOptions>},
-    FeatureSpec{.name = "selection_range", .run_at = run_selection_range},
-    FeatureSpec{.name = "semantic_tokens", .run = run_semantic_tokens},
-    FeatureSpec{.name = "signature_help",
-                .run_complete = run_signature_help,
-                .check_config = check_feature_config<feature::SignatureHelpOptions>},
+    FeatureSpec{.name = "code_action",        .run_select = run_code_action      },
+    FeatureSpec{.name = "code_completion",    .run_complete = run_code_completion},
+    FeatureSpec{.name = "document_highlight", .run_at = run_document_highlight   },
+    FeatureSpec{.name = "document_links",     .run = run_document_links          },
+    FeatureSpec{.name = "document_symbol",    .run = run_document_symbols        },
+    FeatureSpec{.name = "folding_range",      .run = run_folding_ranges          },
+    FeatureSpec{.name = "hover",              .run_at = run_hover                },
+    FeatureSpec{.name = "inlay_hint",         .run_over = run_inlay_hints        },
+    FeatureSpec{.name = "selection_range",    .run_at = run_selection_range      },
+    FeatureSpec{.name = "semantic_tokens",    .run = run_semantic_tokens         },
+    FeatureSpec{.name = "signature_help",     .run_complete = run_signature_help },
 };
 
 const FeatureSpec* find_feature(llvm::StringRef name) {
@@ -542,14 +498,13 @@ std::optional<FileCommand> file_command(FileEntry& entry,
 /// pass, deliberately without the preamble PCH the server uses: a shared
 /// snapshot pins that the PCH split does not change feature results, so any
 /// divergence between the two paths shows as a snapshot mismatch instead of
-/// hiding in the preamble. With `clang_tidy` the compile runs the file's
-/// clang-tidy configuration as the server's does.
+/// hiding in the preamble. With `diagnostics.clang_tidy` the compile runs
+/// the file's clang-tidy configuration as the server's does.
 void run_feature(FileEntry& entry,
                  const FeatureSpec& spec,
                  const SourceFile& file,
                  const FileCommand& command,
-                 llvm::StringRef config,
-                 bool clang_tidy) {
+                 const Config& config) {
     auto prepare = [&](CompilationParams& params) {
         apply_command(params, command);
         std::string text = file.content;
@@ -562,7 +517,7 @@ void run_feature(FileEntry& entry,
     CompilationParams params;
     params.kind = CompilationKind::Content;
     prepare(params);
-    if(clang_tidy) {
+    if(config.diagnostics.clang_tidy) {
         auto resolution = tidy::resolve_tidy_params(file.path);
         if(!resolution.error.empty()) {
             LOG_WARN("{}", resolution.error);
@@ -686,19 +641,6 @@ int run_inspect(const InspectOptions& opts) {
         return 1;
     }
 
-    // Validate --config up front so a typo fails the whole run with a
-    // clear message instead of showing as a feature error.
-    llvm::StringRef config = opts.config.has_value() ? llvm::StringRef(*opts.config) : "";
-    if(!config.empty()) {
-        if(spec->check_config == nullptr) {
-            LOG_ERROR("feature '{}' does not accept --config", feature);
-            return 1;
-        }
-        if(!spec->check_config(config)) {
-            return 1;
-        }
-    }
-
     Spelling abs_path(inputs[1], Spelling::cwd());
     if(!vfs::exists(abs_path)) {
         LOG_ERROR("no such file or directory: {}", abs_path);
@@ -759,10 +701,26 @@ int run_inspect(const InspectOptions& opts) {
         LOG_ERROR("--configuration selects among the workspace's rules; --flags replaces them");
         return 1;
     }
+    auto overlay = [&] {
+        if(!opts.config.has_value()) {
+            return true;
+        }
+        auto result = kota::codec::json::from_string<StrictJson>(*opts.config, project.config);
+        if(!result) {
+            LOG_ERROR("invalid --config: {}", result.error().message);
+        }
+        return result.has_value();
+    };
     if(flags.empty()) {
         auto identity = CanonicalPath(directory);
         auto root = workspace_of(identity);
-        project.config = Config::load_from_workspace(root);
+        // The overlay goes in before the rules compile, as initializationOptions do.
+        project.config = Config::load_from_workspace(root, nullptr, nullptr, /*finalized=*/false);
+        if(!overlay()) {
+            return 1;
+        }
+        project.config.finalize(root);
+        project.config.keep_own_cache_dir();
         auto requested = opts.configuration.value_or("");
         if(auto checked = check_requested_configuration(project.config, requested); !checked) {
             LOG_ERROR("{}", checked.error());
@@ -774,6 +732,8 @@ int run_inspect(const InspectOptions& opts) {
                    root,
                    resolve_configuration(project.config, requested),
                    compile_commands_above(identity, root));
+    } else if(!overlay()) {
+        return 1;
     }
 
     auto name = path::filename(file.path).str();
@@ -801,7 +761,7 @@ int run_inspect(const InspectOptions& opts) {
     auto command = file_command(entry, file.path, flags, directory, file_table, commands);
     if(command) {
         command->workspace = project.config.workspace_root.str();
-        run_feature(entry, *spec, file, *command, config, project.config.diagnostics.clang_tidy);
+        run_feature(entry, *spec, file, *command, project.config);
     }
 
     auto json = kota::codec::json::to_string<InspectJsonConfig>(output);

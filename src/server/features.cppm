@@ -118,6 +118,7 @@ public:
     /// worker sends (see Dispatcher::query).
     RawResult hover(Ticket ticket,
                     const protocol::Position& position,
+                    protocol::MarkupKind markup,
                     kota::cancellation_token token = {});
     RawResult semantic_tokens(Ticket ticket, kota::cancellation_token token = {});
     RawResult inlay_hints(Ticket ticket,
@@ -335,8 +336,8 @@ private:
 
     /// The read-only hover card for the symbol under the cursor: name and
     /// kind from the symbol tables, definition text sliced from stored
-    /// content, the comment block above the definition. No Sema products
-    /// — see feature::index_hover.
+    /// content, the documentation read from the indexed text. No Sema
+    /// products — see feature::index_hover.
     std::optional<feature::HoverInfo> index_hover_card(const Session& session,
                                                        const protocol::Position& position);
 
@@ -365,7 +366,8 @@ private:
     /// target the way the user knows the file.
     std::vector<protocol::Location> directive_definition(const index::DocumentLink& link);
     std::optional<protocol::Hover> directive_hover(const Session& session,
-                                                   const index::DocumentLink& link);
+                                                   const index::DocumentLink& link,
+                                                   protocol::MarkupKind markup);
 
     /// A project asked about a symbol, and the symbol as that project
     /// names it: an id hashing its file (a macro, a file-local name) takes

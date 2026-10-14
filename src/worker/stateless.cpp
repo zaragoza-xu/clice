@@ -470,6 +470,7 @@ static worker::CompletionResult handle_completion(const worker::CompletionParams
 
     auto completion = feature::code_complete(cp,
                                              params.config.code_completion,
+                                             params.config.documentation,
                                              params.client,
                                              PositionEncoding::UTF16,
                                              params.candidates);
@@ -492,7 +493,10 @@ static kota::codec::RawValue handle_signature_help(const worker::SignatureHelpPa
     cp.completion = {params.file, params.offset};
     cp.stop = stop;
 
-    auto help = feature::signature_help(cp, params.config.signature_help, params.selected);
+    auto help = feature::signature_help(cp,
+                                        params.config.signature_help,
+                                        params.config.documentation,
+                                        params.selected);
     LOG_DEBUG("SignatureHelp done: {}ms", timer.ms());
 
     return to_raw(help);

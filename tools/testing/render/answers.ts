@@ -435,6 +435,8 @@ export interface Signature {
     /// The active parameter's span in the label.
     active?: { begin: number; end: number } | undefined;
     documentation?: string | undefined;
+    /// The active parameter's documentation.
+    parameterDocumentation?: string | undefined;
 }
 
 export interface Signatures {
@@ -450,7 +452,8 @@ export interface Popup {
 }
 
 /// Each signature with its active parameter in ⟦⟧, which one is active,
-/// and the documentation the client shows with it.
+/// and the documentation the client shows with it and with its active
+/// parameter.
 export function renderSignatures({ signatures, active }: Signatures): Table {
     const labels = signatures.map(({ label, active: parameter }) =>
         parameter === undefined
@@ -461,10 +464,12 @@ export function renderSignatures({ signatures, active }: Signatures): Table {
         return { signatures: [] };
     }
     const documentation = signatures[active]?.documentation;
+    const parameter = signatures[active]?.parameterDocumentation;
     return {
         signatures: labels,
         active,
         ...(documentation === undefined ? {} : { documentation }),
+        ...(parameter === undefined ? {} : { parameter_documentation: parameter }),
     };
 }
 

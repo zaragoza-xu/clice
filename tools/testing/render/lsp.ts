@@ -402,14 +402,15 @@ export function signatures(reply: proto.SignatureHelp | null): Signatures {
                     span = { begin: parameter.label[0], end: parameter.label[1] };
                 }
             }
-            const documentation =
-                typeof signature.documentation === "object"
-                    ? signature.documentation.value
-                    : signature.documentation;
+            const text = (value: string | proto.MarkupContent | undefined) =>
+                typeof value === "object" ? value.value : value;
+            const documentation = text(signature.documentation);
+            const parameterDocumentation = text(parameter?.documentation);
             return {
                 label: signature.label,
                 active: span,
                 ...(documentation === undefined ? {} : { documentation }),
+                ...(parameterDocumentation === undefined ? {} : { parameterDocumentation }),
             };
         }),
     };

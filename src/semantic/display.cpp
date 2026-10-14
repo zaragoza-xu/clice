@@ -9,7 +9,6 @@ module;
 
 module clice;
 
-import :semantic.decls;
 import :semantic.display;
 import :semantic.types;
 import :support.format;
@@ -126,15 +125,6 @@ std::string template_args(const clang::NamedDecl& decl) {
 }
 
 namespace {
-
-bool looks_like_doc_comment(llvm::StringRef comment) {
-    /// We don't report comments that only contain "special" chars.
-    /// This avoids reporting various delimiters, like:
-    ///   =================
-    ///   -----------------
-    ///   *****************
-    return comment.find_first_not_of("/*-= \t\r\n") != llvm::StringRef::npos;
-}
 
 // Determines if any intermediate type in desugaring QualType QT is of
 // substituted template parameter type. Ignore pointer or reference wrappers.
@@ -554,48 +544,6 @@ auto summarize(const clang::Expr* expr) -> std::string {
     };
 
     return Namer{}.Visit(expr);
-}
-
-auto comment(const clang::NamedDecl* decl) -> std::string {
-    assert(decl);
-    /// Chase the pattern to a fixed point: a comparison operator instantiated
-    /// from a spaceship operator that is itself a template instantiation
-    /// needs two hops. Termination rests on clang's instantiation graph
-    /// being acyclic — every hop moves strictly toward a written pattern.
-    while(const auto* pattern = decls::instantiated_from(decl)) {
-        if(pattern == decl) {
-            break;
-        }
-        decl = pattern;
-    }
-    if(llvm::isa<clang::NamespaceDecl>(decl)) {
-        /// Namespaces often have too many redecls for any particular redecl comment
-        /// to be useful. Moreover, we often confuse file headers or generated
-        /// comments with namespace comments. Therefore we choose to just ignore
-        /// the comments for namespaces.
-        return "";
-    }
-
-    const clang::ASTContext& context = decl->getASTContext();
-    /// Clang caches the comment it finds for the whole redeclaration chain:
-    /// asked from any other declaration, the one asked first would decide
-    /// for all.
-    const clang::RawComment* comment = context.getRawCommentForAnyRedecl(decl->getCanonicalDecl());
-    if(!comment) {
-        return "";
-    }
-
-    std::string doc =
-        comment->getFormattedText(context.getSourceManager(), context.getDiagnostics());
-    if(!looks_like_doc_comment(doc)) {
-        return "";
-    }
-
-    /// Clang requires source to be UTF-8, but doesn't enforce this in comments.
-    if(!llvm::json::isUTF8(doc)) {
-        doc = llvm::json::fixUTF8(doc);
-    }
-    return doc;
 }
 
 auto local_scope(const clang::Decl* decl) -> std::string {

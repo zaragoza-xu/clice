@@ -11,6 +11,7 @@ import :semantic.display;
 import :semantic.resolver;
 import :support.fuzzy_matcher;
 import :support.markup;
+import :syntax.documentation;
 import :syntax.completion;
 import :syntax.lexer;
 
@@ -647,11 +648,13 @@ struct OverloadItem {
     int dedup_priority = 0;
     std::string bundled_insert;
     bool bundled_snippet = false;
+    const clang::NamedDecl* documented = nullptr;
 };
 
 struct CollectedItem {
     protocol::CompletionItem item;
     int dedup_priority = 0;
+    const clang::NamedDecl* documented = nullptr;
 };
 
 /// A compile of the whole buffer a completion runs on, for what only the
@@ -920,14 +923,16 @@ public:
     CodeCompletionCollector(std::uint32_t offset,
                             PositionEncoding encoding,
                             std::vector<protocol::CompletionItem>& output,
+                            std::vector<const clang::NamedDecl*>& documented,
                             const CodeCompletionOptions& options,
                             const CompletionClient& client,
                             llvm::ArrayRef<ScopeCandidate> candidates,
                             bool& includes_pending,
                             WholeBuffer& whole) :
         clang::CodeCompleteConsumer(sema_options(options)), offset(offset), encoding(encoding),
-        output(output), options(options), argument_style(arguments_of(options.arguments)),
-        client(client), scope_candidates(candidates), includes_pending(includes_pending),
+        output(output), documented(documented), options(options),
+        argument_style(arguments_of(options.arguments)), client(client),
+        scope_candidates(candidates), includes_pending(includes_pending),
         info(std::make_shared<clang::GlobalCodeCompletionAllocator>()), whole(whole) {}
 
     clang::CodeCompletionAllocator& getAllocator() final {
@@ -1101,13 +1106,16 @@ public:
         /// `output`.
         auto run = [&](auto complete) {
             std::vector<protocol::CompletionItem> previous;
+            std::vector<const clang::NamedDecl*> previous_documented;
             previous.swap(output);
+            previous_documented.swap(documented);
             resolving = true;
             resolved_candidates = false;
             complete();
             resolving = false;
             if(!resolved_candidates) {
                 output.swap(previous);
+                documented.swap(previous_documented);
                 return false;
             }
             return true;
@@ -1172,6 +1180,7 @@ public:
                 });
                 if(!named) {
                     output.clear();
+                    documented.clear();
                     return true;
                 }
                 return run([&] {
@@ -1344,21 +1353,6 @@ public:
                 item.data = protocol::LSPAny(std::format("{}", candidate.include));
                 includes_pending = true;
             }
-            if(auto comment =
-                   candidate.documented ? display::comment(candidate.documented) : std::string();
-               !comment.empty()) {
-                protocol::MarkupContent documentation;
-                if(client.markdown) {
-                    markup::Document document;
-                    parse_documentation(comment, document);
-                    documentation.kind = protocol::MarkupKind::Markdown;
-                    documentation.value = document.as_markdown();
-                } else {
-                    documentation.kind = protocol::MarkupKind::PlainText;
-                    documentation.value = std::move(comment);
-                }
-                item.documentation = std::move(documentation);
-            }
             if(!candidate.signature.empty() || !candidate.return_type.empty()) {
                 protocol::CompletionItemLabelDetails details;
                 if(!candidate.signature.empty()) {
@@ -1408,6 +1402,7 @@ public:
                         .dedup_priority = priority,
                         .bundled_insert = candidate.bundled_insert,
                         .bundled_snippet = candidate.bundled_snippet,
+                        .documented = candidate.documented,
                     });
                 } else {
                     auto& existing = overloads[it->second];
@@ -1420,7 +1415,9 @@ public:
                 return;
             }
 
-            collected.push_back({.item = build_item(candidate, score), .dedup_priority = priority});
+            collected.push_back({.item = build_item(candidate, score),
+                                 .dedup_priority = priority,
+                                 .documented = candidate.documented});
         };
 
         bool keyword_snippets = options.statement_snippets && client.snippets;
@@ -2151,8 +2148,9 @@ public:
                     }
                 }
             }
-            collected.push_back(
-                {.item = std::move(entry.item), .dedup_priority = entry.dedup_priority});
+            collected.push_back({.item = std::move(entry.item),
+                                 .dedup_priority = entry.dedup_priority,
+                                 .documented = entry.documented});
         }
 
         // In bundle mode, deduplicate same-label candidates (see dedup_priority).
@@ -2178,9 +2176,11 @@ public:
         }
 
         output.clear();
+        documented.clear();
         output.reserve(collected.size());
         for(auto& entry: collected) {
             output.push_back(std::move(entry.item));
+            documented.push_back(entry.documented);
         }
     }
 
@@ -2188,6 +2188,11 @@ private:
     std::uint32_t offset;
     PositionEncoding encoding;
     std::vector<protocol::CompletionItem>& output;
+
+    /// What documents each item of `output`, in its order; read once the
+    /// compile is done.
+    std::vector<const clang::NamedDecl*>& documented;
+
     const CodeCompletionOptions& options;
     Arguments argument_style;
     const CompletionClient& client;
@@ -2204,23 +2209,42 @@ private:
 
 auto code_complete(CompilationParams& params,
                    const CodeCompletionOptions& options,
+                   const DocumentationOptions& documentation,
                    const CompletionClient& client,
                    PositionEncoding encoding,
                    llvm::ArrayRef<ScopeCandidate> candidates) -> Completion {
     auto offset = std::get<1>(params.completion);
 
     std::vector<protocol::CompletionItem> items;
+    std::vector<const clang::NamedDecl*> documented;
     WholeBuffer whole(params);
     bool includes = false;
     auto* consumer = new CodeCompletionCollector(offset,
                                                  encoding,
                                                  items,
+                                                 documented,
                                                  options,
                                                  client,
                                                  candidates,
                                                  includes,
                                                  whole);
     auto unit = complete(params, consumer);
+
+    for(auto [item, decl]: llvm::zip_equal(items, documented)) {
+        if(!decl) {
+            continue;
+        }
+        auto doc = feature::documentation(unit, decl, documentation);
+        if(doc.empty()) {
+            continue;
+        }
+        auto shown = present(doc);
+        item.documentation = protocol::MarkupContent{
+            .kind =
+                client.markdown ? protocol::MarkupKind::Markdown : protocol::MarkupKind::PlainText,
+            .value = client.markdown ? shown.as_markdown() : shown.as_plain_text(),
+        };
+    }
 
     Completion completion{
         .list = completion_list(std::move(items), includes ? 0U : options.limit.value)};

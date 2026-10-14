@@ -10,6 +10,7 @@ import :compile.directive;
 import :feature.feature;
 import :semantic.display;
 import :support.markup;
+import :syntax.documentation;
 import :syntax.lexer;
 
 namespace clice::feature {
@@ -157,12 +158,17 @@ struct Signature {
     llvm::raw_svector_ostream stream{label};
     std::vector<protocol::ParameterInformation> parameters;
 
+    /// The names a documentation comment may give each parameter, none
+    /// for one it cannot name (an expanded pack's element).
+    std::vector<llvm::SmallVector<std::string, 1>> names;
+
     /// The last parameter takes every argument past the ones before it: a
     /// pack or a C-style `...`.
     bool pack = false;
 
-    /// Writes one parameter with `print`.
-    void parameter(llvm::function_ref<void(llvm::raw_ostream&)> print) {
+    /// Writes one parameter, which a comment may name `names`, with `print`.
+    void parameter(llvm::function_ref<void(llvm::raw_ostream&)> print,
+                   llvm::SmallVector<std::string, 1> names = {}) {
         if(!parameters.empty()) {
             stream << ", ";
         }
@@ -172,17 +178,15 @@ struct Signature {
         parameters.push_back({
             .label = std::tuple<protocol::uinteger, protocol::uinteger>{begin, end},
         });
+        this->names.push_back(std::move(names));
     }
 
     /// The finished signature, the parameter `argument` falls on active.
-    protocol::SignatureInformation finish(std::uint32_t argument, std::string documentation) && {
+    protocol::SignatureInformation finish(std::uint32_t argument) && {
         if(pack && argument >= parameters.size()) {
             argument = static_cast<std::uint32_t>(parameters.size() - 1);
         }
         protocol::SignatureInformation signature{.label = label.str().str()};
-        if(!documentation.empty()) {
-            signature.documentation = std::move(documentation);
-        }
         if(!parameters.empty()) {
             signature.parameters = std::move(parameters);
         }
@@ -191,12 +195,19 @@ struct Signature {
     }
 };
 
+/// What documents a signature: a declaration, and the names of its
+/// parameters (Signature::names).
+struct Documented {
+    const clang::NamedDecl* decl = nullptr;
+    std::vector<llvm::SmallVector<std::string, 1>> parameters;
+};
+
 class SignatureCollector final : public clang::CodeCompleteConsumer {
 public:
     SignatureCollector(protocol::SignatureHelp& help,
-                       clang::CodeCompleteOptions complete_options,
-                       const SignatureHelpOptions& options) :
-        clang::CodeCompleteConsumer(complete_options), help(help), options(options),
+                       std::vector<Documented>& sources,
+                       clang::CodeCompleteOptions complete_options) :
+        clang::CodeCompleteConsumer(complete_options), help(help), sources(sources),
         info(std::make_shared<clang::GlobalCodeCompletionAllocator>()) {}
 
     void ProcessOverloadCandidates(clang::Sema& sema,
@@ -323,7 +334,7 @@ public:
                 case clang::CodeCompleteConsumer::OverloadCandidate::CK_FunctionTemplate:
                     std::unreachable();
             }
-            help.signatures.push_back(std::move(signature).finish(current_arg, {}));
+            add(signature, current_arg, nullptr);
         }
     }
 
@@ -366,23 +377,15 @@ private:
     /// A C-style `...` takes every argument past the named parameters.
     static void variadic(Signature& signature, bool variadic) {
         if(variadic) {
-            signature.parameter([](llvm::raw_ostream& os) { os << "..."; });
+            signature.parameter([](llvm::raw_ostream& os) { os << "..."; }, {"..."});
             signature.pack = true;
         }
     }
 
-    /// The documentation comment of `decl`, as plain text.
-    std::string documentation(const clang::NamedDecl& decl) {
-        if(!options.documentation) {
-            return {};
-        }
-        auto comment = display::comment(&decl);
-        if(comment.empty()) {
-            return {};
-        }
-        markup::Document document;
-        parse_documentation(comment, document);
-        return document.as_plain_text();
+    /// Adds a signature that `decl`, when given, documents.
+    void add(Signature& signature, std::uint32_t argument, const clang::NamedDecl* decl) {
+        sources.push_back({.decl = decl, .parameters = signature.names});
+        help.signatures.push_back(std::move(signature).finish(argument));
     }
 
     /// Writes the parameters of `function` in [first, last).
@@ -394,9 +397,11 @@ private:
         for(unsigned index = first; index < last; index += 1) {
             bool expanded = index >= pack_begin && index < pack_end;
             auto name = expanded ? "" : parameter_name(function, index);
-            signature.parameter([&](llvm::raw_ostream& os) {
-                print_parameter(os, *function.getParamDecl(index), name);
-            });
+            signature.parameter(
+                [&](llvm::raw_ostream& os) {
+                    print_parameter(os, *function.getParamDecl(index), name);
+                },
+                expanded ? llvm::SmallVector<std::string, 1>() : parameter_names(function, index));
         }
     }
 
@@ -456,8 +461,7 @@ private:
             stream << " -> ";
             print(stream, function.getReturnType());
         }
-        help.signatures.push_back(
-            std::move(signature).finish(current_arg, documentation(function)));
+        add(signature, current_arg, &function);
     }
 
     /// Writes the bases and the fields of `record`, as aggregate
@@ -601,11 +605,14 @@ private:
         function.getDeclName().print(signature.stream, policy);
         signature.stream << "(";
         parameters(signature, function, 0, function.getNumParams() - 1);
+        // The constructor's comment names none of the function's own.
+        for(auto& names: signature.names) {
+            names.clear();
+        }
         write(signature);
         signature.stream << ") -> ";
         print(signature.stream, forwarding->result);
-        help.signatures.push_back(
-            std::move(signature).finish(forwarding->argument, documentation(documented)));
+        add(signature, forwarding->argument, &documented);
     }
 
     /// The forwarding call whose constructors Sema is reporting.
@@ -619,7 +626,9 @@ private:
     std::optional<Forwarding> forwarding;
 
     protocol::SignatureHelp& help;
-    const SignatureHelpOptions& options;
+
+    /// What documents each signature of `help`, in its order.
+    std::vector<Documented>& sources;
     clang::PrintingPolicy policy{clang::LangOptions()};
     std::optional<display::ReadableTypes> readable;
     clang::CodeCompletionTUInfo info;
@@ -693,28 +702,54 @@ auto macro_call_at(CompilationUnitRef unit, std::uint32_t offset) -> std::option
     return innermost;
 }
 
-auto macro_signature(const MacroCall& call) -> protocol::SignatureHelp {
+/// Shows `doc` with `signature` as plain text, and each parameter's
+/// `@param` beside it; `names` are the parameters' (Signature::names).
+void document(protocol::SignatureInformation& signature,
+              const Documentation& doc,
+              llvm::ArrayRef<llvm::SmallVector<std::string, 1>> names) {
+    if(doc.empty()) {
+        return;
+    }
+    signature.documentation = present(doc).as_plain_text();
+    if(!signature.parameters) {
+        return;
+    }
+    for(auto [parameter, written]: llvm::zip_equal(*signature.parameters, names)) {
+        for(const auto& name: written) {
+            if(const auto* param = doc.param(name); param && !param->text.empty()) {
+                parameter.documentation = param->text;
+                break;
+            }
+        }
+    }
+}
+
+auto macro_signature(const MacroCall& call, const Documentation& doc) -> protocol::SignatureHelp {
     Signature signature;
     signature.stream << call.name << "(";
     auto params = call.macro->params();
     for(auto* param: params) {
         bool last = param == params.back();
-        signature.parameter([&](llvm::raw_ostream& os) {
-            if(last && call.macro->isC99Varargs()) {
-                os << "...";
-                return;
-            }
-            os << param->getName();
-            if(last && call.macro->isGNUVarargs()) {
-                os << "...";
-            }
-        });
+        signature.parameter(
+            [&](llvm::raw_ostream& os) {
+                if(last && call.macro->isC99Varargs()) {
+                    os << "...";
+                    return;
+                }
+                os << param->getName();
+                if(last && call.macro->isGNUVarargs()) {
+                    os << "...";
+                }
+            },
+            {last && call.macro->isC99Varargs() ? "..." : param->getName().str()});
     }
     signature.stream << ")";
     signature.pack = call.macro->isVariadic();
 
+    auto names = signature.names;
     protocol::SignatureHelp help;
-    help.signatures.push_back(std::move(signature).finish(call.argument, {}));
+    help.signatures.push_back(std::move(signature).finish(call.argument));
+    document(help.signatures.front(), doc, names);
     help.active_signature = 0;
     return help;
 }
@@ -723,6 +758,7 @@ auto macro_signature(const MacroCall& call) -> protocol::SignatureHelp {
 
 auto signature_help(CompilationParams& params,
                     const SignatureHelpOptions& options,
+                    const DocumentationOptions& documentation,
                     llvm::StringRef selected) -> protocol::SignatureHelp {
     protocol::SignatureHelp help;
 
@@ -736,7 +772,8 @@ auto signature_help(CompilationParams& params,
     complete_options.IncludeFixIts = false;
 
     auto offset = std::get<1>(params.completion);
-    auto* consumer = new SignatureCollector(help, complete_options, options);
+    std::vector<Documented> sources;
+    auto* consumer = new SignatureCollector(help, sources, complete_options);
     auto unit = complete(params, consumer);
     if(!unit.completed()) {
         return help;
@@ -746,7 +783,20 @@ auto signature_help(CompilationParams& params,
     // call's; one written outside the macro, which Sema may report too,
     // is not where the cursor is.
     if(auto call = macro_call_at(unit, offset); call && (call->direct || help.signatures.empty())) {
-        return macro_signature(*call);
+        return macro_signature(*call,
+                               options.documentation
+                                   ? feature::documentation(unit, call->macro, documentation)
+                                   : Documentation());
+    }
+
+    if(options.documentation) {
+        for(auto [signature, source]: llvm::zip_equal(help.signatures, sources)) {
+            if(source.decl) {
+                document(signature,
+                         feature::documentation(unit, source.decl, documentation),
+                         source.parameters);
+            }
+        }
     }
 
     // Overloads told apart only by what a label leaves out, such as the

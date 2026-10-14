@@ -21,10 +21,9 @@ your question:
    Standalone binaries in this directory, Bazel targets of their own
    (`//:benchmarks`), each answering one decision:
    - `scan_benchmark` — dependency-graph scan over a real CDB.
-   - `pipeline_benchmark` — per-TU stage profile (preprocess with/without
-     token collection, parse, index build/serialize, preamble PCH build incl.
-     preamble indexing, reparse over PCH incl. interactive indexing), one
-     result per file.
+   - `pipeline_benchmark` — per-TU stage profile (preprocess, parse, index
+     build/serialize, preamble PCH build incl. preamble indexing, reparse over
+     PCH incl. interactive indexing), one result per file.
    - `pch_chain_benchmark` — monolithic vs chained PCH strategy (ported
      from PR #405).
 
@@ -120,9 +119,8 @@ to the critical path (preamble indexing).
 - **Idle machine.** No concurrent builds. On WSL2 specifically, do not run
   ninja alongside a benchmark: page-cache-sensitive numbers wobble because
   WSL2 reclaims mmap'd cache aggressively.
-- **One variable at a time.** The pipeline stages and the A/B knobs
-  (token collection, PCH on/off) exist so a comparison changes exactly one
-  thing.
+- **One variable at a time.** The pipeline stages and the PCH on/off knob
+  exist so a comparison changes exactly one thing.
 
 ## Reference numbers
 

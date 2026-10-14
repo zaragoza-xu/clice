@@ -383,15 +383,16 @@ struct Stats {
     void add_tu(const index::TUIndex& tu) {
         indexed += 1;
 
-        tu.iterate_symbols(
-            [&](index::SymbolHash hash, const index::SymbolIdentity& symbol, llvm::StringRef) {
-                auto scope = static_cast<std::uint8_t>(symbol.scope);
-                if(scope < scope_n.size()) {
-                    scope_n[scope] += 1;
-                }
-                scope_map.try_emplace(hash, symbol.scope);
-                return true;
-            });
+        tu.iterate_symbols([&](index::SymbolHash hash,
+                               const index::SymbolIdentity& symbol,
+                               llvm::ArrayRef<std::uint32_t>) {
+            auto scope = static_cast<std::uint8_t>(symbol.scope);
+            if(scope < scope_n.size()) {
+                scope_n[scope] += 1;
+            }
+            scope_map.try_emplace(hash, symbol.scope);
+            return true;
+        });
 
         for(std::uint32_t i = 0; i < tu.section_count(); i += 1) {
             const auto& shard = tu.shard_of(tu.section_path(i));
@@ -484,10 +485,11 @@ std::uint32_t mask_bytes(std::uint32_t m) {
 CompilationParams make_params(const std::vector<const char*>& arguments,
                               llvm::StringRef file,
                               llvm::StringRef content) {
-    CompilationParams params;
-    params.kind = CompilationKind::Indexing;
-    params.arguments = arguments;
-    params.add_remapped_file(file, content);
+    CompilationParams params{
+        .kind = CompilationKind::Whole,
+        .input = {.arguments = {arguments.begin(), arguments.end()}},
+    };
+    params.input.add_remapped_file(file, content);
     return params;
 }
 
@@ -1157,18 +1159,17 @@ extern "C++" int main(int argc, const char** argv) {
                 continue;
             }
 
-            auto params = make_params(job.argv, job.file, (*content)->getBuffer());
-            auto unit = compile(params);
-            if(!unit.completed()) {
+            auto unit = compile(make_params(job.argv, job.file, (*content)->getBuffer()));
+            if(!unit->completed()) {
                 stats.skipped_compile += 1;
                 finish("skip (did not compile)");
                 continue;
             }
-            if(auto errors = collect_errors(unit); !errors.empty()) {
+            if(auto errors = collect_errors(*unit); !errors.empty()) {
                 stats.had_diagnostics += 1;
             }
 
-            auto envelope = index::build_tu_index(unit);
+            auto envelope = index::build_tu_index(*unit);
             stats.wire_sizes.add(envelope.size());
 
             stats.add_tu(index::TUIndex::from_bytes(envelope));

@@ -170,8 +170,9 @@ public:
         if(!text) {
             return std::nullopt;
         }
-        fid = unit.file_id(range.getBegin());
-        base = unit.file_offset(range.getBegin());
+        auto begin = unit.written_at(range.getBegin());
+        fid = begin.file;
+        base = begin.offset;
         source = *text;
         // Lexed here: the unit's spelled tokens cover the main file only.
         tokens = clang::syntax::tokenize(clang::syntax::FileRange(fid, base, base + source.size()),
@@ -200,15 +201,19 @@ private:
     /// A location of the declaration relative to its text; nullopt when
     /// a macro spells it.
     std::optional<std::uint32_t> offset_of(clang::SourceLocation location) {
-        if(!location.isFileID() || unit.file_id(location) != fid) {
+        if(!location.isFileID()) {
             return std::nullopt;
         }
-        return unit.file_offset(location) - base;
+        auto [file, offset] = unit.written_at(location);
+        if(file != fid) {
+            return std::nullopt;
+        }
+        return offset - base;
     }
 
     /// The tokens all lie in the declaration's text.
     std::uint32_t offset_of(const clang::syntax::Token& token) {
-        return unit.file_offset(token.location()) - base;
+        return unit.written_at(token.location()).offset - base;
     }
 
     /// The end of a token at `offset`, with the spaces following it.
@@ -644,7 +649,7 @@ const clang::CXXRecordDecl* outermost_record(const clang::CXXRecordDecl* record)
 /// something else follows.
 std::optional<std::uint32_t> semicolon_after(CompilationUnit& unit, clang::SourceLocation end) {
     auto& sm = unit.context().getSourceManager();
-    auto tokens = unit.tokens().expanded();
+    auto tokens = unit.focus_file().tokens().expanded();
     auto token = llvm::partition_point(tokens, [&](const clang::syntax::Token& token) {
         return !sm.isBeforeInTranslationUnit(end, token.location());
     });
@@ -666,7 +671,7 @@ std::optional<std::uint32_t> semicolon_after(CompilationUnit& unit, clang::Sourc
     if(token == tokens.end() || token->kind() != clang::tok::semi) {
         return std::nullopt;
     }
-    auto range = main_range(unit, token->location());
+    auto range = editable_range(unit, token->location());
     if(!range) {
         return std::nullopt;
     }
@@ -698,11 +703,11 @@ std::optional<Placement> placement_after(CompilationUnit& unit, const clang::Dec
         }
         end = next->getEndLoc();
     }
-    auto range = main_range(unit, end);
+    auto range = editable_range(unit, end);
     if(!range) {
         return std::nullopt;
     }
-    auto content = unit.main_content();
+    auto content = unit.focus_file().content();
     auto offset = range->end;
     if(auto semicolon = semicolon_after(unit, end)) {
         offset = *semicolon + 1;
@@ -890,8 +895,8 @@ void define(const Context& ctx, std::vector<CodeAction>& out) {
         !sm.isBeforeInTranslationUnit(outermost_record(method->getParent())->getEndLoc(),
                                       (*needed)->getEndLoc()))) {
         auto written = written_declaration(decl)->getSourceRange();
-        if(auto semicolon =
-               main_range(unit, written) ? semicolon_after(unit, written.getEnd()) : std::nullopt) {
+        if(auto semicolon = editable_range(unit, written) ? semicolon_after(unit, written.getEnd())
+                                                          : std::nullopt) {
             out.push_back(CodeAction{
                 .title = std::format("Define '{}' inline", name),
                 .kind = action_kind::define_inline,

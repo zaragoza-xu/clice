@@ -39,6 +39,8 @@ std::string diagnostics;
 /// Compile, build a preamble TU index, persist it as the `.pch.idx` pair
 /// and load it back through the production gate.
 void build_state(std::source_location location = std::source_location::current()) {
+    // Not an open file's compile: the preamble's index covers every file.
+    kind = CompilationKind::Whole;
     ZASSERT(compile());
 
     links.resize(1);
@@ -100,6 +102,7 @@ ZEST_CASE(ForcedIncludeServed) {
     // the predefines buffer, which is a valid location — so unlike the
     // synthetic buffers themselves, the file must stay in the TU index
     // under its own path.
+    kind = CompilationKind::Whole;
     prepare();
     params.input.arguments.insert(params.input.arguments.end() - 1, "-include");
     params.input.arguments.insert(params.input.arguments.end() - 1, TestVFS::path("forced.h"));
@@ -335,7 +338,7 @@ int other = 1;
 
     // The preamble text itself is not stored; the TU index keeps only the
     // identity of the exact prefix it was built from.
-    auto content = unit->main_content();
+    auto content = unit->focus_file().content();
     ZEXPECT(state->matches_prefix(content));
     ZEXPECT(state->matches_prefix(content.str() + "\nint more = 2;"));
     ZEXPECT(!state->matches_prefix(content.drop_back(1)));

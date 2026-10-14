@@ -380,12 +380,13 @@ kota::task<> lint_one(BatchStack& stack, bool with_index, Fid path_id, LintPass&
             }
             // The lint set applies to the findings too: a header outside
             // it reports nothing. A compiler error stays wherever it is:
-            // broken code is not a clean run.
+            // broken code is not a clean run. So does a finding no file
+            // holds (the configuration's).
             std::ranges::copy_if(outcome.tidy_diagnostics,
                                  std::back_inserter(pass.findings),
                                  [&](const worker::TidyDiagnostic& d) {
                                      auto& files = stack.project.file_table;
-                                     return d.compiler_error ||
+                                     return d.compiler_error || d.file.empty() ||
                                             stack.project.build.lintable(files.resolve(
                                                 files.intern(Spelling::absolute(d.file))));
                                  });
@@ -515,7 +516,9 @@ kota::task<> run_lint(BatchStack& stack, const BatchLintOptions& options, BatchL
     co_await kota::with_token(run_lint_pass(stack, options, tus, pass), lifetime.token());
     // What arrived is the report, whole or cut short by an interruption.
     auto shown = [&files = project.file_table](std::string& file) {
-        file = files.display(files.intern(Spelling::absolute(file)));
+        if(!file.empty()) {
+            file = files.display(files.intern(Spelling::absolute(file)));
+        }
     };
     for(auto& finding: pass.findings) {
         shown(finding.file);

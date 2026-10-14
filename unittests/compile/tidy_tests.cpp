@@ -38,13 +38,19 @@ std::unique_ptr<CompilationUnit> compile_main(const Sources& sources,
     return compile(std::move(params));
 }
 
-/// The checks the unit reports a finding of, sorted.
+/// The checks the unit reports a finding of, sorted: a batch run's
+/// findings, or the editor's clang-tidy diagnostics.
 std::vector<std::string> findings(CompilationUnit& unit) {
     std::vector<std::string> names;
-    for(auto& diag: unit.diagnostics()) {
-        if(diag.id.source == DiagnosticSource::ClangTidy &&
-           diag.id.level != DiagnosticLevel::Ignored && diag.id.level != DiagnosticLevel::Note) {
-            names.push_back(diag.id.name.str());
+    if(unit.kind() == CompilationKind::Whole) {
+        for(auto& finding: unit.take_tidy_findings()) {
+            names.push_back(finding.DiagnosticName);
+        }
+    } else {
+        for(auto& diag: unit.diagnostics()) {
+            if(diag.id.source == DiagnosticSource::ClangTidy) {
+                names.push_back(diag.id.name.str());
+            }
         }
     }
     std::ranges::sort(names);
@@ -85,20 +91,23 @@ ZEST_CASE(BatchTraversesHeaders) {
         {"ratio.h",  "inline double ratio(int a, int b) { return a / b; }\n"},
         {"main.cpp", "#include \"ratio.h\"\nint main() { return 0; }\n"     },
     };
-    // The finding arrives with the header's location; the header filter is
-    // the consumer's to apply.
     auto unit = compile_main(sources,
-                             {.checks = "-*,bugprone-integer-division"},
+                             {.checks = "-*,bugprone-integer-division", .header_filter = ".*"},
                              {},
                              CompilationKind::Whole);
     ZASSERT(unit->completed());
-    bool header_finding = false;
-    for(auto& diag: unit->diagnostics()) {
-        header_finding |= diag.id.source == DiagnosticSource::ClangTidy &&
-                          diag.id.name == "bugprone-integer-division" &&
-                          diag.fid != unit->focus_file().file();
-    }
-    ZASSERT(header_finding);
+    auto reported = unit->take_tidy_findings();
+    ZASSERT(reported.size() == 1);
+    ZEXPECT(reported[0].DiagnosticName == "bugprone-integer-division");
+    ZEXPECT(llvm::StringRef(reported[0].Message.FilePath).ends_with("ratio.h"));
+
+    // No header filter, no header findings.
+    auto filtered = compile_main(sources,
+                                 {.checks = "-*,bugprone-integer-division"},
+                                 {},
+                                 CompilationKind::Whole);
+    ZASSERT(filtered->completed());
+    ZEXPECT(findings(*filtered).empty());
 
     // The editor matches the main file's declarations whatever the
     // configuration reports on.
@@ -109,25 +118,24 @@ ZEST_CASE(BatchTraversesHeaders) {
 }
 
 ZEST_CASE(HeaderNolint) {
-    Sources sources = {
-        {"ratio.h",  "inline double ratio(int a, int b) { return a / b; }  // NOLINT\n"},
-        {"main.cpp", "#include \"ratio.h\"\n"                                          },
+    auto compile_header = [&](llvm::StringRef header) {
+        Sources sources = {
+            {"ratio.h",  header.str()            },
+            {"main.cpp", "#include \"ratio.h\"\n"},
+        };
+        return compile_main(sources,
+                            {.checks = "-*,bugprone-integer-division", .header_filter = ".*"},
+                            {},
+                            CompilationKind::Whole);
     };
-    auto unit = compile_main(sources,
-                             {.checks = "-*,bugprone-integer-division", .header_filter = ".*"},
-                             {},
-                             CompilationKind::Whole);
-    ZASSERT(unit->completed());
-    // A suppressed finding stays in the stream at the Ignored level.
-    bool suppressed = false;
-    for(auto& diag: unit->diagnostics()) {
-        ZEXPECT((diag.id.source != DiagnosticSource::ClangTidy ||
-                 diag.id.level == DiagnosticLevel::Ignored));
-        suppressed |= diag.id.source == DiagnosticSource::ClangTidy &&
-                      diag.id.name == "bugprone-integer-division" &&
-                      diag.id.level == DiagnosticLevel::Ignored;
-    }
-    ZASSERT(suppressed);
+    auto reported = compile_header("inline double ratio(int a, int b) { return a / b; }\n");
+    ZASSERT(reported->completed());
+    ZEXPECT(findings(*reported) == std::vector<std::string>{"bugprone-integer-division"});
+
+    auto suppressed =
+        compile_header("inline double ratio(int a, int b) { return a / b; }  // NOLINT\n");
+    ZASSERT(suppressed->completed());
+    ZEXPECT(findings(*suppressed).empty());
 }
 
 ZEST_CASE(EditorDropsUnusableChecks) {
@@ -186,34 +194,40 @@ ZEST_CASE(CompilerWarningProvenance) {
 
     auto batch =
         compile_main(sources, {.checks = enabled}, {"-Wunused-variable"}, CompilationKind::Whole);
-    id = warning(*batch);
-    ZASSERT(id);
-    ZEXPECT(id->source == DiagnosticSource::ClangTidy);
-    ZEXPECT(id->name == "clang-diagnostic-unused-variable");
+    ZASSERT(batch->completed());
+    ZEXPECT(findings(*batch) == std::vector<std::string>{"clang-diagnostic-unused-variable"});
 
     auto other = compile_main(sources,
                               {.checks = "-*,bugprone-integer-division"},
                               {"-Wunused-variable"},
                               CompilationKind::Whole);
-    id = warning(*other);
-    ZASSERT(id);
-    ZEXPECT(id->source == DiagnosticSource::Clang);
+    ZASSERT(other->completed());
+    ZEXPECT(findings(*other).empty());
 }
 
 ZEST_CASE(NolintSilencesWarnings) {
-    auto unit = compile_main(
+    auto warnings = [](CompilationUnit& unit) {
+        return llvm::count_if(unit.diagnostics(), [](const Diagnostic& diag) {
+            return diag.id.level == DiagnosticLevel::Warning;
+        });
+    };
+    auto reported = compile_main(
+        {
+            {"main.cpp", "int f() { int unused; return 0; }\n"}
+    },
+        {},
+        {"-Wunused-variable"});
+    ZASSERT(reported->completed());
+    ZEXPECT(warnings(*reported) == 1);
+
+    auto silenced = compile_main(
         {
             {"main.cpp", "int f() { int unused; return 0; }  // NOLINT\n"}
     },
         {},
         {"-Wunused-variable"});
-    ZASSERT(unit->completed());
-    bool silenced = false;
-    for(auto& diag: unit->diagnostics()) {
-        ZEXPECT(diag.id.level != DiagnosticLevel::Warning);
-        silenced |= diag.id.level == DiagnosticLevel::Ignored;
-    }
-    ZASSERT(silenced);
+    ZASSERT(silenced->completed());
+    ZEXPECT(warnings(*silenced) == 0);
 }
 
 ZEST_CASE(OverlappingFixDropped) {
@@ -306,10 +320,14 @@ int f(int value, int total) {
     ZASSERT(unit->completed());
     // Clang drops the `)` it cannot place after `1` in the definition: the
     // `(` left in the argument is no fix.
-    auto parentheses = llvm::find_if(unit->diagnostics(), [](const Diagnostic& diag) {
-        return llvm::StringRef(diag.message).starts_with("place parentheses");
+    auto assignment = llvm::find_if(unit->diagnostics(), [](const Diagnostic& diag) {
+        return diag.id.level == DiagnosticLevel::Warning;
     });
-    ZASSERT(parentheses != unit->diagnostics().end());
+    ZASSERT(assignment != unit->diagnostics().end());
+    auto parentheses = llvm::find_if(assignment->notes, [](const Diagnostic& note) {
+        return llvm::StringRef(note.message).starts_with("place parentheses");
+    });
+    ZASSERT(parentheses != assignment->notes.end());
     ZEXPECT(parentheses->fix.empty());
 
     auto typo = llvm::find_if(unit->diagnostics(), [](const Diagnostic& diag) {

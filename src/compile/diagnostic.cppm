@@ -9,23 +9,17 @@ import :syntax.token;
 namespace clice {
 
 enum class DiagnosticLevel : std::uint8_t {
-    Ignored,
     Note,
     Remark,
     Warning,
     Error,
     Fatal,
-    Invalid,
 };
 
 enum class DiagnosticSource : std::uint8_t {
-    Unknown,
     Clang,
     ClangTidy,
-    Clice,
 };
-
-llvm::StringRef diagnostic_source_name(DiagnosticSource source);
 
 struct DiagnosticID {
     /// The diagnostic id value.
@@ -41,15 +35,6 @@ struct DiagnosticID {
 
     /// Get the diagnostic code.
     llvm::StringRef diagnostic_code() const;
-
-    /// Get help diagnostic uri for the diagnostic.
-    std::optional<std::string> diagnostic_document_uri() const;
-
-    /// Whether this diagnostic represents an deprecated diagnostic.
-    bool is_deprecated() const;
-
-    /// Whether this diagnostic represents an unused diagnostic.
-    bool is_unused() const;
 
     /// Whether this diagnostic reports a failure to read a prebuilt
     /// artifact (PCH/PCM) — clang's "AST Deserialization Issue" category.
@@ -71,11 +56,6 @@ struct Diagnostic {
     /// The file location of this diagnostic.
     clang::FileID fid;
 
-    /// Whether the location sits in a system header — captured at
-    /// creation for clang-tidy's SystemHeaders filter, applied at
-    /// collection time where no SourceManager is at hand.
-    bool in_system = false;
-
     /// The source range of this diagnostic(may be invalid, if this diagnostic
     /// is from command line. e.g. unknown command line argument).
     LocalSourceRange range;
@@ -87,6 +67,9 @@ struct Diagnostic {
     /// text applied together; empty when it has none, or one the main
     /// file's text cannot express.
     std::vector<TextReplacement> fix;
+
+    /// The notes clang attached to it, in order.
+    std::vector<Diagnostic> notes;
 };
 
 }  // namespace clice

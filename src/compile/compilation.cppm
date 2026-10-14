@@ -4,12 +4,9 @@ module;
 
 module clice:compile.compilation;
 
-import :compile.dep_file;
 import :compile.diagnostic;
 import :compile.directive;
-import :compile.tidy;
 import :compile.tokens;
-import :semantic.resolver;
 import :syntax.lexical_scan;
 import :syntax.position;
 import :syntax.preamble_synthesis;
@@ -19,8 +16,67 @@ import :vfs.path;
 
 namespace clice {
 
-class EntityTable;
-class Semantics;
+namespace tidy {
+
+/// The frozen clang-tidy configuration of one run. Plain data on purpose:
+/// it travels in worker requests and in the TURun family's product plan,
+/// both of which freeze it at takeoff.
+struct TidyParams {
+    /// Effective checks glob list in clang-tidy syntax; empty falls back
+    /// to the built-in default set.
+    std::string checks;
+
+    /// Check options (the .clang-tidy CheckOptions map).
+    std::vector<std::pair<std::string, std::string>> options;
+
+    /// Checks whose findings report as errors (WarningsAsErrors globs).
+    std::string warnings_as_errors;
+
+    /// Also report findings in headers matching this regex (clang-tidy's
+    /// HeaderFilterRegex; empty = main file only).
+    std::string header_filter;
+
+    /// Headers excluded from reporting even when header_filter matches
+    /// (clang-tidy's ExcludeHeaderFilterRegex).
+    std::string exclude_header_filter;
+
+    /// Also report findings in system headers.
+    bool system_headers = false;
+
+    /// What the checks take for headers and for sources by extension;
+    /// unset keeps clang-tidy's defaults.
+    std::optional<std::vector<std::string>> header_file_extensions;
+    std::optional<std::vector<std::string>> implementation_file_extensions;
+
+    /// Extra compiler args from the configuration. -W<group> flags are
+    /// consumed engine-side by apply_warning_options so the Checks gate
+    /// applies (the clangd approach, see tidy.cpp); a batch lint run
+    /// additionally applies the remaining args (command_extra_args) to
+    /// its driver command at resolution, as clang-tidy itself does. The
+    /// interactive command is never rewritten.
+    std::vector<std::string> extra_args;
+    std::vector<std::string> extra_args_before;
+};
+
+class ClangTidyChecker;
+
+}  // namespace tidy
+
+/// One compile input paired with the hash of the bytes the compiler actually
+/// consumed for it — taken from the compiler's own in-memory buffers at build
+/// time, never from a later disk read. A later disk read could describe
+/// content the build never saw (the file may change while the build runs),
+/// which would poison every staleness check built on it.
+///
+/// hash == 0 means the consumed bytes were not available for hashing; the
+/// staleness check treats such an entry conservatively (rebuild once).
+struct DepFile {
+    std::string path;
+    std::uint64_t hash = 0;
+
+    /// A place a failed lookup looked: the build saw no file there.
+    bool absent = false;
+};
 
 enum class CompilationKind : std::uint8_t {
     /// Only preprocess the source file: directives are available, AST
@@ -353,12 +409,6 @@ public:
 
     clang::ASTContext& context();
 
-    types::TemplateResolver& resolver();
-
-    /// The semantic map of the main file (token → owning node), built
-    /// lazily on first use and cached for the unit's lifetime.
-    const Semantics& semantics();
-
     llvm::DenseMap<clang::FileID, Directive>& directives();
 
     clang::TranslationUnitDecl* tu();
@@ -372,19 +422,22 @@ public:
     /// hold no file: creating one changes what this compilation would see.
     std::vector<std::string> absent();
 
-    /// The entity of a declaration (semantic/identity.h), memoized for the
-    /// unit's lifetime.
-    std::uint64_t entity(const clang::NamedDecl* decl);
-
-    /// The entity of a macro definition.
-    std::uint64_t entity(const clang::MacroInfo* macro);
-
-    /// The entity of a named module.
-    std::uint64_t module_entity(llvm::StringRef name);
-
-    /// The entity of the symbol a declaration is named in (its parent in a
-    /// qualified name), 0 at the translation unit.
-    std::uint64_t parent(const clang::NamedDecl* decl);
+    /// What a reader derives from the AST, such as the semantic map or the
+    /// entity table: built as `T(unit)` on first use and kept until the
+    /// unit is destroyed, then released before the AST.
+    template <typename T>
+    T& get() {
+        for(auto& entry: derived) {
+            if(entry.key == &derived_key<T>) {
+                return static_cast<Derived<T>&>(*entry.data).value;
+            }
+        }
+        // Building one may get another: store it only once it is built.
+        auto data = std::make_unique<Derived<T>>(*this);
+        auto& value = data->value;
+        derived.push_back({&derived_key<T>, std::move(data)});
+        return value;
+    }
 
 private:
     friend std::unique_ptr<CompilationUnit> compile(CompilationParams params);
@@ -421,6 +474,28 @@ private:
     /// destroyed later.
     void run_tidy();
 
+    struct DerivedBase {
+        virtual ~DerivedBase() = default;
+    };
+
+    template <typename T>
+    struct Derived : DerivedBase {
+        explicit Derived(CompilationUnit& unit) : value(unit) {}
+
+        T value;
+    };
+
+    struct DerivedEntry {
+        const void* key;
+
+        std::unique_ptr<DerivedBase> data;
+    };
+
+    /// One per type, its address the type's key in `derived`. Not const:
+    /// the linker may fold equal constants into one address.
+    template <typename T>
+    inline static char derived_key = 0;
+
     CompilationParams params;
 
     CompilationStatus outcome = CompilationStatus::SetupFail;
@@ -456,11 +531,8 @@ private:
     /// lifecycle of all objects during the compilation process.
     std::unique_ptr<clang::CompilerInstance> instance;
 
-    /// The template resolver used to resolve dependent name.
-    std::optional<types::TemplateResolver> template_resolver;
-
-    /// Lazily built semantic map, see CompilationUnit::semantics().
-    std::unique_ptr<Semantics> semantics_cache;
+    /// See get, in the order they were built.
+    llvm::SmallVector<DerivedEntry, 4> derived;
 
     /// The tokens a Content compile collects for the features.
     std::optional<TokenMap> collected_tokens;
@@ -470,9 +542,6 @@ private:
 
     /// Cache for file path. It is used to avoid multiple file path lookup.
     llvm::DenseMap<clang::FileEntryRef, llvm::StringRef> path_cache;
-
-    /// Lazily built, see CompilationUnit::entity().
-    std::unique_ptr<EntityTable> entity_table;
 
     struct LineTables {
         std::vector<std::uint32_t> starts;

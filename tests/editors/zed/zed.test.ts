@@ -17,12 +17,10 @@ import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CliceClient, sleep, waitUntil } from "@clice/tools/client";
+import { CliceClient } from "@clice/tools/client";
 import { afterAll, expect, test } from "vitest";
 
 const STARTUP_TIMEOUT = 300_000;
-/// How long a started server has to stay up for the start to count.
-const STABILIZE_DELAY = 10_000;
 /// Debug logs of how Zed loads the worktree environment and starts language
 /// servers, so a timeout's log tail shows where the start stopped.
 const ZED_LOG = "info,project::environment=debug,project::lsp_store=debug,language_extension=debug";
@@ -99,12 +97,59 @@ function readLog(): string {
     return fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "";
 }
 
+/// The end of Zed's log, for a failure to show where Zed stopped.
+function logTail(): string {
+    return `--- end of ${log}:\n${readLog().split("\n").slice(-80).join("\n")}`;
+}
+
+/// What `found` returns once it returns something; a `found` that throws
+/// ends the wait, and so does the end of `zed`. What never comes fails
+/// after STARTUP_TIMEOUT.
+/// No event: Zed announces nothing but its files, read again each second.
+async function until<T>(zed: ChildProcess, found: () => T | undefined, what: string): Promise<T> {
+    const deadline = Date.now() + STARTUP_TIMEOUT;
+    for (;;) {
+        const value = found();
+        if (value !== undefined) {
+            return value;
+        }
+        const ended = zed.exitCode ?? zed.signalCode;
+        if (ended !== null) {
+            throw new Error(`Zed ended (${ended}) before the ${what}\n${logTail()}`);
+        }
+        if (Date.now() > deadline) {
+            throw new Error(`no ${what} within ${STARTUP_TIMEOUT} ms\n${logTail()}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+}
+
+/// Whether a clice server started for `dir` is ready: past the handshake,
+/// it writes its session log.
+function cliceReady(dir: string): boolean {
+    const logs = path.join(dir, ".clice", "logs");
+    return (
+        fs.existsSync(logs) &&
+        fs
+            .readdirSync(logs, { recursive: true, encoding: "utf8" })
+            .some((name) => path.basename(name) === "master.log")
+    );
+}
+
 async function stop(zed: ChildProcess): Promise<void> {
-    const exited = zed.exitCode === null ? once(zed, "exit") : Promise.resolve();
+    const exited =
+        zed.exitCode === null && zed.signalCode === null ? once(zed, "exit") : Promise.resolve();
     if (process.platform === "win32") {
         spawnSync("taskkill", ["/F", "/T", "/PID", String(zed.pid)]);
     } else {
-        process.kill(-zed.pid!, "SIGKILL");
+        try {
+            process.kill(-zed.pid!, "SIGKILL");
+        } catch (error) {
+            // ESRCH: nothing of the group Zed led is left to stop.
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+                throw error;
+            }
+        }
     }
     await exited;
 }
@@ -125,14 +170,18 @@ function launch(paths: string[], env: Record<string, string> = {}): ChildProcess
 /// up front, so this start only writes the index.
 async function indexExtensions(): Promise<void> {
     const zed = launch([]);
+    const index = path.join(data, "extensions", "index.json");
     try {
-        await waitUntil(
+        await until(
+            zed,
             () =>
-                fs.existsSync(path.join(data, "extensions", "index.json")) &&
-                readLog().includes("extensions updated"),
-            { timeout: STARTUP_TIMEOUT, interval: 1_000, description: "Zed to index extensions" },
+                readLog().includes("extensions updated") &&
+                fs.existsSync(index) &&
+                fs.readFileSync(index, "utf8").includes('"clice"')
+                    ? true
+                    : undefined,
+            "index of the extensions naming clice",
         );
-        await sleep(STABILIZE_DELAY);
     } finally {
         await stop(zed);
     }
@@ -148,25 +197,24 @@ async function startServer(dir: string, file: string, env: Record<string, string
         }
     };
     try {
-        const started = await waitUntil(
+        const started = await until(
+            zed,
             () => {
-                if (zed.exitCode !== null) {
-                    throw new Error(`${file}: Zed exited with code ${zed.exitCode}`);
-                }
                 checkFailed();
                 return STARTED.exec(readLog())?.[1];
             },
-            {
-                timeout: STARTUP_TIMEOUT,
-                interval: 2_000,
-                description: `Zed to start clice for ${file}`,
+            `start of clice for ${file}`,
+        );
+        // The start counts once clice is ready: Zed took its answer to
+        // initialize and said it was initialized.
+        await until(
+            zed,
+            () => {
+                checkFailed();
+                return cliceReady(dir) ? true : undefined;
             },
-        ).catch((error: unknown) => {
-            const tail = readLog().split("\n").slice(-80).join("\n");
-            throw new Error(`${String(error)}\n--- end of ${log}:\n${tail}`);
-        });
-        await sleep(STABILIZE_DELAY);
-        checkFailed();
+            `initialize of clice for ${file}`,
+        );
         return fs.realpathSync.native(JSON.parse(`"${started}"`) as string);
     } finally {
         await stop(zed);

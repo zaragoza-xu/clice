@@ -62,10 +62,11 @@ ZEST_CASE(HandlerCancelChainsThrough) {
             auto result = co_await kota::with_token(handler(), source.token());
             handler_cancelled = result.is_cancelled();
         };
+        auto gate = w.gate(cp);
         group.spawn(wrapper());
-
-        co_await kota::sleep(50, w.loop);
+        co_await w.parked(gate);
         source.cancel();
+        w.release(gate);
         co_await group.join();
 
         // The worker must have seen the IPC cancel: an interrupted (or
@@ -73,6 +74,8 @@ ZEST_CASE(HandlerCancelChainsThrough) {
         worker::QueryParams qp;
         qp.kind = worker::QueryKind::DocumentSymbol;
         qp.path = src;
+        // Hang detection: a reply that never comes fails here, before the
+        // watchdog.
         auto symbols = co_await w.peer->send_request(qp, {.timeout = std::chrono::seconds(30)});
         ZASSERT(symbols);
         ZEXPECT(symbols.value().data == "null");
@@ -88,8 +91,9 @@ ZEST_CASE(HandlerCancelChainsThrough) {
 
 // The scheduler's cooperative cancel of a stateless build is an IPC cancel
 // whose answer the sender keeps awaiting (the slot must stay busy while the
-// worker is): the stop flag it trips makes that answer arrive at the next
-// declaration boundary instead of after the whole TU.
+// worker is): the stop flag it trips cuts the parse at the next declaration.
+// The source ends in a pragma that crashes the worker (CLICE_TEST_PRAGMA_CRASH):
+// only a parse run to its end reaches it.
 ZEST_CASE(IpcCancelStopsBuild) {
     TempDir tmp;
     std::string text;
@@ -97,10 +101,15 @@ ZEST_CASE(IpcCancelStopsBuild) {
     for(int i = 0; i < 200'000; i += 1) {
         text += std::format("int v{};\n", i);
     }
+    text += "#pragma clang __debug crash\n";
     tmp.touch("probe.cpp", text);
     auto src = tmp.path("probe.cpp");
+    tmp.touch("small.cpp", "int small;\n");
 
     WorkerHandle w;
+    w.env = {
+        {.name = "CLICE_TEST_PRAGMA_CRASH", .value = "1"}
+    };
     ZASSERT(w.spawn());
 
     bool test_done = false;
@@ -112,23 +121,26 @@ ZEST_CASE(IpcCancelStopsBuild) {
         bp.arguments = make_args(src);
 
         kota::cancellation_source source;
-        std::chrono::steady_clock::time_point cancelled_at;
         auto build = [&]() -> kota::task<> {
             auto result = co_await w.peer->send_request(bp, {.token = source.token()});
-            auto waited = std::chrono::steady_clock::now() - cancelled_at;
             ZASSERT(!result);
             ZEXPECT(result.error().code == worker::dispatch_errc::cancelled);
-            // An uninterrupted worker would index all 200k decls first.
-            ZEXPECT(waited < std::chrono::seconds(5));
         };
 
         kota::task_group<> group;
+        auto gate = w.gate(bp);
         group.spawn(build());
-
-        co_await kota::sleep(50, w.loop);
-        cancelled_at = std::chrono::steady_clock::now();
+        co_await w.parked(gate);
         source.cancel();
+        w.release(gate);
         co_await group.join();
+
+        // The worker lives on: the parse stopped short of the pragma.
+        bp.file = tmp.path("small.cpp");
+        bp.arguments = make_args(bp.file);
+        auto next = co_await w.peer->send_request(bp);
+        ZASSERT(next);
+        ZEXPECT(next->success);
 
         test_done = true;
         w.peer->close_output();

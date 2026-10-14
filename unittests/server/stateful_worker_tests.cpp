@@ -61,21 +61,10 @@ ZEST_CASE(CancelledCompileFreesStrand) {
     bool test_done = false;
 
     w.run([&]() -> kota::task<> {
-        // A deterministically slow TU: two hundred thousand trivial
-        // declarations keep the parse far past the cancellation tick on any
-        // hardware — two consecutive macOS runners completed a whole
-        // four-STL-header compile roundtrip inside 20ms — while the
-        // per-declaration stop poll keeps the cancelled remainder cheap.
-        std::string text;
-        text.reserve(1 << 22);
-        for(int i = 0; i < 200'000; ++i) {
-            text += std::format("int v{};\n", i);
-        }
-
         worker::CompileParams cp;
         cp.path = src;
         cp.version = 1;
-        cp.text = std::move(text);
+        cp.text = "int v0;\n";
         cp.directory = "/tmp";
         cp.arguments = make_args(src);
         cp.pch = {"", 0};
@@ -91,30 +80,25 @@ ZEST_CASE(CancelledCompileFreesStrand) {
             auto result = co_await w.peer->send_request(cp, opts);
             first_failed = !result.has_value();
         };
+        // The compile is under way, holding the strand, when the cancel
+        // arrives.
+        auto gate = w.gate(cp);
         group.spawn(sender());
-        // One short tick: enough for the request bytes to flush, far below
-        // any parse of four STL headers. The $/cancelRequest then chases
-        // the request down the same pipe, and the single-threaded worker
-        // processes it while the handler is parked on the pool await — the
-        // compile cannot have replied first, so the cancel deterministically
-        // arrives mid-flight (a 150ms window lost this race on a warm macOS
-        // runner that compiled the TU faster).
-        co_await kota::sleep(20, w.loop);
+        co_await w.parked(gate);
         source.cancel();
+        w.release(gate);
         co_await group.join();
         ZEXPECT(first_failed);
 
         // The strand must be free again: a second compile of the same
         // document completes instead of hanging behind the cancelled one's
         // never-released lock (the guard releases it when the cancelled
-        // handler's frame unwinds). A held strand blocks a compile of any
-        // size, so the retry uses a trivial TU — re-parsing the 200k
-        // declarations here once blew the bound on a slow runner — and the
-        // bound makes a regression a clean, attributable failure instead
-        // of a CI-wide timeout.
+        // handler's frame unwinds).
         cp.version = 2;
         cp.text = "int done;\n";
         kota::ipc::request_options retry_opts;
+        // Hang detection: a strand still held fails the retry here,
+        // attributably, rather than the whole run at its timeout.
         retry_opts.timeout = std::chrono::milliseconds(30'000);
         auto retry = co_await w.peer->send_request(cp, retry_opts);
         ZASSERT(retry);
@@ -161,15 +145,19 @@ ZEST_CASE(IpcCancelInterruptsCompile) {
         bool cancelled = false;
         kota::task_group<> group;
         auto sender = [&]() -> kota::task<> {
+            // Hang detection: a reply that never comes fails here, before
+            // the watchdog.
             auto result = co_await w.peer->send_request(
                 cp,
                 {.token = source.token(), .timeout = std::chrono::seconds(30)});
             cancelled =
                 !result.has_value() && result.error().code == worker::dispatch_errc::cancelled;
         };
+        auto gate = w.gate(cp);
         group.spawn(sender());
-        co_await kota::sleep(20, w.loop);
+        co_await w.parked(gate);
         source.cancel();
+        w.release(gate);
         co_await group.join();
         ZASSERT(cancelled);
 
@@ -214,6 +202,8 @@ ZEST_CASE(UnstartedCompileWakesQueries) {
         bool cancelled = false;
         kota::task_group<> group;
         auto sender = [&]() -> kota::task<> {
+            // Hang detection: a reply that never comes fails here, before
+            // the watchdog.
             auto result = co_await w.peer->send_request(
                 cp,
                 {.token = source.token(), .timeout = std::chrono::seconds(30)});
@@ -221,8 +211,11 @@ ZEST_CASE(UnstartedCompileWakesQueries) {
                 !result.has_value() && result.error().code == worker::dispatch_errc::cancelled;
         };
         group.spawn(sender());
+        // No event: the request's write into the stopped worker's pipe
+        // ends unannounced.
         co_await kota::sleep(50, w.loop);
         source.cancel();
+        // No event: so does the cancel's.
         co_await kota::sleep(50, w.loop);
         ZASSERT(!w.proc.kill(SIGCONT));
         co_await group.join();
@@ -231,6 +224,8 @@ ZEST_CASE(UnstartedCompileWakesQueries) {
         worker::QueryParams qp;
         qp.kind = worker::QueryKind::DocumentSymbol;
         qp.path = src;
+        // Hang detection: a reply that never comes fails here, before the
+        // watchdog.
         auto symbols = co_await w.peer->send_request(qp, {.timeout = std::chrono::seconds(30)});
         ZASSERT(symbols);
         ZEXPECT(symbols.value().data == "null");
@@ -282,8 +277,8 @@ ZEST_CASE(CancelledQueryFreesStrand) {
         source.cancel();
         co_await group.join();
 
-        // Bounded: a still-locked strand fails this cleanly via timeout.
         kota::ipc::request_options retry_opts;
+        // Hang detection: a strand still held fails the retry here.
         retry_opts.timeout = std::chrono::milliseconds(30'000);
         auto retry = co_await w.peer->send_request(qp, retry_opts);
         ZASSERT(retry);

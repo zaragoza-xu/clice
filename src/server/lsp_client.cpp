@@ -56,6 +56,8 @@ static kota::ipc::Error hooks_off() {
 template <typename Params>
 static void fire_refresh(kota::event_loop& loop, kota::ipc::JSONPeer& peer, Params params) {
     loop.schedule([](kota::ipc::JSONPeer* peer, Params request) -> kota::task<> {
+        // Hang detection: nothing waits on the answer; the bound only frees
+        // the request of a client that never answers.
         co_await peer->send_request(request, {.timeout = std::chrono::milliseconds(3000)});
     }(&peer, std::move(params)));
 }
@@ -1252,6 +1254,8 @@ void LSPClient::register_extensions() {
             auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::max(deadline - std::chrono::steady_clock::now(),
                          std::chrono::steady_clock::duration::zero()));
+            // Hang detection: past the deadline, the answer names what
+            // still runs.
             co_await kota::when_any(srv.wait_idle(this->peer), kota::sleep(left, srv.loop));
             ext::SyncResult result;
             for(auto& project: srv.projects) {
@@ -1581,10 +1585,11 @@ void LSPClient::report_index_progress() {
             // teardown completes the wait through the failure path first,
             // which also stops the timeout timer.
             server.loop.schedule([](std::shared_ptr<IndexProgressState> state) -> kota::task<> {
-                // Timeout prevents the handshake from hanging when the client
-                // never responds.
+                // Hang detection: the bound ends the handshake of a client
+                // that never responds; a short one drops the progress of a
+                // round whose client is merely busy.
                 auto create_result =
-                    co_await state->reporter->create({.timeout = std::chrono::milliseconds(3000)});
+                    co_await state->reporter->create({.timeout = std::chrono::minutes(1)});
                 state->create_inflight = false;
                 // The round may have ended — or the whole connection may have
                 // been torn down — while the handshake was in flight; drop the

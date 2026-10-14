@@ -10,11 +10,12 @@ module clice:semantic.display;
 /// queries stay in decls.h and types.h.
 namespace clice::display {
 
-/// How the policy-driven renderers below print. The boolean fields mirror
-/// the PrintingPolicy configurations the features historically used; the
-/// quirk fields gate the patches we apply on top of clang's printers.
-/// Divergent defaults are kept per feature for now — unifying them is a
-/// deliberate, snapshot-reviewed change, not a side effect of this module.
+class ReadableTypes;
+
+/// How the policy-driven renderers below print. The boolean fields select
+/// PrintingPolicy flags; the quirk fields gate the patches applied on top of
+/// clang's printers. A feature keeps one Options for a request, so every
+/// type it shows prints the same way.
 struct Options {
     /// Drop scope qualifiers to keep names short.
     bool suppress_scope = false;
@@ -34,10 +35,13 @@ struct Options {
     /// Don't print a class template's args as part of a constructor name.
     bool suppress_ctor_template_args = false;
 
-    /// "(anonymous struct at foo.cc:1:2)" instead of "(anonymous struct)".
-    /// Nobody renders locations on purpose; only the untouched policy of
-    /// signature help keeps them today.
-    bool anonymous_tag_locations = false;
+    /// Print a reserved parameter name without its uglification (`__x` as
+    /// `x`).
+    bool clean_uglified = false;
+
+    /// type(): print the type as a reader knows it (ReadableTypes), through
+    /// the request's collection of standard aliases.
+    ReadableTypes* readable = nullptr;
 
     /// name_of(): include the written nested name qualifier and the
     /// template specialization arguments ("Foo::bar<int>" instead of
@@ -97,8 +101,16 @@ struct Param {
     /// std::nullopt for unnamed parameters.
     std::optional<std::string> name;
 
+    /// The names its declarations write for it (decls::named_parameters), as
+    /// written: a documentation comment names it by one of them.
+    std::vector<std::string> written;
+
     /// std::nullopt if no default is provided.
     std::optional<std::string> default_value;
+
+    /// A function parameter as its declaration writes it (parameter()), which
+    /// is how it prints; a template parameter prints from the fields above.
+    std::optional<std::string> declaration;
 };
 
 /// The raw spelled identifier of the decl, empty if its name is not a
@@ -143,9 +155,17 @@ auto namespace_scope(const clang::Decl* decl) -> std::string;
 /// theirs would duplicate it. Null when nothing is restored.
 auto restored_scope(clang::QualType type, const Options& options) -> clang::NestedNameSpecifier;
 
+/// The printing policy the options select: the context's policy with the
+/// option-selected flags applied on top.
+auto printing_policy(clang::ASTContext& context, const Options& options) -> clang::PrintingPolicy;
+
 /// Pretty-print a type, applying the option-gated quirks and the optional
-/// aka form.
-auto type(clang::ASTContext& context, clang::QualType type, const Options& options = {}) -> Type;
+/// aka form; a `declarator` (a name, `...name`) goes where the type puts it,
+/// as in `void (*name)(int)`.
+auto type(clang::ASTContext& context,
+          clang::QualType type,
+          const Options& options = {},
+          llvm::StringRef declarator = {}) -> Type;
 
 /// Apply a series of heuristic methods to determine whether or not the
 /// type is suitable for desugaring (e.g. getting the real name behind the
@@ -157,15 +177,18 @@ auto type(clang::ASTContext& context, clang::QualType type, const Options& optio
 auto maybe_desugar(clang::ASTContext& context, clang::QualType type) -> clang::QualType;
 
 /// Types as a reader knows them: a deduced `auto` gives way to the type it
-/// stands for, an alias with a reserved name (`_NonArray<int>`) to what it
-/// names, and a standard class template specialization to the standard
-/// alias naming it (`string` for `basic_string<char>`), in template
-/// arguments too. libc++ marks those aliases as preferred names, which the
-/// printer honors; libstdc++ only declares them. One per request: the
-/// aliases are collected once, on first use.
+/// stands for, an alias the standard library keeps to itself
+/// (`_NonArray<int>`) to what it names, and a standard class template specialization to the
+/// standard alias naming it (`string` for `basic_string<char>`), in template arguments too, under
+/// the namespaces the code writes it with
+/// (`std::string`) unless the options suppress scopes. libc++ marks those
+/// aliases as preferred names, which the printer honors; libstdc++ only
+/// declares them. One per request: the aliases are collected once, on first
+/// use.
 class ReadableTypes {
 public:
-    explicit ReadableTypes(clang::ASTContext& context) : context(context) {}
+    ReadableTypes(clang::ASTContext& context, const Options& options) :
+        context(context), scoped(!options.suppress_scope) {}
 
     auto readable(clang::QualType type) -> clang::QualType;
 
@@ -174,12 +197,21 @@ private:
 
     bool reserved(const clang::NamedDecl* decl) const;
 
+    /// A reserved name a library keeps to itself, within namespace std or a
+    /// reserved one (`_NonArray`, `__gnu_cxx::__alloc_traits`). One outside
+    /// them, as `__m128`, is the name its header gives its users.
+    bool internal(const clang::NamedDecl* decl) const;
+
+    /// The scope the code names a namespace member through, `std::pmr::`.
+    auto written_scope(const clang::NamedDecl* decl) const -> clang::NestedNameSpecifier;
+
     /// The standard aliases by the canonical type they name; two aliases
     /// of one type name none.
     auto standard_aliases()
         -> const llvm::DenseMap<const clang::Type*, const clang::TypedefNameDecl*>&;
 
     clang::ASTContext& context;
+    bool scoped;
     std::optional<llvm::DenseMap<const clang::Type*, const clang::TypedefNameDecl*>> aliases;
 };
 
@@ -195,8 +227,29 @@ auto expr_value(const clang::ASTContext& context, const clang::Expr* expr)
 auto default_argument(const clang::ParmVarDecl* param, const Options& options = {})
     -> std::optional<std::string>;
 
-/// Render a function parameter with its default value.
+/// The name `function`'s parameter `index` shows under: the first one its
+/// declarations write (decls::named_parameters), a reserved name without
+/// its uglification (`__x` as `x`); empty when none names it.
+auto parameter_name(const clang::FunctionDecl& function, unsigned index) -> llvm::StringRef;
+
+/// What a member function's declaration writes after its parameters:
+/// ` const`, ` &`, ` &&`; empty for none.
+auto method_qualifiers(const clang::CXXMethodDecl& method) -> std::string;
+
+/// Render a function parameter with its default value, under the first name
+/// its declarations write (decls::named_parameters).
 auto param(const clang::ParmVarDecl* param, const Options& options = {}) -> Param;
+
+/// A function parameter as its declaration writes it, under `name`: the
+/// type as written (an array does not decay), a pack's `...`, then its
+/// default argument.
+auto parameter(const clang::ParmVarDecl& param, llvm::StringRef name, const Options& options)
+    -> std::string;
+
+/// A field as its declaration writes it: `mutable`, then its bit width and
+/// default member initializer as the source writes them, as parameter()
+/// gives a default argument.
+auto field(const clang::FieldDecl& field, const Options& options) -> std::string;
 
 /// Render every parameter of a template parameter list.
 auto template_params(const clang::TemplateParameterList* params, const Options& options = {})

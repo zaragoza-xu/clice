@@ -154,6 +154,65 @@ Shape shape
 '''
 range = "return area(2, 3) + ⟦shape⟧.sides + LIMIT + calls;"
 
+["index cards of template parameters".template_parameter.hover]
+markdown = '''
+### type `T`
+
+---
+
+The replaced type.
+
+---
+```cpp
+typename T
+```
+'''
+range = "⟦T⟧ exchange(T& target, T value);"
+
+["index cards of template parameters".undocumented_parameter.hover]
+markdown = '''
+### type `U`
+
+---
+```cpp
+typename U
+```
+'''
+range = "⟦U⟧ repeat(U value);"
+
+["index cards of template parameters".non_type_parameter.hover]
+markdown = '''
+### variable `Size`
+
+---
+
+Its capacity.
+
+---
+```cpp
+int Size
+```
+'''
+range = "char data[⟦Size⟧];"
+
+["index cards of template parameters".copied_alias.hover]
+markdown = '''
+### type `self`
+
+---
+
+A fixed buffer.
+
+Template parameters:
+- `Size` — Its capacity.
+
+---
+```cpp
+using self = Buffer
+```
+'''
+range = "using ⟦self⟧ = Buffer;"
+
 ["index cards follow the options".call.hover]
 markdown = '''
 ### function `area`

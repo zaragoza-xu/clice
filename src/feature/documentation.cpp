@@ -8,6 +8,7 @@ import :compile.compilation_unit;
 import :compile.documentation;
 import :feature.feature;
 import :index.query;
+import :semantic.display;
 import :support.markup;
 import :syntax.documentation;
 
@@ -99,36 +100,22 @@ auto documentation(const index::IndexQuery& query,
                    Fid anchor,
                    const DocumentationOptions& options) -> Documentation {
     // A parameter shows what its function's comment says of it, as hover's
-    // card does.
-    if(auto info = query.symbol_info(hash, anchor);
-       info && info->kind == SymbolKind::Parameter && info->parent != 0) {
+    // card does, and a template parameter, indexed as a type or a variable,
+    // what its template's says.
+    auto info = query.symbol_info(hash, anchor);
+    if(info && info->kind == SymbolKind::Parameter && info->parent != 0) {
         auto owner = symbol_documentation(query, info->parent, anchor, options, 0);
         const auto* param = owner.param(info->name);
         return param ? Documentation{.brief = param->text} : Documentation();
     }
-    return symbol_documentation(query, hash, anchor, options, 0);
-}
-
-auto parameter_names(const clang::FunctionDecl& function, unsigned index)
-    -> llvm::SmallVector<std::string, 1> {
-    llvm::SmallVector<std::string, 1> names;
-    auto add = [&](const clang::FunctionDecl& declaration) {
-        for(const auto* redecl: declaration.redecls()) {
-            if(index >= redecl->getNumParams()) {
-                continue;
-            }
-            auto name = redecl->getParamDecl(index)->getName();
-            if(!name.empty() && !llvm::is_contained(names, name)) {
-                names.push_back(name.str());
-            }
+    if(info && info->parent != 0 &&
+       (info->kind == SymbolKind::Type || info->kind == SymbolKind::Variable)) {
+        auto owner = symbol_documentation(query, info->parent, anchor, options, 0);
+        if(const auto* param = owner.template_param(info->name)) {
+            return Documentation{.brief = param->text};
         }
-    };
-    add(function);
-    if(const auto* pattern = function.getTemplateInstantiationPattern();
-       pattern && pattern->getNumParams() == function.getNumParams()) {
-        add(*pattern);
     }
-    return names;
+    return symbol_documentation(query, hash, anchor, options, 0);
 }
 
 void describe(markup::Paragraph& entry, llvm::StringRef direction, llvm::StringRef text) {
@@ -170,40 +157,65 @@ void add_details(markup::Document& output, const Documentation& documentation) {
     }
 }
 
-auto present(const Documentation& documentation) -> markup::Document {
-    markup::Document output;
-    const auto& doc = documentation;
-    if(doc.deprecated) {
+void add_summary(markup::Document& output,
+                 const Documentation& documentation,
+                 std::optional<llvm::StringRef> attribute) {
+    if(attribute || documentation.deprecated) {
         auto& paragraph = output.add_paragraph().append_text("Deprecated");
-        if(!doc.deprecated->empty()) {
-            paragraph.append_text(": ").append_markdown(*doc.deprecated);
+        if(attribute && !attribute->empty()) {
+            paragraph.append_text(": " + attribute->str());
+        } else if(documentation.deprecated && !documentation.deprecated->empty()) {
+            paragraph.append_text(": ").append_markdown(*documentation.deprecated);
         }
     }
-    if(!doc.brief.empty()) {
-        output.add_markdown(doc.brief);
+    if(!documentation.brief.empty()) {
+        output.add_markdown(documentation.brief);
     }
+}
 
-    auto list = [&](llvm::StringRef title, llvm::ArrayRef<Documentation::Param> params) {
-        if(params.empty()) {
-            return;
+void add_parameters(markup::Document& output,
+                    llvm::StringRef title,
+                    llvm::ArrayRef<display::Param> signature,
+                    llvm::ArrayRef<Documentation::Param> documented) {
+    if(signature.empty() && documented.empty()) {
+        return;
+    }
+    output.add_paragraph().append_text(title);
+    auto& list = output.add_bullet_list();
+    llvm::SmallVector<bool> shown(documented.size());
+    for(const auto& param: signature) {
+        auto& entry = list.add_item().add_paragraph().append_code(llvm::to_string(param));
+        // Each entry documents one parameter: declarations may give one name
+        // to two of them.
+        for(auto [index, described]: llvm::enumerate(documented)) {
+            if(!shown[index] && (llvm::is_contained(param.written, described.name) ||
+                                 (param.name && described.name == *param.name))) {
+                shown[index] = true;
+                describe(entry, described.direction, described.text);
+                break;
+            }
         }
-        output.add_paragraph().append_text(title);
-        auto& items = output.add_bullet_list();
-        for(const auto& param: params) {
-            describe(items.add_item().add_paragraph().append_code(param.name),
+    }
+    for(auto [index, param]: llvm::enumerate(documented)) {
+        if(!shown[index]) {
+            describe(list.add_item().add_paragraph().append_code(param.name),
                      param.direction,
                      param.text);
         }
-    };
-    list("Template parameters: ", doc.template_params);
-    list("Parameters: ", doc.params);
-
-    if(!doc.returns.empty()) {
-        output.add_paragraph().append_text("Returns: ").append_markdown(doc.returns);
     }
-    add_entries(output, "Return values: ", doc.retvals);
-    add_entries(output, "Throws: ", doc.throws);
-    add_details(output, doc);
+}
+
+auto present(const Documentation& documentation) -> markup::Document {
+    markup::Document output;
+    add_summary(output, documentation, std::nullopt);
+    add_parameters(output, "Template parameters: ", {}, documentation.template_params);
+    add_parameters(output, "Parameters: ", {}, documentation.params);
+    if(!documentation.returns.empty()) {
+        output.add_paragraph().append_text("Returns: ").append_markdown(documentation.returns);
+    }
+    add_entries(output, "Return values: ", documentation.retvals);
+    add_entries(output, "Throws: ", documentation.throws);
+    add_details(output, documentation);
     return output;
 }
 

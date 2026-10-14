@@ -17,8 +17,8 @@ documentation = '''
 Opens a file.
 
 Parameters:
-- __path — The file to open.
-- __flags — How to open it.
+- path — The file to open.
+- flags — How to open it.
 '''
 parameter_documentation = "The file to open."
 
@@ -29,8 +29,8 @@ documentation = '''
 Copies bytes.
 
 Parameters:
-- to — Where they go.
-- from — Where they come from.
+- destination — Where they go.
+- source — Where they come from.
 '''
 parameter_documentation = "Where they come from."
 
@@ -45,3 +45,27 @@ Parameters:
 - ... — The values it formats.
 '''
 parameter_documentation = "The values it formats."
+
+[answers.direction.signature_help]
+signatures = ["read_value(⟦int *value⟧) -> void"]
+active = 0
+documentation = '''
+Reads a value.
+
+Parameters:
+- value (out) — Where it goes.
+- count — How many it reads.
+'''
+parameter_documentation = "Where it goes."
+
+[answers.swapped.signature_help]
+signatures = ["step(int z, ⟦int x⟧) -> void"]
+active = 0
+documentation = '''
+Moves a point.
+
+Parameters:
+- z — The horizontal step.
+- x — The vertical step.
+'''
+parameter_documentation = "The vertical step."

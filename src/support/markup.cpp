@@ -335,6 +335,17 @@ public:
     }
 };
 
+class Spacing : public Block {
+public:
+    void render_markdown(llvm::raw_ostream& os) const override {
+        os << '\n';
+    }
+
+    void render_plain_text(llvm::raw_ostream& os) const override {
+        os << '\n';
+    }
+};
+
 class CodeBlock : public Block {
 public:
     CodeBlock(std::string contents, std::string language) :
@@ -476,6 +487,7 @@ void Paragraph::render_markdown(llvm::raw_ostream& os) const {
             case Chunk::PlainText: os << render_text(chunk.contents, !has_chunks); break;
             case Chunk::InlineCode: os << code_span(chunk.contents); break;
             case Chunk::Markdown: os << escape_markdown(chunk.contents); break;
+            case Chunk::Strong: os << "**" << render_text(chunk.contents, false) << "**"; break;
         }
 
         has_chunks = true;
@@ -538,6 +550,14 @@ Paragraph& Paragraph::append_markdown(llvm::StringRef text) {
     return *this;
 }
 
+Paragraph& Paragraph::append_strong(llvm::StringRef text) {
+    append_text(text);
+    if(!chunks.empty() && chunks.back().kind == Chunk::PlainText) {
+        chunks.back().kind = Chunk::Strong;
+    }
+    return *this;
+}
+
 Paragraph& Paragraph::append_code(llvm::StringRef code, bool preserve) {
     bool adjacent_code = !chunks.empty() && chunks.back().kind == Chunk::InlineCode;
     std::string norm = canonicalize_spaces(code);
@@ -586,6 +606,10 @@ Paragraph& Document::add_paragraph() {
 
 void Document::add_ruler() {
     children.push_back(std::make_unique<Ruler>());
+}
+
+void Document::add_spacing() {
+    children.push_back(std::make_unique<Spacing>());
 }
 
 void Document::add_code_block(std::string code, std::string language) {

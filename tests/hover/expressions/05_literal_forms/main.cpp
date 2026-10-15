@@ -1,6 +1,7 @@
-// A character and a string literal, sizeof and alignof have cards; so do
-// both halves of a user-defined literal, the digits and the suffix. Numeric
-// literals have none yet.
+// Every literal has a card: a character, a string, a floating, an imaginary
+// and an integer one, both halves of a user-defined literal, the digits and
+// the suffix, a static_assert's message, which has no type, one longer than
+// the title shows; so do sizeof and alignof.
 
 auto delimiter = '§(char_literal):';
 auto greeting = §(string_literal)"welcome";
@@ -19,3 +20,9 @@ int literal() {
 auto decimal = §(float_literal)3.5;
 auto imaginary = §(imaginary_literal)6.0i;
 auto integer = §(int_literal)99;
+
+static_assert(sizeof(int) == 4, §(unevaluated_string)"int is four bytes");
+
+auto long_text = §(long_text)"中文中文中文中文中文中文中文中文";
+
+constexpr _Complex double §(negative_imaginary)conjugate = 1.0 - 2.0i;

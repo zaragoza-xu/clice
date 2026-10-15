@@ -1,53 +1,44 @@
 [answers.char_literal.hover]
 markdown = '''
-### `expression`
+**literal** `':'`
 
----
 Type: `char`
-Value = `58 (0x3a)`
+Value: `58 (0x3a)`
 '''
 range = "auto delimiter = ⟦':'⟧;"
 
 [answers.string_literal.hover]
 markdown = '''
-### `string-literal`
+**literal** `"welcome"`
 
----
 Type: `const char[8]`
+Length: 7
 Size: 8 bytes
 '''
 range = 'auto greeting = ⟦"welcome"⟧;'
 
 [answers.sizeof_expr.hover]
 markdown = '''
-### `expression`
+**expression**
 
----
-Type: `__size_t (aka unsigned long)`
-Value = `8`
+Type: `unsigned long`
+Value: `8`
 '''
 range = "(void)⟦sizeof⟧(long);"
 
 [answers.alignof_expr.hover]
 markdown = '''
-### `expression`
+**expression**
 
----
-Type: `__size_t (aka unsigned long)`
-Value = `8`
+Type: `unsigned long`
+Value: `8`
 '''
 range = "(void)⟦alignof⟧(double);"
 
 [answers.udl_digits.hover]
 markdown = '''
-### function `operator""_unit`
+**function** `operator ""_unit`
 
----
-→ `int`
-Parameters:
-- `unsigned long long value`
-
----
 ```cpp
 int operator""_unit(unsigned long long value)
 ```
@@ -56,28 +47,67 @@ range = "return ⟦12_unit⟧ + 12_unit;"
 
 [answers.udl_suffix.hover]
 markdown = '''
-### function `operator""_unit`
+**function** `operator ""_unit`
 
----
-→ `int`
-Parameters:
-- `unsigned long long value`
-
----
 ```cpp
 int operator""_unit(unsigned long long value)
 ```
 '''
 range = "return 12_unit + ⟦12_unit⟧;"
 
-[answers.float_literal]
-wrong = "a numeric literal has no card, where its type and value could show (clangd#1669)"
-hover = {}
+[answers.float_literal.hover]
+markdown = '''
+**literal** `3.5`
 
-[answers.imaginary_literal]
-wrong = "a numeric literal has no card, where its type and value could show (clangd#1669)"
-hover = {}
+Type: `double`
+Value: `3.5`
+'''
+range = "auto decimal = ⟦3.5⟧;"
 
-[answers.int_literal]
-wrong = "a numeric literal has no card, where its type and value could show (clangd#1669)"
-hover = {}
+[answers.imaginary_literal.hover]
+markdown = '''
+**literal** `6.0i`
+
+Type: `_Complex double`
+Value: `0+6i`
+'''
+range = "auto imaginary = ⟦6.0i⟧;"
+
+[answers.int_literal.hover]
+markdown = '''
+**literal** `99`
+
+Type: `int`
+Value: `99 (0x63)`
+'''
+range = "auto integer = ⟦99⟧;"
+
+[answers.unevaluated_string.hover]
+markdown = '''
+**literal** `"int is four bytes"`
+
+Length: 17
+Size: 18 bytes
+'''
+range = 'static_assert(sizeof(int) == 4, ⟦"int is four bytes"⟧);'
+
+[answers.long_text.hover]
+markdown = '''
+**literal** `"中文中文中文中文中文中文中...`
+
+Type: `const char[49]`
+Length: 48
+Size: 49 bytes
+'''
+range = 'auto long_text = ⟦"中文中文中文中文中文中文中文中文"⟧;'
+
+[answers.negative_imaginary.hover]
+markdown = '''
+**variable** `conjugate`
+
+```cpp
+constexpr _Complex double conjugate = 1.0 - 2.0i
+```
+Value: `1-2i`
+'''
+range = "constexpr _Complex double ⟦conjugate⟧ = 1.0 - 2.0i;"

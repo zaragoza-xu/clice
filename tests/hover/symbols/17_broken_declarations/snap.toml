@@ -1,0 +1,49 @@
+[answers.variable.hover]
+markdown = '''
+**variable** `missing`
+
+```cpp
+Unknown missing
+```
+'''
+range = "Unknown ⟦missing⟧;"
+
+[answers.parameter.hover]
+markdown = '''
+**parameter** `value` · function `consume`
+
+```cpp
+Missing value
+```
+'''
+range = "void consume(Missing ⟦value⟧);"
+
+[answers.field.hover]
+markdown = '''
+**field** `member` · struct `Record`
+
+```cpp
+Undeclared member
+```
+'''
+range = "Undeclared ⟦member⟧;"
+
+[answers.broken_default.hover]
+markdown = '''
+**parameter** `delay` · function `reconnect`
+
+```cpp
+int delay
+```
+'''
+range = "void reconnect(int ⟦delay⟧ = undeclared_delay);"
+
+[answers.broken_initializer.hover]
+markdown = '''
+**field** `ceiling` · struct `Limits`
+
+```cpp
+int ceiling
+```
+'''
+range = "int ⟦ceiling⟧ = undeclared_ceiling;"

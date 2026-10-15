@@ -1,5 +1,8 @@
 namespace std {
 
+typedef decltype(sizeof 0) size_t;
+typedef decltype(static_cast<int*>(nullptr) - static_cast<int*>(nullptr)) ptrdiff_t;
+
 inline namespace __1 {
 
 template <typename Char>
@@ -36,4 +39,6 @@ void use(std::vector<std::string> names, std::vector<std::pmr::string> texts) {
     §(standard)auto& name = names.front();
     §(nested)auto& text = texts.front();
     §(header_alias)auto sum = checksum();
+    §(size_type)auto size = sizeof(names);
+    §(difference_type)auto distance = &names - &names;
 }

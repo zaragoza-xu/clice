@@ -1,0 +1,80 @@
+[answers.function_type.hover]
+markdown = '''
+**parameter** `attempt` · function `function_type::retry`
+
+```cpp
+int attempt(int)
+```
+'''
+range = "void retry(int ⟦attempt⟧(int));"
+
+[answers.noexcept_function_type.hover]
+markdown = '''
+**parameter** `attempt` · function `function_type::retry_quietly`
+
+```cpp
+int attempt(int) noexcept
+```
+'''
+range = "void retry_quietly(int ⟦attempt⟧(int) noexcept);"
+
+[answers.returns_function_pointer.hover]
+markdown = '''
+**parameter** `handler` · function `function_type::install`
+
+```cpp
+void (*handler(int))(double)
+```
+'''
+range = "void install(void (*⟦handler⟧(int))(double));"
+
+[answers.alias_function_type.hover]
+markdown = '''
+**parameter** `callback` · function `function_type::subscribe`
+
+```cpp
+Callback callback
+```
+`Callback` is `void (int)`
+'''
+range = "void subscribe(Callback ⟦callback⟧);"
+
+[answers.explicit_object.hover]
+markdown = '''
+**parameter** `self` · method `explicit_object::Widget::resize`
+
+```cpp
+this Widget &self
+```
+'''
+range = "void resize(this Widget& ⟦self⟧, int width);"
+
+[answers.deduced_object.hover]
+markdown = '''
+**parameter** `self` · method `explicit_object::Widget::get`
+
+```cpp
+this Self &&self
+```
+'''
+range = "template <typename Self> auto& get(this Self&& ⟦self⟧);"
+
+[answers.inherited_default.hover]
+markdown = '''
+**parameter** `mode` · function `inherited_default::open`
+
+```cpp
+int mode
+```
+'''
+range = "void open(int ⟦mode⟧) {}"
+
+[answers.attributed.hover]
+markdown = '''
+**parameter** `code` · function `attributed::report`
+
+```cpp
+[[maybe_unused]] int code
+```
+'''
+range = "void report([[maybe_unused]] int ⟦code⟧);"

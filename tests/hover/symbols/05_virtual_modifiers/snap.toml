@@ -1,62 +1,53 @@
 [answers.pure_virtual.hover]
 markdown = '''
-### method `draw`
+**method** `draw` · struct `Base`
 
----
-→ `void`
-
----
 ```cpp
-// In Base
-public: virtual void draw() = 0
+virtual void draw() = 0
 ```
 '''
-range = "virtual void ⟦draw⟧() = 0;"
+range = "virtual void ⟦draw⟧() = 0; @+0"
 
 [answers.override_method.hover]
 markdown = '''
-### method `draw`
+**method** `draw` · struct `Circle`
 
----
-→ `void`
-
----
 ```cpp
-// In Circle
-public: void draw() override
+void draw() override
 ```
+Overrides: `Base::draw`
 '''
-range = "void ⟦draw⟧() override;"
+range = "void ⟦draw⟧() override; @+0"
 
 [answers.final_method.hover]
 markdown = '''
-### method `draw`
+**method** `draw` · struct `Dot`
 
----
-→ `void`
-
----
 ```cpp
-// In Dot
-public: void draw() final
+void draw() final
 ```
+Overrides: `Circle::draw`
 '''
 range = "void ⟦draw⟧() final;"
 
-[answers.implicit_override]
-wrong = "draw overrides Base::draw, but without the override keyword the card gives no sign it is virtual (clangd#2474)"
-
 [answers.implicit_override.hover]
 markdown = '''
-### method `draw`
+**method** `draw` · struct `Square`
 
----
-→ `void`
-
----
 ```cpp
-// In Square
-public: void draw()
+void draw()
 ```
+Overrides: `Base::draw`
 '''
 range = "void ⟦draw⟧();"
+
+[answers.two_bases.hover]
+markdown = '''
+**method** `draw` · struct `Label`
+
+```cpp
+void draw() override
+```
+Overrides: `Base::draw`, `Printable::draw`
+'''
+range = "void ⟦draw⟧() override; @+0"

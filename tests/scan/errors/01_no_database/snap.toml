@@ -1,0 +1,3 @@
+[test."$ clice scan"]
+stderr = "error: Nothing to scan: no compilation database for ${WS} lists a file"
+exit = 1

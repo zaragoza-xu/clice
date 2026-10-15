@@ -11,6 +11,7 @@ so re-running is cheap.
 """
 
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -101,13 +102,17 @@ def main() -> int:
     print(f"\nworkload ready: {root}")
     print(f"compile_commands.json: {cdb}")
     print("suggested runs:")
-    print(f"  ./build/RelWithDebInfo/bin/bin/scan_benchmark {cdb}")
-    print(f"  ./build/RelWithDebInfo/bin/bin/pipeline_benchmark --limit 100 {cdb}")
+    print(
+        f"  ./build/RelWithDebInfo/bin/bin/clice scan --workspace {shlex.quote(str(cdb.parent))} --runs 20"
+    )
+    print(
+        f"  ./build/RelWithDebInfo/bin/bin/pipeline_benchmark --limit 100 {shlex.quote(str(cdb))}"
+    )
     scenario = workload.get("scenario")
     if scenario:
         print(
-            f"  node tools/bench/bench.ts --workspace {root}"
-            f" --file {root / scenario['file']}"
+            f"  node tools/bench/bench.ts --workspace {shlex.quote(str(root))}"
+            f" --file {shlex.quote(str(root / scenario['file']))}"
         )
     return 0
 

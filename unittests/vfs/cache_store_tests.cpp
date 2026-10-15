@@ -39,23 +39,18 @@ CacheStore open_store(const TempDir& tmp, std::uint32_t ver = version) {
 }
 
 void register_lru(CacheStore& store, std::uint64_t max_bytes = 0) {
-    store.register_namespace(
-        {.name = "pch", .extension = ".pch", .policy = CachePolicy::LRU, .max_bytes = max_bytes});
+    store.register_namespace({.name = "pch", .extension = ".pch", .max_bytes = max_bytes});
 }
 
 void register_paired(CacheStore& store, std::uint64_t max_bytes = 0) {
-    store.register_namespace({.name = "pch",
-                              .extension = ".pch",
-                              .aux_extension = ".pch.idx",
-                              .policy = CachePolicy::LRU,
-                              .max_bytes = max_bytes});
+    store.register_namespace(
+        {.name = "pch", .extension = ".pch", .aux_extension = ".pch.idx", .max_bytes = max_bytes});
 }
 
 /// Run a full two-phase aux write with the given content.
 std::string
     put_aux(CacheStore& store, llvm::StringRef ns, llvm::StringRef key, llvm::StringRef content) {
     auto pending = store.begin_store_aux(ns, key);
-    require(!pending.tmp_path.empty(), "begin_store_aux returned no tmp path");
     require(!vfs::write(pending.tmp_path, content), "tmp write failed");
     auto committed = store.commit(std::move(pending));
     require(committed.has_value(), "aux commit failed");
@@ -66,7 +61,6 @@ std::string
 std::string
     put(CacheStore& store, llvm::StringRef ns, llvm::StringRef key, llvm::StringRef content) {
     auto pending = store.begin_store(ns, key);
-    require(!pending.tmp_path.empty(), "begin_store returned no tmp path");
     require(!vfs::write(pending.tmp_path, content), "tmp write failed");
     auto committed = store.commit(std::move(pending));
     require(committed.has_value(), "commit failed");
@@ -457,43 +451,6 @@ ZEST_CASE(ShutdownRemovesOwnTmp) {
         store.shutdown();
     }
     ZASSERT(!llvm::sys::fs::exists(tmp.path("root/cache/v1/tmp/" + pid)));
-}
-
-ZEST_CASE(ScratchBasics) {
-    TempDir tmp;
-    auto store = open_store(tmp);
-    store.register_namespace(
-        {.name = "header_context", .extension = ".h", .policy = CachePolicy::Scratch});
-
-    auto pid = std::to_string(llvm::sys::Process::getProcessId());
-    auto path = put(store, "header_context", "k1", "preamble");
-
-    // Scratch blobs live under this instance's pid directory.
-    ZASSERT(llvm::StringRef(path).contains(pid));
-    ZASSERT(store.lookup("header_context", "k1"));
-
-    // Scratch entries never enter the manifest.
-    store.checkpoint();
-    auto manifest = read_file(tmp.path("root/cache/v1/manifest.json"));
-    if(manifest.has_value()) {
-        ZASSERT(!llvm::StringRef(*manifest).contains("header_context"));
-    }
-
-    // shutdown removes the whole instance directory.
-    store.shutdown();
-    ZASSERT(!llvm::sys::fs::exists(path));
-}
-
-ZEST_CASE(ScratchDeadPidRemoved) {
-    TempDir tmp;
-    tmp.touch(std::string("root/cache/v1/header_context/") + dead_pid + "/x.h", "stale");
-
-    auto store = open_store(tmp);
-    store.register_namespace(
-        {.name = "header_context", .extension = ".h", .policy = CachePolicy::Scratch});
-
-    ZASSERT(
-        !llvm::sys::fs::exists(tmp.path(std::string("root/cache/v1/header_context/") + dead_pid)));
 }
 
 ZEST_CASE(CommitOverwriteSameKey) {

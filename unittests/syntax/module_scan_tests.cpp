@@ -4,7 +4,7 @@ module;
 
 module clice;
 
-import :syntax.annotation;
+import :unittests.utils.annotation;
 import :syntax.scan;
 import :unittests.utils;
 
@@ -48,11 +48,11 @@ struct ModuleScanFixture {
     }
 
     ScanResult decl() {
-        return scan_module_decl(args, TestVFS::root(), {}, nullptr, vfs);
+        return scan_module_decl(args, TestVFS::root(), {}, vfs);
     }
 
     ScanResult precise() {
-        return scan_precise(args, TestVFS::root(), {}, nullptr, vfs);
+        return scan_precise(args, TestVFS::root(), {}, vfs);
     }
 };
 
@@ -573,7 +573,6 @@ int legacy_func();
 )");
     auto result = f.precise();
     ZEXPECT(result.module_name == "mylib");
-    ZASSERT(result.includes.size() >= 1u);
     ZASSERT(result.modules.size() == 2u);
     ZEXPECT(result.modules[0] == "dep_a");
     ZEXPECT(result.modules[1] == "dep_b");

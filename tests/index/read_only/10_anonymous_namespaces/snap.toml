@@ -1,0 +1,105 @@
+[test.top.index]
+markdown = '''
+**variable** `hidden` · namespace `(anonymous)`
+
+```cpp
+int hidden = 1
+```
+'''
+range = "int ⟦hidden⟧ = 1;"
+
+[test.top.ast]
+markdown = '''
+**variable** `hidden` · namespace `(anonymous)`
+
+```cpp
+int hidden = 1
+```
+Value: `1`
+'''
+range = "int ⟦hidden⟧ = 1;"
+
+[test.member.index]
+markdown = '''
+**field** `count` · struct `(anonymous namespace)::Impl`
+
+```cpp
+int count
+```
+'''
+range = "int ⟦count⟧;"
+
+[test.member.ast]
+markdown = '''
+**field** `count` · struct `(anonymous namespace)::Impl`
+
+```cpp
+int count
+```
+Offset: 0 bytes
+Size: 4 bytes, alignment 4 bytes
+'''
+range = "int ⟦count⟧;"
+
+[test.union_member.index]
+markdown = '''
+**field** `raw` · namespace `(anonymous)`
+
+```cpp
+int raw
+```
+'''
+range = "int ⟦raw⟧;"
+
+[test.union_member.ast]
+markdown = '''
+**field** `raw` · namespace `(anonymous)`
+
+```cpp
+int raw
+```
+Size: 4 bytes, alignment 4 bytes
+'''
+range = "int ⟦raw⟧;"
+
+[test.nested.index]
+markdown = '''
+**variable** `nested` · namespace `outer::(anonymous)`
+
+```cpp
+int nested = 2
+```
+'''
+range = "int ⟦nested⟧ = 2;"
+
+[test.nested.ast]
+markdown = '''
+**variable** `nested` · namespace `outer::(anonymous)`
+
+```cpp
+int nested = 2
+```
+Value: `2`
+'''
+range = "int ⟦nested⟧ = 2;"
+
+[test.inside.index]
+markdown = '''
+**variable** `deep` · namespace `outer::(anonymous)::inner`
+
+```cpp
+int deep = 3
+```
+'''
+range = "int ⟦deep⟧ = 3;"
+
+[test.inside.ast]
+markdown = '''
+**variable** `deep` · namespace `outer::(anonymous)::inner`
+
+```cpp
+int deep = 3
+```
+Value: `3`
+'''
+range = "int ⟦deep⟧ = 3;"

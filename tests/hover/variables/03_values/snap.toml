@@ -14,7 +14,7 @@ markdown = '''
 **variable** `value` · struct `evaluated_static_member::Offset<10>`
 
 ```cpp
-static constexpr long value = Base + 6
+static constexpr long value = 16
 ```
 Value: `16 (0x10)`
 '''
@@ -106,6 +106,18 @@ constexpr char16_t face[] = u"\U0001F600!"
 Value: `u"😀!"`
 '''
 range = 'constexpr char16_t ⟦face⟧[] = u"\U0001F600!";'
+
+[answers.lone_surrogate.hover]
+markdown = '''
+**variable** `lone` · namespace `string_values`
+
+```cpp
+constexpr char16_t lone[] = u"\xD800"
+                            "A"
+```
+Value: `u"\xd800\101"`
+'''
+range = 'constexpr char16_t ⟦lone⟧[] = u"\xD800" "A";'
 
 [answers.invalid_utf8.hover]
 markdown = '''

@@ -8,6 +8,7 @@ module;
 
 #ifdef _WIN32
 #include <io.h>
+#include <signal.h>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -82,6 +83,14 @@ void lower_thread_priority() {
 }
 
 kota::task<> watch_termination(int signum, bool& requested, std::function<void()> stop) {
+    // Runs after the watcher closes, which restores the default action: a
+    // repeated SIGTERM or SIGHUP would then kill a process that is only left
+    // to report and exit.
+    auto keep_ignoring = llvm::make_scope_exit([&] {
+        if(requested && signum != SIGINT) {
+            std::signal(signum, SIG_IGN);
+        }
+    });
     auto watcher = kota::signal::create();
     if(!watcher || watcher->start(signum).has_error()) {
         co_return;

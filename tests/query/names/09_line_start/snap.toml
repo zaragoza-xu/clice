@@ -5,7 +5,7 @@ Session log: ${WS}/.clice/logs/${SESSION}
 '''
 exit = 0
 
-[test."$ clice query --method references --symbol value --include-declaration"]
+[test."$ clice query references value --include-declaration"]
 stdout = '''
 {
   "result": {
@@ -25,6 +25,34 @@ stdout = '''
       }
     ],
     "total": 2
+  },
+  "stale": []
+}
+'''
+exit = 0
+
+[test."$ clice query symbol-search --limit 3"]
+stdout = '''
+{
+  "result": {
+    "symbols": [
+      {
+        "name": "use",
+        "kind": "Function",
+        "file": "${WS}/main.cpp",
+        "line": 3,
+        "container": null,
+        "symbol": "#864f22013c538ab8"
+      },
+      {
+        "name": "value",
+        "kind": "Function",
+        "file": "${WS}/main.cpp",
+        "line": 2,
+        "container": null,
+        "symbol": "#2282827d1139ff33"
+      }
+    ]
   },
   "stale": []
 }

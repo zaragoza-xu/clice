@@ -4,9 +4,13 @@ name: clice
 # release build: every CI run on main packages the binaries its test suites
 # just validated (see test-leg.yml), and this workflow
 # only downloads those artifacts from the green run of the tagged commit,
-# renames them to their asset names, and attaches them to the release. It
-# also re-uploads the packages into the current run so publish-vscode.yml
-# can bundle them.
+# renames them to their asset names, attaches them to the release, and then
+# publishes the release. It also re-uploads the packages into the current run
+# so publish-vscode.yml can bundle them.
+#
+# The release is a draft until every platform archive is attached: drafts are
+# hidden from anyone without push access, so no user's editor extension
+# picking the newest release meets one that lacks its platform's archive.
 on:
   workflow_call:
     inputs:
@@ -65,16 +69,23 @@ jobs:
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
       # Stable tag pushes arrive without a release object (nightly creates
-      # its own before dispatching); create it so `gh release upload` in the
-      # promote matrix has a target.
+      # its own draft before dispatching); create it so `gh release upload`
+      # in the promote matrix has a target. gh finds drafts by tag too. A
+      # release already published, e.g. one created on the releases page,
+      # would show its archives one platform at a time, so it is refused.
       - name: Ensure the release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.release_tag }}
         run: |
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+          if ! DRAFT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft --jq .isDraft 2> /dev/null); then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
               --title "$TAG" --generate-notes
+          elif [ "$DRAFT" != true ]; then
+            echo "::error::release $TAG is already published; turn it back into a draft (gh release edit $TAG --draft=true) and rerun"
+            exit 1
+          fi
 
   promote:
     needs: locate
@@ -149,3 +160,17 @@ jobs:
             pkg/clice.zip
           if-no-files-found: error
           retention-days: 7
+
+  # Only after every leg of the matrix succeeded; a failed leg leaves the
+  # draft for `gh run rerun --failed`.
+  publish:
+    needs: promote
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

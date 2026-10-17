@@ -405,6 +405,44 @@ ZEST_CASE(PortablePathsFiltered) {
     ZEXPECT(found("side path:/opt/") == Names{"outside"});
 }
 
+ZEST_CASE(LocalHitsNameFile) {
+    // A symbol of internal linkage is in no project table: a hit on it
+    // names the file whose shard holds it.
+    Corpus corpus;
+    corpus.add("helper", SymbolKind::Function);
+    corpus.add("helper", SymbolKind::Function, SymbolFlags::HasDefinition, 1, "/w/src/b.cpp");
+    corpus.add("helper_too", SymbolKind::Function);
+    corpus.snapshot.entries[1].local = true;
+    auto built = corpus.build();
+    std::vector<std::pair<std::string, std::string>> hits;
+    for(auto& hit: built.search(*SymbolQuery::parse("helper"), 10, {}).hits) {
+        hits.emplace_back(corpus.name_of(hit.hash), hit.file.str());
+    }
+    llvm::sort(hits);
+    ZEXPECT(hits == (std::vector<std::pair<std::string, std::string>>{
+                        {"helper",     ""            },
+                        {"helper",     "/w/src/b.cpp"},
+                        {"helper_too", ""            },
+    }));
+}
+
+ZEST_CASE(ExternalOnlyLeavesLocals) {
+    // A name of internal linkage ranking first takes no place in a search
+    // for external names, however few it asks for.
+    Corpus corpus;
+    corpus.add("helper", SymbolKind::Function, SymbolFlags::HasDefinition, 9, "/w/src/b.cpp");
+    corpus.add("helper_function", SymbolKind::Function);
+    corpus.snapshot.entries[0].local = true;
+    auto built = corpus.build();
+    auto query = *SymbolQuery::parse("helper");
+    query.external_only = true;
+    std::vector<std::string> names;
+    for(auto& hit: built.search(query, 1, {}).hits) {
+        names.push_back(corpus.name_of(hit.hash));
+    }
+    ZEXPECT(names == std::vector<std::string>{"helper_function"});
+}
+
 };  // ZEST_SUITE(SearchIndex)
 
 }  // namespace

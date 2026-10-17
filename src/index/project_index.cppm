@@ -232,6 +232,9 @@ struct ProjectIndex {
     /// with.
     SearchIndex search_index;
     llvm::DenseSet<SymbolHash> search_pending;
+    /// The files whose names of internal linkage, in no table, changed
+    /// since the build: a search reads them from the files' shards.
+    llvm::DenseSet<Fid> search_pending_files;
     std::uint64_t search_generation = 0;
 
     /// Adopt a persisted search blob when the bound global pins its
@@ -251,6 +254,7 @@ struct ProjectIndex {
     struct GlobalColumns {
         std::size_t names = 0;
         std::size_t args = 0;
+        std::size_t signatures = 0;
         std::size_t bitmaps = 0;
         /// Hash, parent, kind, flags and file per symbol.
         std::size_t fixed = 0;

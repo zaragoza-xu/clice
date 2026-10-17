@@ -284,6 +284,22 @@ export interface Span {
     end: number;
 }
 
+/// At most `limit` of the values, spread evenly over them.
+export function sample<T>(values: T[], limit: number): T[] {
+    if (values.length <= limit) {
+        return values;
+    }
+    const stride = values.length / limit;
+    const picked: T[] = [];
+    for (let i = 0; i < limit; i += 1) {
+        const value = values[Math.floor(i * stride)];
+        if (value !== undefined) {
+            picked.push(value);
+        }
+    }
+    return picked;
+}
+
 /// One line around a span, the span marked: `a ⟦b⟧ c`, a span over
 /// several lines shown from its first line to its last.
 export function snippet(lines: Lines, span: Span): string {
@@ -358,6 +374,16 @@ export interface ServerOptions {
     readonly?: boolean | undefined;
     /// More of clice's configuration, as initializationOptions.
     config?: Record<string, unknown> | undefined;
+    /// More of clice's `[project]` settings.
+    project?: Record<string, unknown> | undefined;
+    /// The directory holding the compile_commands.json, the workspace by
+    /// default.
+    cdb?: string | undefined;
+    /// The server indexes the workspace in the background: clice's
+    /// `enable_indexing`, clangd's `--background-index`.
+    indexing?: boolean | undefined;
+    /// More of clangd's command line.
+    args?: string[] | undefined;
 }
 
 /// A server on the workspace `workspace`, whose compile_commands.json both
@@ -369,11 +395,17 @@ export async function start(
     workspace: string,
     options: ServerOptions = {},
 ): Promise<Server> {
+    const cdb = options.cdb ?? workspace;
+    const indexing = options.indexing === true;
     const client = CliceClient.start(binary, {
         args:
             kind === "clice"
                 ? ["serve"]
-                : [`--compile-commands-dir=${workspace}`, "--background-index=false"],
+                : [
+                      `--compile-commands-dir=${cdb}`,
+                      `--background-index=${String(indexing)}`,
+                      ...(options.args ?? []),
+                  ],
         cwd: workspace,
     });
     await client.initialize(new Workspace(workspace), {
@@ -382,11 +414,12 @@ export async function start(
         initializationOptions:
             kind === "clice"
                 ? {
-                      rules: [{ compile_commands: [workspace] }],
+                      rules: [{ compile_commands: [cdb] }],
                       project: {
-                          enable_indexing: false,
+                          enable_indexing: indexing,
                           stateful_worker_count: 1,
                           readonly: options.readonly === true ? "on" : "off",
+                          ...options.project,
                       },
                       ...options.config,
                   }

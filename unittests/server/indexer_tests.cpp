@@ -603,6 +603,112 @@ ZEST_CASE(MidSaveMergeKept) {
     ZASSERT(it->second.content_hash() == llvm::xxh3_64bits("int second_value() { return 2; }\n"));
 }
 
+ZEST_CASE(RebuildKeepsPendingFindable) {
+    TempDir tmp;
+    tmp.touch("a.cpp", "int first_value() { return 1; }\n");
+    tmp.touch("b.cpp", "int second_value() { return 2; }\n");
+    open_store(tmp, project);
+    auto first = index_file(tmp, tmp.path("a.cpp"));
+    ZASSERT(!first.data.empty());
+    merge(first.data.data(), first.data.size());
+    fx.save(IndexStore::SearchRebuild::Idle);
+    ZASSERT(project.project_index.search_index.loaded());
+
+    auto second = index_file(tmp, tmp.path("b.cpp"));
+    ZASSERT(!second.data.empty());
+    merge(second.data.data(), second.data.size());
+    llvm::SmallVector<index::SymbolHash> merged(project.project_index.search_pending.begin(),
+                                                project.project_index.search_pending.end());
+    ZASSERT(!merged.empty());
+
+    // The probe runs while the save awaits the search build on the thread
+    // pool: what was merged since the last build is in neither index yet,
+    // so it must still be pending, where a search scans it.
+    auto save_body = [&]() -> kota::task<> {
+        co_await fx.async_save(IndexStore::SearchRebuild::Idle);
+    };
+    bool findable = true;
+    auto probe_body = [&]() -> kota::task<> {
+        auto& table = project.project_index;
+        for(auto hash: merged) {
+            findable &= table.search_index.contains(hash) || table.search_pending.contains(hash);
+        }
+        co_return;
+    };
+    auto save_task = save_body();
+    auto probe_task = probe_body();
+    loop.schedule(save_task);
+    loop.schedule(probe_task);
+    loop.run();
+
+    ZASSERT(findable);
+    for(auto hash: merged) {
+        ZASSERT(project.project_index.search_index.contains(hash));
+        ZASSERT(!project.project_index.search_pending.contains(hash));
+    }
+}
+
+ZEST_CASE(RebuildKeepsMidBuildChanges) {
+    TempDir tmp;
+    tmp.touch("a.cpp", "int first_value() { return 1; }\n");
+    tmp.touch("b.cpp", "int second_value() { return 2; }\n");
+    tmp.touch("c.cpp", "int second_value() { return 3; }\n");
+    open_store(tmp, project);
+    auto first = index_file(tmp, tmp.path("a.cpp"));
+    ZASSERT(!first.data.empty());
+    merge(first.data.data(), first.data.size());
+    fx.save(IndexStore::SearchRebuild::Idle);
+
+    auto second = index_file(tmp, tmp.path("b.cpp"));
+    ZASSERT(!second.data.empty());
+    merge(second.data.data(), second.data.size());
+    llvm::SmallVector<index::SymbolHash> merged(project.project_index.search_pending.begin(),
+                                                project.project_index.search_pending.end());
+    ZASSERT(!merged.empty());
+    auto moved = index_file(tmp, tmp.path("c.cpp"));
+    ZASSERT(!moved.data.empty());
+
+    // The definition moves to c.cpp while the build reads the table from
+    // before: the built entry describes the old file, so the symbol stays
+    // pending, where a search reads the table.
+    auto save_body = [&]() -> kota::task<> {
+        co_await fx.async_save(IndexStore::SearchRebuild::Idle);
+    };
+    auto merge_body = [&]() -> kota::task<> {
+        merge(moved.data.data(), moved.data.size());
+        co_return;
+    };
+    auto save_task = save_body();
+    auto merge_task = merge_body();
+    loop.schedule(save_task);
+    loop.schedule(merge_task);
+    loop.run();
+
+    for(auto hash: merged) {
+        ZASSERT(project.project_index.search_pending.contains(hash));
+    }
+}
+
+ZEST_CASE(DroppedUnitPendsItsNames) {
+    TempDir tmp;
+    tmp.touch("main.cpp",
+              "static int lonely_helper() { return 1; }\n"
+              "int main() { return lonely_helper(); }\n");
+    open_store(tmp, project);
+    auto indexed = index_file(tmp, tmp.path("main.cpp"));
+    ZASSERT(!indexed.data.empty());
+    merge(indexed.data.data(), indexed.data.size());
+    fx.save(IndexStore::SearchRebuild::Idle);
+    ZASSERT(project.project_index.search_index.loaded());
+    auto file = project.file_table.intern(Spelling::absolute(indexed.tu_path));
+    ZASSERT(!project.project_index.search_pending_files.contains(file));
+
+    // The built index still lists the static of the variant the drop
+    // retires: searches must read the shard instead.
+    drop_index(file);
+    ZEXPECT(project.project_index.search_pending_files.contains(file));
+}
+
 ZEST_CASE(MergeHitWritesNothing) {
     TempDir tmp;
     tmp.touch("main.cpp", "int steady() { return 1; }\n");

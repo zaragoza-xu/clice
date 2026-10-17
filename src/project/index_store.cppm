@@ -299,6 +299,23 @@ private:
     /// Merges committed since the search index was built.
     std::size_t merges_since_search_build = 0;
 
+    /// While a search index is built, the symbols and the files merges
+    /// change: they stay pending after the build, which read them before
+    /// the change.
+    struct SearchBuildChanges {
+        llvm::DenseSet<index::SymbolHash> symbols;
+        llvm::DenseSet<Fid> files;
+    };
+
+    std::optional<SearchBuildChanges> changed_during_search_build;
+
+    /// The file's internal names may have changed — its shard replaced, its
+    /// live variants changed: searches scan its shard until the next build.
+    void search_file_changed(Fid path_id);
+
+    /// Recompute a shard's live variants from the manifests.
+    void refresh_live(Fid path_id);
+
     /// A rebuilt search blob no batch has committed yet.
     std::string search_bytes;
 

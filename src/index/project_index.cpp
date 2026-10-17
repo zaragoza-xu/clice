@@ -52,6 +52,8 @@ struct GlobalBlob {
     std::vector<std::uint32_t> sym_name_ends;
     std::string sym_args;
     std::vector<std::uint32_t> sym_args_ends;
+    std::string sym_signatures;
+    std::vector<std::uint32_t> sym_signature_ends;
     std::vector<std::uint64_t> sym_parents;
     std::vector<std::uint8_t> sym_kinds;
     std::vector<std::uint16_t> sym_flags;
@@ -72,9 +74,11 @@ struct GlobalBlob {
     std::vector<std::uint64_t> manifest_gens;
 
     /// The generation of the search blob this table was saved with, and
-    /// the entries changed since that blob was built.
+    /// the entries and the files whose names of internal linkage (path
+    /// ids, ascending) changed since that blob was built.
     std::uint64_t search_generation = 0;
     std::vector<std::uint64_t> search_pending;
+    std::vector<std::uint32_t> search_pending_files;
 
     /// The reverse include graph, for readers holding no manifests: every
     /// file some TU contributed a variant to (path ids, ascending), and those
@@ -105,6 +109,8 @@ struct ProjectIndex::Base {
     llvm::ArrayRef<std::uint32_t> name_ends;
     llvm::StringRef args;
     llvm::ArrayRef<std::uint32_t> args_ends;
+    llvm::StringRef signatures;
+    llvm::ArrayRef<std::uint32_t> signature_ends;
     llvm::ArrayRef<std::uint64_t> parents;
     llvm::ArrayRef<std::uint8_t> kinds;
     llvm::ArrayRef<std::uint16_t> flags;
@@ -120,6 +126,7 @@ struct ProjectIndex::Base {
 
     std::uint64_t search_generation = 0;
     llvm::ArrayRef<std::uint64_t> search_pending;
+    llvm::ArrayRef<std::uint32_t> search_pending_files;
 
     llvm::ArrayRef<std::uint32_t> contributed_files;
     llvm::ArrayRef<std::uint32_t> contributor_ends;
@@ -149,6 +156,10 @@ struct ProjectIndex::Base {
 
     llvm::StringRef arguments(std::uint32_t doc) const {
         return back_to_back(args, args_ends, doc);
+    }
+
+    llvm::StringRef signature(std::uint32_t doc) const {
+        return back_to_back(signatures, signature_ends, doc);
     }
 
     llvm::ArrayRef<std::uint8_t> image(std::uint32_t doc) const {
@@ -190,6 +201,7 @@ struct ProjectIndex::Base {
         return {
             .name = name(doc),
             .args = arguments(doc),
+            .signature = signature(doc),
             .parent = parents[doc],
             .kind = SymbolKind(kinds[doc]),
             .scope = SymbolScope::External,
@@ -219,6 +231,8 @@ std::expected<void, llvm::StringRef> ProjectIndex::Base::bind(BlobView root) {
     name_ends = to_array_ref(root[&GlobalBlob::sym_name_ends]);
     args = to_ref(root[&GlobalBlob::sym_args]);
     args_ends = to_array_ref(root[&GlobalBlob::sym_args_ends]);
+    signatures = to_ref(root[&GlobalBlob::sym_signatures]);
+    signature_ends = to_array_ref(root[&GlobalBlob::sym_signature_ends]);
     parents = to_array_ref(root[&GlobalBlob::sym_parents]);
     kinds = to_array_ref(root[&GlobalBlob::sym_kinds]);
     flags = to_array_ref(root[&GlobalBlob::sym_flags]);
@@ -232,6 +246,7 @@ std::expected<void, llvm::StringRef> ProjectIndex::Base::bind(BlobView root) {
     manifest_gens = to_array_ref(root[&GlobalBlob::manifest_gens]);
     search_generation = root[&GlobalBlob::search_generation];
     search_pending = to_array_ref(root[&GlobalBlob::search_pending]);
+    search_pending_files = to_array_ref(root[&GlobalBlob::search_pending_files]);
     contributed_files = to_array_ref(root[&GlobalBlob::contributed_files]);
     contributor_ends = to_array_ref(root[&GlobalBlob::contributor_ends]);
     contributors = to_array_ref(root[&GlobalBlob::contributors]);
@@ -257,9 +272,9 @@ std::expected<void, llvm::StringRef> ProjectIndex::Base::bind(BlobView root) {
         return std::unexpected("manifest pin columns do not line up");
     }
     auto count = hashes.size();
-    if(name_ends.size() != count || args_ends.size() != count || parents.size() != count ||
-       kinds.size() != count || flags.size() != count || token_kinds.size() != count ||
-       token_modifiers.size() != count || files.size() != count ||
+    if(name_ends.size() != count || args_ends.size() != count || signature_ends.size() != count ||
+       parents.size() != count || kinds.size() != count || flags.size() != count ||
+       token_kinds.size() != count || token_modifiers.size() != count || files.size() != count ||
        reference_counts.size() != count || bitmap_ends.size() != count) {
         return std::unexpected("symbol columns do not line up");
     }
@@ -267,6 +282,7 @@ std::expected<void, llvm::StringRef> ProjectIndex::Base::bind(BlobView root) {
         return std::unexpected("a symbol's token kind is out of range");
     }
     if(!monotone_ends(name_ends, names.size()) || !monotone_ends(args_ends, args.size()) ||
+       !monotone_ends(signature_ends, signatures.size()) ||
        !monotone_ends(bitmap_ends, bitmaps.size())) {
         return std::unexpected("symbol arenas do not line up");
     }
@@ -287,6 +303,11 @@ std::expected<void, llvm::StringRef> ProjectIndex::Base::bind(BlobView root) {
     for(auto hash: search_pending) {
         if(reserved_key(hash)) {
             return std::unexpected("reserved pending search row");
+        }
+    }
+    for(auto file: search_pending_files) {
+        if(file >= paths.size()) {
+            return std::unexpected("pending search file outside the path table");
         }
     }
     // The writer only emits interned paths, which are never empty; an
@@ -450,6 +471,10 @@ std::expected<void, llvm::StringRef>
     search_generation = base->search_generation;
     search_pending.clear();
     search_pending.insert(base->search_pending.begin(), base->search_pending.end());
+    search_pending_files.clear();
+    for(auto file: base->search_pending_files) {
+        search_pending_files.insert(base->remap[file]);
+    }
     return {};
 }
 
@@ -585,6 +610,7 @@ Symbol& ProjectIndex::touch(SymbolHash hash) {
     auto identity = base->identity(*doc);
     symbol.name = identity.name.str();
     symbol.args = identity.args.str();
+    symbol.signature = identity.signature.str();
     symbol.parent = identity.parent;
     symbol.kind = identity.kind;
     symbol.flags = identity.flags;
@@ -648,6 +674,14 @@ void ProjectIndex::merge(const TUIndex& index,
         }
         symbol_changed = prefer(target.name, identity.name) || symbol_changed;
         symbol_changed = prefer(target.args, identity.args) || symbol_changed;
+        // An edit to a function, a parameter renamed, keeps its hash: the
+        // unit merging last describes it — a unit defining it, when one
+        // does, which sees the names of every declaration.
+        if(!identity.signature.empty() && target.signature != identity.signature &&
+           (defines || !has_flag(target.flags, SymbolFlags::HasDefinition))) {
+            target.signature = identity.signature.str();
+            symbol_changed = true;
+        }
         // A unit that defines the symbol always places it: the table never
         // retracts a unit's earlier report, so an old definition bit must
         // not pin the file after the definition moved. Declarations only
@@ -747,6 +781,7 @@ void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& file
     blob.sym_hashes.reserve(count);
     blob.sym_name_ends.reserve(count);
     blob.sym_args_ends.reserve(count);
+    blob.sym_signature_ends.reserve(count);
     blob.sym_parents.reserve(count);
     blob.sym_kinds.reserve(count);
     blob.sym_flags.reserve(count);
@@ -759,6 +794,8 @@ void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& file
         blob.sym_name_ends.push_back(static_cast<std::uint32_t>(blob.sym_names.size()));
         blob.sym_args += base->arguments(doc);
         blob.sym_args_ends.push_back(static_cast<std::uint32_t>(blob.sym_args.size()));
+        blob.sym_signatures += base->signature(doc);
+        blob.sym_signature_ends.push_back(static_cast<std::uint32_t>(blob.sym_signatures.size()));
         blob.sym_parents.push_back(base->parents[doc]);
         blob.sym_kinds.push_back(base->kinds[doc]);
         blob.sym_flags.push_back(base->flags[doc]);
@@ -776,6 +813,8 @@ void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& file
         blob.sym_name_ends.push_back(static_cast<std::uint32_t>(blob.sym_names.size()));
         blob.sym_args += symbol.args;
         blob.sym_args_ends.push_back(static_cast<std::uint32_t>(blob.sym_args.size()));
+        blob.sym_signatures += symbol.signature;
+        blob.sym_signature_ends.push_back(static_cast<std::uint32_t>(blob.sym_signatures.size()));
         blob.sym_parents.push_back(symbol.parent);
         blob.sym_kinds.push_back(symbol.kind.value());
         blob.sym_flags.push_back(static_cast<std::uint16_t>(symbol.flags));
@@ -837,6 +876,10 @@ void ProjectIndex::serialize_global(llvm::raw_ostream& os, const FileTable& file
     blob.search_generation = search_generation;
     blob.search_pending.assign(search_pending.begin(), search_pending.end());
     llvm::sort(blob.search_pending);
+    for(auto file: search_pending_files) {
+        blob.search_pending_files.push_back(path_id(file));
+    }
+    llvm::sort(blob.search_pending_files);
 
     serialize_blob(blob, os);
 }
@@ -1131,6 +1174,10 @@ bool ProjectIndex::open(BlobDatabase& db, FileTable& files) {
     search_generation = base->search_generation;
     search_pending.clear();
     search_pending.insert(base->search_pending.begin(), base->search_pending.end());
+    search_pending_files.clear();
+    for(auto file: base->search_pending_files) {
+        search_pending_files.insert(base->remap[file]);
+    }
     if(auto search = db.read(IndexBlobKind::Search, "search")) {
         bind_search(std::move(search.buffer));
     }
@@ -1146,6 +1193,7 @@ ProjectIndex::GlobalColumns ProjectIndex::global_columns() const {
     return {
         .names = base->names.size(),
         .args = base->args.size(),
+        .signatures = base->signatures.size(),
         .bitmaps = base->bitmaps.size(),
         .fixed = base->count() * (8 + 8 + 1 + 2 + 4 + 4),
         .contributors = base->contributors.size() + base->contributed_files.size() * (4 + 4),

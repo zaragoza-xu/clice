@@ -8,6 +8,7 @@ module clice;
 
 import :index.database;
 import :index.manifest;
+import :index.query;
 import :index.serialization;
 import :index.shard;
 import :index.tu_index;
@@ -527,6 +528,9 @@ std::expected<IndexStore::Report, IndexStore::MergeError>
     llvm::SmallVector<index::SymbolHash> added;
     project_index.merge(view, file_ids_map, &added);
     project.project_index.search_pending.insert(added.begin(), added.end());
+    if(changed_during_search_build) {
+        changed_during_search_build->symbols.insert(added.begin(), added.end());
+    }
     merges_since_search_build += 1;
 
     // Intern a FileVersion per file of the parse: the consumed-content hash
@@ -608,6 +612,7 @@ std::expected<IndexStore::Report, IndexStore::MergeError>
         project.project_index.shards[global_id] = std::move(replacement);
         dirty_shards.insert(global_id);
         report.add_index_changed(global_id);
+        search_file_changed(global_id);
     }
 
     // Replace this TU's manifest wholesale: files it no longer touches lose
@@ -617,11 +622,7 @@ std::expected<IndexStore::Report, IndexStore::MergeError>
         project_index.apply_manifest(project.file_table, tu_path_id, std::move(manifest));
     for(auto path_id: affected) {
         report.add_index_changed(path_id);
-        auto it = project.project_index.shards.find(path_id);
-        if(it == project.project_index.shards.end()) {
-            continue;
-        }
-        it->second.set_live(project_index.live_variants(path_id));
+        refresh_live(path_id);
     }
 
     // A rebuild started its file's blob over, discarding the variants other
@@ -680,6 +681,22 @@ IndexStore::Report IndexStore::drop_index(Fid tu_path_id) {
     return report;
 }
 
+void IndexStore::search_file_changed(Fid path_id) {
+    project.project_index.search_pending_files.insert(path_id);
+    if(changed_during_search_build) {
+        changed_during_search_build->files.insert(path_id);
+    }
+}
+
+void IndexStore::refresh_live(Fid path_id) {
+    auto it = project.project_index.shards.find(path_id);
+    if(it == project.project_index.shards.end()) {
+        return;
+    }
+    it->second.set_live(project.project_index.live_variants(path_id));
+    search_file_changed(path_id);
+}
+
 void IndexStore::drop_index_into(Fid tu_path_id, Report& report) {
     auto& project_index = project.project_index;
     if(!project_index.manifests.contains(tu_path_id)) {
@@ -689,10 +706,7 @@ void IndexStore::drop_index_into(Fid tu_path_id, Report& report) {
     // entries do; without the refresh the client keeps them forever, since no
     // later merge or compile is owed.
     for(auto path_id: project_index.remove_manifest(project.file_table, tu_path_id)) {
-        auto it = project.project_index.shards.find(path_id);
-        if(it != project.project_index.shards.end()) {
-            it->second.set_live(project_index.live_variants(path_id));
-        }
+        refresh_live(path_id);
         report.add_index_changed(path_id);
     }
     dirty_manifests.insert(tu_path_id);
@@ -1099,17 +1113,46 @@ kota::task<> IndexStore::rebuild_search_index() {
             });
             return true;
         });
+    // The symbols of internal linkage are in no table but the shards of
+    // the files declaring them.
+    for(auto& [file, shard]: project_index.shards) {
+        if(!shard.loaded()) {
+            continue;
+        }
+        shard.for_each_local_symbol([&](index::SymbolHash hash,
+                                        const index::SymbolIdentity& symbol) {
+            if(symbol.scope != index::SymbolScope::TULocal ||
+               !index::is_searchable_kind(symbol.kind) || symbol.name.empty() ||
+               !index::declares(shard, hash)) {
+                return true;
+            }
+            auto [path, inserted] =
+                path_index.try_emplace(file.raw, static_cast<std::uint32_t>(snapshot.paths.size()));
+            if(inserted) {
+                snapshot.paths.push_back(project_index.portable(project.file_table.resolve(file)));
+            }
+            snapshot.entries.push_back({
+                .hash = hash,
+                .name = symbol.name.str(),
+                .args = symbol.args.str(),
+                .parent = symbol.parent,
+                .kind = symbol.kind,
+                .flags = symbol.flags,
+                .file = path->second,
+                .local = true,
+            });
+            return true;
+        });
+    }
     auto merges_in_snapshot = merges_since_search_build;
-    // Entries that change across the build stay pending: only the ones the
-    // snapshot saw are cleared by the index built from it.
-    auto pending_in_snapshot = std::move(project.project_index.search_pending);
-    project.project_index.search_pending.clear();
-    // Until the rebuilt index is adopted the old one still needs them:
-    // a cancelled or failed build gives them back.
-    auto restore = llvm::make_scope_exit([&] {
-        project.project_index.search_pending.insert(pending_in_snapshot.begin(),
-                                                    pending_in_snapshot.end());
-    });
+    // The entries pending now are in the snapshot; the ones a merge changes
+    // during the build stay pending once it is adopted.
+    llvm::SmallVector<index::SymbolHash> pending_in_snapshot(project_index.search_pending.begin(),
+                                                             project_index.search_pending.end());
+    llvm::SmallVector<Fid> pending_files_in_snapshot(project_index.search_pending_files.begin(),
+                                                     project_index.search_pending_files.end());
+    changed_during_search_build.emplace();
+    auto finished = llvm::make_scope_exit([&] { changed_during_search_build.reset(); });
 
     std::string bytes;
     co_await kota::queue([&] { bytes = index::build_search_blob(snapshot); });
@@ -1123,11 +1166,16 @@ kota::task<> IndexStore::rebuild_search_index() {
     // persisted search index only under this generation.
     project.project_index.search_generation = snapshot.generation;
     global_dirty = true;
-    restore.release();
     merges_since_search_build -= merges_in_snapshot;
     for(auto hash: pending_in_snapshot) {
-        if(!project.project_index.search_index.contains(hash)) {
-            project.project_index.search_pending.insert(hash);
+        if(project_index.search_index.contains(hash) &&
+           !changed_during_search_build->symbols.contains(hash)) {
+            project_index.search_pending.erase(hash);
+        }
+    }
+    for(auto file: pending_files_in_snapshot) {
+        if(!changed_during_search_build->files.contains(file)) {
+            project_index.search_pending_files.erase(file);
         }
     }
     search_bytes = std::move(bytes);
@@ -1536,10 +1584,7 @@ IndexStore::LoadResult IndexStore::load(IndexLoadOptions options) {
         }
     }
     for(auto path_id: mask_refresh) {
-        auto it = project.project_index.shards.find(path_id);
-        if(it != project.project_index.shards.end()) {
-            it->second.set_live(project_index.live_variants(path_id));
-        }
+        refresh_live(path_id);
     }
 
     // Remove shard blobs nothing references any more.

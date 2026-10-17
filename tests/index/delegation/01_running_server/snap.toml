@@ -17,6 +17,7 @@ stdout = '''
     "symbols": [
       {
         "name": "extra",
+        "signature": "()",
         "kind": "Function",
         "file": "${WS}/main.cpp",
         "line": 5,
@@ -37,6 +38,7 @@ stdout = '''
     "symbols": [
       {
         "name": "extra",
+        "signature": "()",
         "kind": "Function",
         "file": "${WS}/main.cpp",
         "line": 5,
@@ -70,6 +72,7 @@ stdout = '''
     "symbols": [
       {
         "name": "compute",
+        "signature": "()",
         "kind": "Function",
         "file": "${WS}/main.cpp",
         "line": 4,

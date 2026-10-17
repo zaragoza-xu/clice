@@ -19,12 +19,6 @@ namespace clice::feature {
 
 namespace {
 
-/// Bytes of multi-byte UTF-8 sequences count too: clang accepts extended
-/// characters in identifiers.
-bool is_identifier_char(char c) {
-    return clang::isAsciiIdentifierContinue(c) || static_cast<unsigned char>(c) >= 0x80;
-}
-
 /// The identifier the completion point sits in.
 struct CompletionPrefix {
     /// From its start to the cursor: what candidates are matched against.
@@ -369,7 +363,7 @@ bool unqualified_name(clang::CodeCompletionContext& context) {
 bool in_global_fragment(llvm::StringRef content,
                         std::uint32_t offset,
                         const clang::LangOptions& options) {
-    Lexer lexer(content, {.lang_opts = &options});
+    Lexer lexer(content, options);
     bool fragment = false;
     for(auto token = lexer.advance(); !token.is_eof() && token.range.end <= offset;
         token = lexer.advance()) {
@@ -1487,7 +1481,8 @@ public:
                 field_order = designator_order(record);
             }
             std::uint32_t passed = 0;
-            for(auto designator: written_designators(content, prefix.typed.begin)) {
+            for(auto designator:
+                written_designators(content, prefix.typed.begin, sema.getLangOpts())) {
                 if(designator.whole) {
                     designated.insert(designator.field);
                 }

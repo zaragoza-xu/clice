@@ -305,6 +305,8 @@ struct GlobalBlobMirror {
     std::vector<std::uint64_t> sym_parents;
     std::vector<std::uint8_t> sym_kinds;
     std::vector<std::uint16_t> sym_flags;
+    std::vector<std::uint8_t> sym_token_kinds;
+    std::vector<std::uint32_t> sym_token_modifiers;
     std::vector<std::uint32_t> sym_files;
     std::vector<std::uint32_t> sym_reference_counts;
     std::vector<std::uint32_t> sym_bitmap_ends;
@@ -327,6 +329,8 @@ struct GlobalBlobMirror {
         sym_parents.push_back(parent);
         sym_kinds.push_back(0);
         sym_flags.push_back(0);
+        sym_token_kinds.push_back(0);
+        sym_token_modifiers.push_back(0);
         sym_files.push_back(file);
         sym_reference_counts.push_back(0);
         for(auto byte: image) {
@@ -574,6 +578,27 @@ ZEST_CASE(GlobalDuplicateSymbolRejected) {
     auto descending = encode(mirror);
     ZASSERT(descending);
     ZASSERT(!loaded.load_global(bytes_of(*descending), pool, pins).has_value());
+}
+
+ZEST_CASE(GlobalTokenKindRejected) {
+    // A symbol's token kind indexes the legend's tables: one past the enum
+    // marks a corrupt blob.
+    GlobalBlobMirror mirror;
+    mirror.paths = four_paths();
+    mirror.add_symbol(42, "sym", index::write_bitmap(clice::Bitmap{}));
+    mirror.sym_token_kinds = {200};
+
+    clice::FileTable pool;
+    llvm::DenseMap<VersionID, std::uint64_t> pins;
+    auto corrupt = encode(mirror);
+    ZASSERT(corrupt);
+    index::ProjectIndex loaded;
+    ZASSERT(!loaded.load_global(bytes_of(*corrupt), pool, pins).has_value());
+
+    mirror.sym_token_kinds = {0};
+    auto valid = encode(mirror);
+    ZASSERT(valid);
+    ZASSERT(loaded.load_global(bytes_of(*valid), pool, pins));
 }
 
 ZEST_CASE(GlobalReservedKeysRejected) {

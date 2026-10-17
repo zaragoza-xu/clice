@@ -1,14 +1,29 @@
 [answers.by_reference.semantic_token]
 text = "value"
 type = "variable"
-modifiers = ["usedAsMutableReference", "functionScope"]
+modifiers = ["modification", "local"]
 
 [answers.by_pointer.semantic_token]
 text = "value"
 type = "variable"
-modifiers = ["usedAsMutablePointer", "functionScope"]
+modifiers = ["modification", "local"]
 
 [answers.by_const_reference.semantic_token]
 text = "value"
 type = "variable"
-modifiers = ["functionScope"]
+modifiers = ["local"]
+
+[answers.by_pointer_to_const.semantic_token]
+text = "value"
+type = "variable"
+modifiers = ["local"]
+
+[answers.by_array_decay.semantic_token]
+text = "values"
+type = "variable"
+modifiers = ["modification", "local"]
+
+[answers.by_array_decay_to_const.semantic_token]
+text = "values"
+type = "variable"
+modifiers = ["local"]

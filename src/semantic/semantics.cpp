@@ -1787,25 +1787,46 @@ bool is_written(const Semantics& semantics, std::uint32_t index) {
         return false;
     }
 
-    const clang::Stmt* parent = nullptr;
-    for(auto i = entry.parent; i != Semantics::invalid; i = semantics.node(i).parent) {
-        parent = semantics.node(i).node.get<clang::Stmt>();
-        if(!llvm::isa_and_present<clang::ParenExpr, clang::ImplicitCastExpr>(parent)) {
-            break;
+    // The statement enclosing node `at` past parentheses and implicit casts.
+    auto enclosing = [&](std::uint32_t at) -> std::pair<const clang::Stmt*, std::uint32_t> {
+        for(auto i = semantics.node(at).parent; i != Semantics::invalid;
+            i = semantics.node(i).parent) {
+            const auto* stmt = semantics.node(i).node.get<clang::Stmt>();
+            if(!llvm::isa_and_present<clang::ParenExpr, clang::ImplicitCastExpr>(stmt)) {
+                return {stmt, i};
+            }
         }
-    }
+        return {nullptr, Semantics::invalid};
+    };
+    auto [parent, parent_index] = enclosing(index);
     if(!parent) {
         return false;
     }
     auto is_expr = [&](const clang::Expr* operand) {
         return operand->IgnoreParenImpCasts() == expr;
     };
+    // A template parameter may turn const in an instantiation, and a
+    // function is no object a callee could modify.
+    auto is_mutable = [](clang::QualType type) {
+        return !type.isConstQualified() && !type->isDependentType() && !type->isFunctionType();
+    };
+    auto to_mutable = [&](clang::QualType type) {
+        return type->isPointerType() && is_mutable(type->getPointeeType());
+    };
 
     if(auto* op = llvm::dyn_cast<clang::BinaryOperator>(parent)) {
         return op->isAssignmentOp() && is_expr(op->getLHS());
     }
     if(auto* op = llvm::dyn_cast<clang::UnaryOperator>(parent)) {
-        return op->isIncrementDecrementOp();
+        if(op->getOpcode() != clang::UO_AddrOf) {
+            return op->isIncrementDecrementOp();
+        }
+        const auto* call = enclosing(parent_index).first;
+        return call && llvm::any_of(decls::parameter_bindings(call),
+                                    [&](const decls::ParameterBinding& binding) {
+                                        return binding.argument->IgnoreParenImpCasts() == op &&
+                                               to_mutable(binding.forwarded->getType());
+                                    });
     }
 
     if(auto* call = llvm::dyn_cast<clang::CXXOperatorCallExpr>(parent);
@@ -1813,10 +1834,14 @@ bool is_written(const Semantics& semantics, std::uint32_t index) {
         auto op = call->getOperator();
         return call->isAssignmentOp() || op == clang::OO_PlusPlus || op == clang::OO_MinusMinus;
     }
-    return llvm::any_of(decls::parameter_bindings(parent),
-                        [&](const decls::ParameterBinding& binding) {
-                            return is_expr(binding.argument) && binding.mutable_reference();
-                        });
+    return llvm::any_of(
+        decls::parameter_bindings(parent),
+        [&](const decls::ParameterBinding& binding) {
+            auto type = binding.forwarded->getType();
+            return is_expr(binding.argument) &&
+                   ((binding.mutable_reference() && is_mutable(type.getNonReferenceType())) ||
+                    (expr->getType()->isArrayType() && to_mutable(type)));
+        });
 }
 
 bool NameOccurrence::owns_whole_name() const {

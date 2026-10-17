@@ -10,8 +10,9 @@ namespace clice {
 
 /// The options a raw lex of `language` under `standard` runs with: the
 /// language defaults plus what the driver turns on by default and they
-/// leave off — `char8_t` and modules from C++20, the GNU keywords
-/// (`typeof`) in GNU modes — and line comments in every dialect.
+/// leave off — the alternative operator names (`and`) in C++, `char8_t`
+/// and modules from C++20, the GNU keywords (`typeof`) in GNU modes — and
+/// line comments in every dialect.
 clang::LangOptions raw_dialect(clang::Language language, clang::LangStandard::Kind standard);
 
 struct LexerOptions {
@@ -69,6 +70,8 @@ public:
 private:
     Lexer(llvm::StringRef content, std::uint32_t start_offset, Options options);
 
+    /// Where the last token other than eod ended.
+    std::uint32_t lexed_end = 0;
     bool parse_pp_keyword = false;
     bool parse_header_name = false;
     bool after_has_include = false;

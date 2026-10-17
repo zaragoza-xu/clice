@@ -482,10 +482,11 @@ ZEST_CASE(LocalSymbolNames) {
 
 ZEST_CASE(MergedLocalFlagsUnion) {
     // Variants of one file can see different facts of a local symbol (a
-    // definition behind `#ifdef`); the merged table keeps their union in
+    // definition behind `#ifdef`, `struct` declaring what `class` defines);
+    // the merged table keeps their union and the definition's token kind in
     // either merge order.
     llvm::StringRef content = "static int helper();\n";
-    auto variant = [&](index::SymbolFlags flags) {
+    auto variant = [&](index::SymbolFlags flags, SemanticTokenKind token_kind) {
         auto file_index = simple_index({
             {{11, 17}, 7}
         });
@@ -497,14 +498,15 @@ ZEST_CASE(MergedLocalFlagsUnion) {
                 return index::SymbolIdentity{.name = "helper",
                                              .kind = SymbolKind::Function,
                                              .scope = index::SymbolScope::TULocal,
-                                             .flags = flags};
+                                             .flags = flags,
+                                             .token_class = {.kind = token_kind}};
             },
             content,
             os);
         return make_shard(bytes);
     };
-    auto defining = variant(index::SymbolFlags::HasDefinition);
-    auto declaring = variant(index::SymbolFlags::None);
+    auto defining = variant(index::SymbolFlags::HasDefinition, SemanticTokenKind::Class);
+    auto declaring = variant(index::SymbolFlags::None, SemanticTokenKind::Struct);
 
     for(auto [first, second]: {
             std::pair{&defining,  &declaring},
@@ -516,6 +518,7 @@ ZEST_CASE(MergedLocalFlagsUnion) {
         auto identity = merged.find_symbol(7);
         ZASSERT(identity);
         ZASSERT(index::has_flag(identity->flags, index::SymbolFlags::HasDefinition));
+        ZASSERT(identity->token_class.kind == SemanticTokenKind::Class);
     }
 }
 
@@ -633,6 +636,8 @@ ZEST_CASE(ReservedLocalParentRejected) {
     blob.local_args = {""};
     blob.local_parents = {0};
     blob.local_flags = {0};
+    blob.local_token_kinds = {0};
+    blob.local_token_modifiers = {0};
 
     auto bytes_of = [&] {
         std::string bytes;
@@ -643,6 +648,11 @@ ZEST_CASE(ReservedLocalParentRejected) {
     ZASSERT(make_shard(bytes_of()).loaded());
 
     blob.local_parents = {~std::uint64_t(0)};
+    ZASSERT(!make_shard(bytes_of()).loaded());
+
+    // So does a token kind past the enum: it indexes the legend's tables.
+    blob.local_parents = {0};
+    blob.local_token_kinds = {200};
     ZASSERT(!make_shard(bytes_of()).loaded());
 }
 

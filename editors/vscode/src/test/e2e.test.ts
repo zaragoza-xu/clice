@@ -15,7 +15,7 @@ import type {
     "resolution-mode": "import",
 };
 
-import { inactiveRuns } from "../feature/inactive";
+import { inactiveSpans } from "../feature/inactive";
 import { exited, retire } from "../process";
 import { resolveExecutable } from "../setting";
 
@@ -89,33 +89,49 @@ function until<T>(
     });
 }
 
-// Pure decoding of the inactive-modifier line runs; no server involved.
+// Pure decoding of the inactive-modifier spans; no server involved.
 // Entries are (deltaLine, deltaStart, length, type, modifiers) tuples.
-suite("inactive run decoding", function () {
+suite("inactive span decoding", function () {
     const MASK = 1 << 3;
 
-    test("merges runs and bridges token-free gaps", function () {
+    test("merges consecutive lines into runs", function () {
         const data = [
             ...[1, 0, 3, 0, MASK], // line 1, inactive
-            ...[2, 0, 3, 0, MASK], // line 3: the blank line between bridges
-            ...[1, 0, 3, 0, 0], // line 4, active — ends the run
-            ...[2, 0, 3, 0, MASK], // line 6, a separate region
+            ...[1, 0, 3, 0, MASK], // line 2, inactive
+            ...[2, 0, 3, 0, MASK], // line 4: line 3 sent no token, maybe active code
+            ...[1, 0, 3, 0, 0], // line 5, active
+            ...[1, 0, 3, 0, MASK], // line 6, a separate region
         ];
-        assert.deepStrictEqual(inactiveRuns(data, MASK), [
-            [1, 3],
-            [6, 6],
-        ]);
+        assert.deepStrictEqual(inactiveSpans(data, MASK), {
+            lines: [
+                [1, 2],
+                [4, 4],
+                [6, 6],
+            ],
+            tokens: [],
+        });
     });
 
     test("several tokens on one line", function () {
         const data = [...[0, 0, 2, 0, MASK], ...[0, 3, 2, 0, MASK]];
-        assert.deepStrictEqual(inactiveRuns(data, MASK), [[0, 0]]);
+        assert.deepStrictEqual(inactiveSpans(data, MASK), { lines: [[0, 0]], tokens: [] });
+    });
+
+    test("arguments dropped on a line that runs code", function () {
+        const data = [
+            ...[1, 4, 6, 0, 0], // line 1: `return FIRST(left(), right());`
+            ...[0, 7, 5, 0, 0],
+            ...[0, 6, 4, 0, 0],
+            ...[0, 8, 7, 0, MASK], // `right()`, dropped
+        ];
+        assert.deepStrictEqual(inactiveSpans(data, MASK), { lines: [], tokens: [[1, 25, 7]] });
     });
 
     test("empty without the modifier", function () {
-        assert.deepStrictEqual(inactiveRuns([1, 0, 3, 0, 0], MASK), []);
-        assert.deepStrictEqual(inactiveRuns([], MASK), []);
-        assert.deepStrictEqual(inactiveRuns([1, 0, 3, 0, MASK], 0), []);
+        const none = { lines: [], tokens: [] };
+        assert.deepStrictEqual(inactiveSpans([1, 0, 3, 0, 0], MASK), none);
+        assert.deepStrictEqual(inactiveSpans([], MASK), none);
+        assert.deepStrictEqual(inactiveSpans([1, 0, 3, 0, MASK], 0), none);
     });
 });
 

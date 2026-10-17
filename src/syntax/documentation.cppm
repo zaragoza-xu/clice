@@ -75,6 +75,29 @@ using CopiedDocLookup = llvm::function_ref<std::optional<Documentation>(llvm::St
 /// file, a page or a group documents no declaration: empty.
 Documentation parse_documentation(llvm::StringRef text, CopiedDocLookup lookup);
 
+/// Whether `name`, written after `@` or `\` in a documentation comment, is a
+/// command parse_documentation reads.
+bool is_doc_command(llvm::StringRef name);
+
+/// The name of a documentation command whose marker is right before
+/// `text`: a word, or one of the formula delimiters and the group braces.
+llvm::StringRef doc_command_name(llvm::StringRef text);
+
+/// Whether a documentation command may start at `index`: Doxygen reads `@`
+/// and `\` as one only at the start of a word, as `user@example.com` and
+/// `C:\path` show.
+bool at_doc_word_start(llvm::StringRef line, std::size_t index);
+
+/// The command closing the raw text a documentation command opens — a
+/// block's code (`@code` … `@endcode`), hidden text, an inline formula —
+/// in which no command is read; empty for any other command.
+llvm::StringRef doc_raw_end(llvm::StringRef name);
+
+/// Where `closer`, the command ending a raw block, is written in `text`
+/// with either marker (`@endcode`, `\endcode`) and no longer name; npos if
+/// nowhere.
+std::size_t find_doc_closer(llvm::StringRef text, llvm::StringRef closer);
+
 /// A name as `@copydoc` writes it: `name`, `Class::member`,
 /// `Class#member`, `::name`, and for one overload of a function its
 /// parameter types, `f(int, const char*)`.

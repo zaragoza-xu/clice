@@ -247,29 +247,6 @@ bool identifier_char(char c) {
     return llvm::isAlnum(c) || c == '_';
 }
 
-/// The name of a command whose marker is right before `text`: a word, or
-/// one of the formula delimiters and the group braces.
-llvm::StringRef command_name(llvm::StringRef text) {
-    if(text.size() >= 2 && text[0] == 'f' && llvm::StringRef("$[]{}()").contains(text[1])) {
-        return text.take_front(2);
-    }
-    if(text.starts_with("{") || text.starts_with("}")) {
-        return text.take_front(1);
-    }
-    if(text.empty() || !llvm::isAlpha(text[0])) {
-        return {};
-    }
-    return text.take_while(identifier_char);
-}
-
-/// Whether a command may start at `index`: Doxygen reads `@` and `\` as
-/// one only at the start of a word, as `user@example.com` and
-/// `C:\path` show.
-bool at_word_start(llvm::StringRef line, std::size_t index) {
-    return index == 0 || llvm::isSpace(line[index - 1]) ||
-           llvm::StringRef("([{\"'*_").contains(line[index - 1]);
-}
-
 /// The word an inline command takes from `text`: up to the next blank,
 /// without the punctuation that closes a sentence or a parenthesis it did
 /// not open.
@@ -656,17 +633,7 @@ private:
     /// One line of a block a command opened: code up to the closing
     /// command, and what follows that command on the line.
     llvm::StringRef block_line(llvm::StringRef line) {
-        auto end = llvm::StringRef::npos;
-        for(llvm::StringRef marker: {"\\", "@"}) {
-            auto at = line.find((marker + block_end).str());
-            if(at == llvm::StringRef::npos) {
-                continue;
-            }
-            auto after = line.substr(at + 1 + block_end.size());
-            if(after.empty() || !identifier_char(after.front())) {
-                end = std::min(end, at);
-            }
-        }
+        auto end = find_doc_closer(line, block_end);
         auto code = line.substr(0, end);
         if(!hidden && !(end != llvm::StringRef::npos && code.trim().empty())) {
             push_raw(code.rtrim().str());
@@ -713,8 +680,8 @@ private:
                 }
             }
 
-            if((c == '\\' || c == '@') && at_word_start(line, index)) {
-                auto name = command_name(line.substr(index + 1));
+            if((c == '\\' || c == '@') && at_doc_word_start(line, index)) {
+                auto name = doc_command_name(line.substr(index + 1));
                 auto found = commands().find(name);
                 if(!name.empty() && found != commands().end() && (!gtk || c == '\\')) {
                     auto rest = line.substr(index + 1 + name.size());
@@ -732,7 +699,7 @@ private:
                 }
             }
 
-            if(gtk && (c == '#' || c == '%' || c == '@') && at_word_start(line, index) &&
+            if(gtk && (c == '#' || c == '%' || c == '@') && at_doc_word_start(line, index) &&
                index + 1 < line.size() &&
                (llvm::isAlpha(line[index + 1]) || line[index + 1] == '_')) {
                 auto word = line.substr(index + 1).take_while(
@@ -745,7 +712,7 @@ private:
 
             // Doxygen's `%` keeps a word from becoming a link and is not
             // shown; short lowercase words after one are printf formats.
-            if(c == '%' && at_word_start(line, index)) {
+            if(c == '%' && at_doc_word_start(line, index)) {
                 auto word = line.substr(index + 1).take_while(identifier_char);
                 if(word.size() >= 4 ||
                    llvm::any_of(word, [](char c) { return llvm::isUpper(c) || c == '_'; })) {
@@ -1154,6 +1121,53 @@ private:
 };
 
 }  // namespace
+
+llvm::StringRef doc_command_name(llvm::StringRef text) {
+    if(text.size() >= 2 && text[0] == 'f' && llvm::StringRef("$[]{}()").contains(text[1])) {
+        return text.take_front(2);
+    }
+    if(text.starts_with("{") || text.starts_with("}")) {
+        return text.take_front(1);
+    }
+    if(text.empty() || !llvm::isAlpha(text[0])) {
+        return {};
+    }
+    return text.take_while(identifier_char);
+}
+
+bool at_doc_word_start(llvm::StringRef line, std::size_t index) {
+    return index == 0 || llvm::isSpace(line[index - 1]) ||
+           llvm::StringRef("([{\"'*_").contains(line[index - 1]);
+}
+
+std::size_t find_doc_closer(llvm::StringRef text, llvm::StringRef closer) {
+    auto end = llvm::StringRef::npos;
+    for(llvm::StringRef marker: {"\\", "@"}) {
+        auto at = text.find((marker + closer).str());
+        if(at == llvm::StringRef::npos) {
+            continue;
+        }
+        auto after = text.substr(at + 1 + closer.size());
+        if(after.empty() || !identifier_char(after.front())) {
+            end = std::min(end, at);
+        }
+    }
+    return end;
+}
+
+llvm::StringRef doc_raw_end(llvm::StringRef name) {
+    auto it = commands().find(name);
+    if(it == commands().end()) {
+        return {};
+    }
+    auto kind = it->second.kind;
+    return kind == Kind::Code || kind == Kind::Hidden || kind == Kind::Formula ? it->second.end
+                                                                               : llvm::StringRef();
+}
+
+bool is_doc_command(llvm::StringRef name) {
+    return commands().contains(name);
+}
 
 Documentation parse_documentation(llvm::StringRef text, CopiedDocLookup lookup) {
     return Parser(lookup).run(text);

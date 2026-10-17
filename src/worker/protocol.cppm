@@ -69,16 +69,12 @@ inline bool is_operational_error(const protocol::Error& error) {
 constexpr inline std::string_view crashed_in_marker = "clice worker crashed in: ";
 
 /// How a dying worker names a request, and how the master recognizes its
-/// own request in that line: the method, a query's kind, and the file.
+/// own request in that line: the method and the file.
 /// Requests a stateful worker runs side by side differ in one of them
 /// unless they are the same work on the same document.
 template <typename Params>
 std::string crash_tag(const Params& params) {
     std::string tag(protocol::RequestTraits<Params>::method);
-    if constexpr(requires { params.kind; }) {
-        tag += ':';
-        tag += kota::meta::enum_name(params.kind, "Unknown");
-    }
     tag += ' ';
     if constexpr(requires { params.path; }) {
         tag += params.path;
@@ -113,18 +109,11 @@ inline bool is_transport_error(const protocol::Error& error) {
     return error.code == static_cast<protocol::integer>(protocol::ErrorCode::ConnectionClosed);
 }
 
-/// Kind of AST query dispatched to a stateful worker.
-enum class QueryKind : uint8_t {
-    Hover,
-    SemanticTokens,
-};
-
-/// Unified parameters for all stateful AST queries.
-/// The worker dispatches to the appropriate feature handler based on `kind`.
-struct QueryParams {
-    QueryKind kind;
+/// Request the hover card at a point of an open file's AST (see
+/// feature::hover).
+struct HoverParams {
     std::string path;
-    uint32_t offset = 0;  ///< Byte offset for position-sensitive queries (Hover).
+    uint32_t offset = 0;
 
     /// What a hover card renders as: the markup the client shows it in.
     feature::protocol::MarkupKind markup = feature::protocol::MarkupKind::Markdown;
@@ -489,6 +478,16 @@ struct InlayHintParams {
     Config config;
 };
 
+/// Request the semantic tokens of an open file's AST (see
+/// feature::semantic_tokens).
+struct SemanticTokensParams {
+    std::string path;
+
+    /// The workspace config, carried whole — the worker holds no config
+    /// state and a config change simply shows up on the next request.
+    Config config;
+};
+
 /// Request the outline of an open file's AST (see feature::document_symbols).
 struct DocumentSymbolParams {
     std::string path;
@@ -543,9 +542,9 @@ struct RequestTraits<clice::worker::CompileParams> {
 };
 
 template <>
-struct RequestTraits<clice::worker::QueryParams> {
+struct RequestTraits<clice::worker::HoverParams> {
     using Result = kota::codec::RawValue;
-    constexpr inline static std::string_view method = "clice/worker/query";
+    constexpr inline static std::string_view method = "clice/worker/hover";
 };
 
 template <>
@@ -572,6 +571,13 @@ struct RequestTraits<clice::worker::SelectionRangeParams> {
     /// Empty without an AST.
     using Result = std::vector<std::vector<clice::LocalSourceRange>>;
     constexpr inline static std::string_view method = "clice/worker/selectionRange";
+};
+
+template <>
+struct RequestTraits<clice::worker::SemanticTokensParams> {
+    /// Empty without an AST.
+    using Result = std::optional<std::vector<clice::feature::SemanticToken>>;
+    constexpr inline static std::string_view method = "clice/worker/semanticTokens";
 };
 
 template <>

@@ -410,6 +410,20 @@ void StatefulWorker::register_handlers() {
             [&](DocumentEntry& doc) { return std::optional(feature::folding_ranges(*doc.unit)); });
     });
 
+    // === SemanticTokens ===
+    peer.on_request([this](RequestContext& ctx, const worker::SemanticTokensParams& params)
+                        -> RequestResult<worker::SemanticTokensParams> {
+        return with_ast_or(
+            "SemanticTokens",
+            params,
+            std::optional<std::vector<feature::SemanticToken>>{},
+            [&](DocumentEntry& doc) {
+                auto regions = doc.inactive_regions();
+                return std::optional(
+                    feature::semantic_tokens(*doc.unit, regions, params.config.semantic_tokens));
+            });
+    });
+
     // === DocumentSymbol ===
     peer.on_request([this](RequestContext& ctx, const worker::DocumentSymbolParams& params)
                         -> RequestResult<worker::DocumentSymbolParams> {
@@ -472,30 +486,18 @@ void StatefulWorker::register_handlers() {
         release_free_memory();
     });
 
-    // === Query (hover, definition, semantic tokens, etc.) ===
+    // === Hover ===
     peer.on_request(
         [this](RequestContext& ctx,
-               const worker::QueryParams& params) -> RequestResult<worker::QueryParams> {
-            using K = worker::QueryKind;
-            auto kind = kota::meta::enum_name(params.kind, "Unknown");
-            switch(params.kind) {
-                case K::Hover:
-                    return with_ast(kind, params, [&](DocumentEntry& doc) {
-                        auto result = feature::hover(*doc.unit,
-                                                     params.offset,
-                                                     params.config.hover,
-                                                     params.config.documentation,
-                                                     params.markup);
-                        return result ? to_raw(*result) : kota::codec::RawValue{"null"};
-                    });
-                case K::SemanticTokens:
-                    return with_ast(kind, params, [&](DocumentEntry& doc) {
-                        auto regions = doc.inactive_regions();
-                        return to_raw(
-                            feature::semantic_tokens(*doc.unit, regions, PositionEncoding::UTF16));
-                    });
-            }
-            std::unreachable();
+               const worker::HoverParams& params) -> RequestResult<worker::HoverParams> {
+            return with_ast("Hover", params, [&](DocumentEntry& doc) {
+                auto result = feature::hover(*doc.unit,
+                                             params.offset,
+                                             params.config.hover,
+                                             params.config.documentation,
+                                             params.markup);
+                return result ? to_raw(*result) : kota::codec::RawValue{"null"};
+            });
         });
 }
 

@@ -15,6 +15,7 @@ import :semantic.display;
 import :semantic.identity;
 import :semantic.resolver;
 import :semantic.semantics;
+import :semantic.token_class;
 import :semantic.types;
 import :support.logging;
 import :support.timer;
@@ -126,6 +127,8 @@ struct TUIndexBlob {
     std::vector<std::uint8_t> sym_kinds;
     std::vector<std::uint8_t> sym_scopes;
     std::vector<std::uint16_t> sym_flags;
+    std::vector<std::uint8_t> sym_token_kinds;
+    std::vector<std::uint32_t> sym_token_modifiers;
     /// Path ids, `no_file` for a symbol without a declaring relation.
     std::vector<std::uint32_t> sym_files;
     std::vector<std::uint32_t> sym_reference_ends;
@@ -444,6 +447,7 @@ public:
             flags |= SymbolFlags::Exported;
         }
         symbol.flags = with_form(flags, name_form_of(decl->getDeclName()));
+        symbol.token_class = token_class(decl);
         return symbol;
     }
 
@@ -481,6 +485,8 @@ public:
             symbol.kind = SymbolKind::Macro;
             symbol.scope = SymbolScope::External;
             symbol.flags = SymbolFlags::Completable;
+            symbol.token_class = def ? token_class(*def, unit.context().getSourceManager())
+                                     : TokenClass{.kind = SemanticTokenKind::Macro};
         }
         index->occurrences.emplace_back(range, hash);
 
@@ -682,6 +688,7 @@ public:
                 symbol.name = name.str();
                 symbol.kind = SymbolKind::Module;
                 symbol.scope = SymbolScope::External;
+                symbol.token_class = {.kind = SemanticTokenKind::Module};
             }
         };
 
@@ -1231,7 +1238,9 @@ public:
                 auto name = add_name(occurrence);
 
                 if(occurrence.kind.is_one_of(RelationKind::Reference)) {
-                    if(is_written(semantics, i)) {
+                    // What an instantiation passes differs from one
+                    // instantiation to the next: the written code only.
+                    if(!entries[i].flags.in_instantiation && is_written(semantics, i)) {
                         add_self_relation(occurrence.decl, RelationKind::Write, name);
                     }
                     add_specialized_type(occurrence.decl, name);
@@ -1439,6 +1448,8 @@ public:
             blob.sym_kinds.push_back(symbol.kind.value());
             blob.sym_scopes.push_back(static_cast<std::uint8_t>(symbol.scope));
             blob.sym_flags.push_back(static_cast<std::uint16_t>(symbol.flags));
+            blob.sym_token_kinds.push_back(static_cast<std::uint8_t>(symbol.token_class.kind));
+            blob.sym_token_modifiers.push_back(symbol.token_class.modifiers);
             blob.sym_files.push_back(symbol.file);
             for(auto file: symbol.reference_files) {
                 blob.sym_references.push_back(file);
@@ -1542,6 +1553,8 @@ struct SymbolColumns {
     llvm::ArrayRef<std::uint8_t> kinds;
     llvm::ArrayRef<std::uint8_t> scopes;
     llvm::ArrayRef<std::uint16_t> flags;
+    llvm::ArrayRef<std::uint8_t> token_kinds;
+    llvm::ArrayRef<std::uint32_t> token_modifiers;
     llvm::ArrayRef<std::uint32_t> files;
     llvm::ArrayRef<std::uint32_t> reference_ends;
     llvm::ArrayRef<std::uint32_t> references;
@@ -1557,6 +1570,8 @@ struct SymbolColumns {
             .kinds = to_array_ref(root[&TUIndexBlob::sym_kinds]),
             .scopes = to_array_ref(root[&TUIndexBlob::sym_scopes]),
             .flags = to_array_ref(root[&TUIndexBlob::sym_flags]),
+            .token_kinds = to_array_ref(root[&TUIndexBlob::sym_token_kinds]),
+            .token_modifiers = to_array_ref(root[&TUIndexBlob::sym_token_modifiers]),
             .files = to_array_ref(root[&TUIndexBlob::sym_files]),
             .reference_ends = to_array_ref(root[&TUIndexBlob::sym_reference_ends]),
             .references = to_array_ref(root[&TUIndexBlob::sym_references]),
@@ -1580,6 +1595,8 @@ struct SymbolColumns {
             .scope = static_cast<SymbolScope>(scopes[entry]),
             .flags = static_cast<SymbolFlags>(flags[entry]),
             .file = files[entry],
+            .token_class = {.kind = static_cast<SemanticTokenKind>(token_kinds[entry]),
+                            .modifiers = token_modifiers[entry]},
         };
     }
 
@@ -1628,6 +1645,8 @@ TUIndex TUIndex::from_bytes(llvm::StringRef data) {
     if(symbols.name_ends.size() != symbol_count || symbols.args_ends.size() != symbol_count ||
        symbols.parents.size() != symbol_count || symbols.kinds.size() != symbol_count ||
        symbols.scopes.size() != symbol_count || symbols.flags.size() != symbol_count ||
+       symbols.token_kinds.size() != symbol_count ||
+       symbols.token_modifiers.size() != symbol_count || !all_token_kinds(symbols.token_kinds) ||
        symbols.files.size() != symbol_count || symbols.reference_ends.size() != symbol_count ||
        !monotone_ends(symbols.name_ends, symbols.names.size()) ||
        !monotone_ends(symbols.args_ends, symbols.args.size()) ||

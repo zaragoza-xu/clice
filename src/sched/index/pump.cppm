@@ -11,6 +11,7 @@ import :sched.graph;
 import :sched.index.pending_table;
 import :support.signal;
 import :worker.pool;
+import :worker.protocol;
 
 namespace clice {
 
@@ -183,6 +184,19 @@ public:
         return failed_ids;
     }
 
+    /// Have every index attempt bring back the errors its compile reported,
+    /// for compiled_with_errors(). The one-shot `clice index` lists them; a
+    /// server reports none and never asks.
+    void collect_errors() {
+        errors_wanted = true;
+    }
+
+    /// Files whose latest index attempt completed although the compile
+    /// reported errors, with the errors: their index holds what parsed.
+    const llvm::DenseMap<Fid, std::vector<worker::LocatedMessage>>& compiled_with_errors() const {
+        return errors;
+    }
+
     /// TUs actually indexed and merged this session — dispatches the
     /// freshness gate skipped do not count. The one-shot `clice index`
     /// reports its work from this, so a warm rerun honestly says 0.
@@ -253,7 +267,15 @@ private:
     /// attempt will come (entry cleared, shutdown).
     void wake_attempt_waits(Fid server_path_id, std::uint64_t ticket = -1);
 
+    /// What a file's latest attempt left, kept by these two alone: an
+    /// index, with the errors its compile reported, or a failure for good.
+    /// A file is in at most one of failed_ids and errors.
+    void record_indexed(Fid file, std::vector<worker::LocatedMessage> compile_errors);
+    void record_failed(Fid file);
+
     llvm::DenseSet<Fid> failed_ids;
+    llvm::DenseMap<Fid, std::vector<worker::LocatedMessage>> errors;
+    bool errors_wanted = false;
     std::size_t indexed_total = 0;
 
     struct AttemptWait {

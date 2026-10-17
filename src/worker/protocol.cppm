@@ -256,9 +256,10 @@ struct TURunParams {
     /// PCM dependencies for TUs that import modules.
     std::unordered_map<std::string, std::string> pcms;
 
-    /// Products of the run: the index, and a clang-tidy pass under this
-    /// frozen configuration.
+    /// Products of the run: the index, the errors the compile reports, and
+    /// a clang-tidy pass under this frozen configuration.
     bool index = false;
+    bool errors = false;
     std::optional<tidy::TidyParams> tidy;
 
     /// Variant identities the master stores for the files this TU is
@@ -364,15 +365,16 @@ struct ArtifactBuildResult {
     std::vector<DepFile> deps;
 };
 
-/// One clang-tidy finding, located for CLI presentation (1-based line and
-/// column; the column counts bytes, like the compiler's).
-struct TidyNote {
+/// A message where it is, located for CLI presentation: 1-based line and
+/// column, the column counting bytes like the compiler's; a message no
+/// file holds (the command line's) has neither.
+struct LocatedMessage {
     std::string file;
     std::uint32_t line = 0;
     std::uint32_t column = 0;
     std::string message;
 
-    auto operator<=>(const TidyNote&) const = default;
+    auto operator<=>(const LocatedMessage&) const = default;
 };
 
 struct TidyDiagnostic {
@@ -393,14 +395,15 @@ struct TidyDiagnostic {
     std::string check;
 
     /// The notes clang-tidy attached ("previous definition is here").
-    std::vector<TidyNote> notes;
+    std::vector<LocatedMessage> notes;
 };
 
 struct TURunResult {
     bool success = true;
     std::string error;
-    /// See ArtifactBuildResult::has_user_errors.
-    bool has_user_errors = false;
+
+    /// The errors a completed run compiled with (plan product `errors`).
+    std::vector<LocatedMessage> errors;
 
     /// Serialized TUIndex, merged by the master (plan product `index`).
     std::string tu_index_data;

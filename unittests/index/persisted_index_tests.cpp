@@ -69,6 +69,9 @@ struct ManifestBlobMirror {
     std::vector<std::uint64_t> local_symbols;
     std::vector<std::uint32_t> local_file_ends;
     std::vector<std::uint32_t> local_files;
+    std::vector<std::uint32_t> instantiation_files;
+    std::vector<std::uint32_t> instantiation_ends;
+    std::vector<std::uint64_t> instantiation_resolutions;
 };
 
 ZEST_CASE(ManifestFanoutRejected) {
@@ -102,6 +105,29 @@ ZEST_CASE(ManifestFanoutRejected) {
     mirror = valid;
     mirror.local_file_ends = {1, 1};
     ZASSERT(!decodes(mirror));
+}
+
+ZEST_CASE(ManifestCorruptResolutionsRejected) {
+    // A resolution the manifest uses keys a DenseMap at load: a sentinel
+    // value must not decode, nor a resolution no file lists.
+    ManifestBlobMirror mirror;
+    mirror.format_version = index::index_format_version;
+    mirror.instantiation_files = {1};
+    mirror.instantiation_ends = {1};
+    mirror.instantiation_resolutions = {42};
+    auto decodes = [&] {
+        auto blob = kota::codec::fbs::to_bytes(mirror);
+        return blob.has_value() && index::deserialize_manifest(bytes_of(*blob)).has_value();
+    };
+    ZASSERT(decodes());
+    mirror.instantiation_resolutions = {~0ull};
+    ZEXPECT(!decodes());
+    mirror.instantiation_resolutions = {~0ull - 1};
+    ZEXPECT(!decodes());
+    mirror.instantiation_files = {};
+    mirror.instantiation_ends = {};
+    mirror.instantiation_resolutions = {42};
+    ZEXPECT(!decodes());
 }
 
 ZEST_CASE(ManifestCountMismatchRejected) {
@@ -313,6 +339,8 @@ struct GlobalBlobMirror {
     std::vector<std::uint32_t> sym_reference_counts;
     std::vector<std::uint32_t> sym_bitmap_ends;
     std::vector<std::uint8_t> sym_bitmaps;
+    std::vector<std::uint32_t> sym_instantiation_ends;
+    std::vector<std::uint8_t> sym_instantiations;
     std::vector<std::uint32_t> manifest_fvs;
     std::vector<std::uint64_t> manifest_gens;
     std::uint64_t search_generation = 0;
@@ -341,6 +369,7 @@ struct GlobalBlobMirror {
             sym_bitmaps.push_back(static_cast<std::uint8_t>(byte));
         }
         sym_bitmap_ends.push_back(static_cast<std::uint32_t>(sym_bitmaps.size()));
+        sym_instantiation_ends.push_back(static_cast<std::uint32_t>(sym_instantiations.size()));
     }
 };
 

@@ -1,6 +1,11 @@
 [answers.outline]
 document_symbols = [
-    { name = "DEFINE_HANDLER", kind = "Constant", at = "#define ⟦DEFINE_HANDLER⟧(name) void name()", detail = "(name)" },
+    {
+        name = "DEFINE_HANDLER",
+        kind = "Constant",
+        at = "#define ⟦DEFINE_HANDLER⟧(name) void name()",
+        detail = "(name)",
+    },
     { name = "on_ready", kind = "Function", at = "DEFINE_HANDLER(⟦on_ready⟧);", detail = "void ()" },
     { name = "on_close", kind = "Function", at = "DEFINE_HANDLER(⟦on_close⟧);", detail = "void ()" },
     { name = "DECLARE_CLASS", kind = "Constant", at = "#define ⟦DECLARE_CLASS⟧(X) class X", detail = "(X)" },
@@ -17,10 +22,20 @@ document_symbols = [
 
 [answers.extents]
 document_symbols = [
-    { name = "DEFINE_HANDLER", kind = "Constant", at = "#define ⟦DEFINE_HANDLER⟧(name) void name()", range = "#define ⟦DEFINE_HANDLER(name) void name()⟧" },
+    {
+        name = "DEFINE_HANDLER",
+        kind = "Constant",
+        at = "#define ⟦DEFINE_HANDLER⟧(name) void name()",
+        range = "#define ⟦DEFINE_HANDLER(name) void name()⟧",
+    },
     { name = "on_ready", kind = "Function", at = "DEFINE_HANDLER(⟦on_ready⟧);", range = "⟦DEFINE_HANDLER(on_ready)⟧;" },
     { name = "on_close", kind = "Function", at = "DEFINE_HANDLER(⟦on_close⟧);", range = "⟦DEFINE_HANDLER(on_close)⟧;" },
-    { name = "DECLARE_CLASS", kind = "Constant", at = "#define ⟦DECLARE_CLASS⟧(X) class X", range = "#define ⟦DECLARE_CLASS(X) class X⟧" },
+    {
+        name = "DECLARE_CLASS",
+        kind = "Constant",
+        at = "#define ⟦DECLARE_CLASS⟧(X) class X",
+        range = "#define ⟦DECLARE_CLASS(X) class X⟧",
+    },
     {
         name = "Generated",
         kind = "Class",

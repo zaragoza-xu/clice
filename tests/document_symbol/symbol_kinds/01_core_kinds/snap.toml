@@ -31,8 +31,18 @@ document_symbols = [
                 at = "enum class ⟦Mode⟧ : unsigned char { Fast, Safe };",
                 detail = "enum",
                 children = [
-                    { name = "Fast", kind = "EnumMember", at = "enum class Mode : unsigned char { ⟦Fast⟧, Safe };", detail = "Mode" },
-                    { name = "Safe", kind = "EnumMember", at = "enum class Mode : unsigned char { Fast, ⟦Safe⟧ };", detail = "Mode" },
+                    {
+                        name = "Fast",
+                        kind = "EnumMember",
+                        at = "enum class Mode : unsigned char { ⟦Fast⟧, Safe };",
+                        detail = "Mode",
+                    },
+                    {
+                        name = "Safe",
+                        kind = "EnumMember",
+                        at = "enum class Mode : unsigned char { Fast, ⟦Safe⟧ };",
+                        detail = "Mode",
+                    },
                 ],
             },
             {
@@ -56,8 +66,18 @@ document_symbols = [
                 ],
             },
             { name = "make_pair", kind = "Function", at = "Pair ⟦make_pair⟧();", detail = "Pair ()" },
-            { name = "bound_first", kind = "Variable", at = "auto [⟦bound_first⟧, bound_second] = make_pair();", detail = "int" },
-            { name = "bound_second", kind = "Variable", at = "auto [bound_first, ⟦bound_second⟧] = make_pair();", detail = "int" },
+            {
+                name = "bound_first",
+                kind = "Variable",
+                at = "auto [⟦bound_first⟧, bound_second] = make_pair();",
+                detail = "int",
+            },
+            {
+                name = "bound_second",
+                kind = "Variable",
+                at = "auto [bound_first, ⟦bound_second⟧] = make_pair();",
+                detail = "int",
+            },
             { name = "lambda", kind = "Variable", at = "auto ⟦lambda⟧ = [](int x) {", detail = "int (int x)" },
         ],
     },
@@ -87,8 +107,18 @@ document_symbols = [
                 at = "enum ⟦Flags⟧ { FlagA, FlagB };",
                 range = "⟦enum Flags { FlagA, FlagB }⟧;",
                 children = [
-                    { name = "FlagA", kind = "EnumMember", at = "enum Flags { ⟦FlagA⟧, FlagB };", range = "enum Flags { ⟦FlagA⟧, FlagB };" },
-                    { name = "FlagB", kind = "EnumMember", at = "enum Flags { FlagA, ⟦FlagB⟧ };", range = "enum Flags { FlagA, ⟦FlagB⟧ };" },
+                    {
+                        name = "FlagA",
+                        kind = "EnumMember",
+                        at = "enum Flags { ⟦FlagA⟧, FlagB };",
+                        range = "enum Flags { ⟦FlagA⟧, FlagB };",
+                    },
+                    {
+                        name = "FlagB",
+                        kind = "EnumMember",
+                        at = "enum Flags { FlagA, ⟦FlagB⟧ };",
+                        range = "enum Flags { FlagA, ⟦FlagB⟧ };",
+                    },
                 ],
             },
             {
@@ -97,8 +127,18 @@ document_symbols = [
                 at = "enum class ⟦Mode⟧ : unsigned char { Fast, Safe };",
                 range = "⟦enum class Mode : unsigned char { Fast, Safe }⟧;",
                 children = [
-                    { name = "Fast", kind = "EnumMember", at = "enum class Mode : unsigned char { ⟦Fast⟧, Safe };", range = "enum class Mode : unsigned char { ⟦Fast⟧, Safe };" },
-                    { name = "Safe", kind = "EnumMember", at = "enum class Mode : unsigned char { Fast, ⟦Safe⟧ };", range = "enum class Mode : unsigned char { Fast, ⟦Safe⟧ };" },
+                    {
+                        name = "Fast",
+                        kind = "EnumMember",
+                        at = "enum class Mode : unsigned char { ⟦Fast⟧, Safe };",
+                        range = "enum class Mode : unsigned char { ⟦Fast⟧, Safe };",
+                    },
+                    {
+                        name = "Safe",
+                        kind = "EnumMember",
+                        at = "enum class Mode : unsigned char { Fast, ⟦Safe⟧ };",
+                        range = "enum class Mode : unsigned char { Fast, ⟦Safe⟧ };",
+                    },
                 ],
             },
             {
@@ -118,13 +158,33 @@ document_symbols = [
                     },
                     { name = "first", kind = "Field", at = "int ⟦first⟧;", range = "⟦int first⟧;" },
                     { name = "second", kind = "Field", at = "int ⟦second⟧;", range = "⟦int second⟧;" },
-                    { name = "instances", kind = "Variable", at = "static int ⟦instances⟧;", range = "⟦static int instances⟧;" },
+                    {
+                        name = "instances",
+                        kind = "Variable",
+                        at = "static int ⟦instances⟧;",
+                        range = "⟦static int instances⟧;",
+                    },
                 ],
             },
             { name = "make_pair", kind = "Function", at = "Pair ⟦make_pair⟧();", range = "⟦Pair make_pair()⟧;" },
-            { name = "bound_first", kind = "Variable", at = "auto [⟦bound_first⟧, bound_second] = make_pair();", range = "auto [⟦bound_first⟧, bound_second] = make_pair();" },
-            { name = "bound_second", kind = "Variable", at = "auto [bound_first, ⟦bound_second⟧] = make_pair();", range = "auto [bound_first, ⟦bound_second⟧] = make_pair();" },
-            { name = "lambda", kind = "Variable", at = "auto ⟦lambda⟧ = [](int x) {", range = "⟦auto lambda = [](int x) { … }⟧ (3 lines)" },
+            {
+                name = "bound_first",
+                kind = "Variable",
+                at = "auto [⟦bound_first⟧, bound_second] = make_pair();",
+                range = "auto [⟦bound_first⟧, bound_second] = make_pair();",
+            },
+            {
+                name = "bound_second",
+                kind = "Variable",
+                at = "auto [bound_first, ⟦bound_second⟧] = make_pair();",
+                range = "auto [bound_first, ⟦bound_second⟧] = make_pair();",
+            },
+            {
+                name = "lambda",
+                kind = "Variable",
+                at = "auto ⟦lambda⟧ = [](int x) {",
+                range = "⟦auto lambda = [](int x) { … }⟧ (3 lines)",
+            },
         ],
     },
 ]

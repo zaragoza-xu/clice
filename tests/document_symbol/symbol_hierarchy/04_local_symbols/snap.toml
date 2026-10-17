@@ -51,7 +51,12 @@ document_symbols = [
                     { name = "total", kind = "Field", at = "int ⟦total⟧;", range = "⟦int total⟧;" },
                 ],
             },
-            { name = "twice", kind = "Variable", at = "auto ⟦twice⟧ = [](int x) {", range = "⟦auto twice = [](int x) { … }⟧ (3 lines)" },
+            {
+                name = "twice",
+                kind = "Variable",
+                at = "auto ⟦twice⟧ = [](int x) {",
+                range = "⟦auto twice = [](int x) { … }⟧ (3 lines)",
+            },
             {
                 name = "Pair",
                 kind = "Struct",
@@ -62,8 +67,18 @@ document_symbols = [
                     { name = "b", kind = "Field", at = "int ⟦b⟧;", range = "⟦int b⟧;" },
                 ],
             },
-            { name = "first", kind = "Variable", at = "auto [⟦first⟧, second] = Pair{1, 2};", range = "auto [⟦first⟧, second] = Pair{1, 2};" },
-            { name = "second", kind = "Variable", at = "auto [first, ⟦second⟧] = Pair{1, 2};", range = "auto [first, ⟦second⟧] = Pair{1, 2};" },
+            {
+                name = "first",
+                kind = "Variable",
+                at = "auto [⟦first⟧, second] = Pair{1, 2};",
+                range = "auto [⟦first⟧, second] = Pair{1, 2};",
+            },
+            {
+                name = "second",
+                kind = "Variable",
+                at = "auto [first, ⟦second⟧] = Pair{1, 2};",
+                range = "auto [first, ⟦second⟧] = Pair{1, 2};",
+            },
         ],
     },
 ]

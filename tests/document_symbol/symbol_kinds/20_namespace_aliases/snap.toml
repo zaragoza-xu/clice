@@ -46,14 +46,24 @@ document_symbols = [
             },
         ],
     },
-    { name = "geo", kind = "Namespace", at = "namespace ⟦geo⟧ = geometry::planar;", range = "⟦namespace geo = geometry::planar⟧;" },
+    {
+        name = "geo",
+        kind = "Namespace",
+        at = "namespace ⟦geo⟧ = geometry::planar;",
+        range = "⟦namespace geo = geometry::planar⟧;",
+    },
     {
         name = "draw",
         kind = "Function",
         at = "void ⟦draw⟧() {",
         range = "⟦void draw() { … }⟧ (3 lines)",
         children = [
-            { name = "local", kind = "Namespace", at = "namespace ⟦local⟧ = geometry;", range = "⟦namespace local = geometry⟧;" },
+            {
+                name = "local",
+                kind = "Namespace",
+                at = "namespace ⟦local⟧ = geometry;",
+                range = "⟦namespace local = geometry⟧;",
+            },
         ],
     },
 ]

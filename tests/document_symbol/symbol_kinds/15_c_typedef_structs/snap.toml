@@ -88,11 +88,26 @@ document_symbols = [
         at = "typedef enum { Red, Green } ⟦Color⟧;",
         range = "⟦typedef enum { Red, Green } Color⟧;",
         children = [
-            { name = "Red", kind = "EnumMember", at = "typedef enum { ⟦Red⟧, Green } Color;", range = "typedef enum { ⟦Red⟧, Green } Color;" },
-            { name = "Green", kind = "EnumMember", at = "typedef enum { Red, ⟦Green⟧ } Color;", range = "typedef enum { Red, ⟦Green⟧ } Color;" },
+            {
+                name = "Red",
+                kind = "EnumMember",
+                at = "typedef enum { ⟦Red⟧, Green } Color;",
+                range = "typedef enum { ⟦Red⟧, Green } Color;",
+            },
+            {
+                name = "Green",
+                kind = "EnumMember",
+                at = "typedef enum { Red, ⟦Green⟧ } Color;",
+                range = "typedef enum { Red, ⟦Green⟧ } Color;",
+            },
         ],
     },
-    { name = "Point3Ref", kind = "Class", at = "} *⟦Point3Ref⟧;", range = "⟦typedef struct Point3 { … } *Point3Ref⟧ (3 lines)" },
+    {
+        name = "Point3Ref",
+        kind = "Class",
+        at = "} *⟦Point3Ref⟧;",
+        range = "⟦typedef struct Point3 { … } *Point3Ref⟧ (3 lines)",
+    },
     {
         name = "Point3",
         kind = "Struct",

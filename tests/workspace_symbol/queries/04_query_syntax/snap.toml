@@ -25,7 +25,12 @@ workspace_symbols = [
     { name = "io::process", kind = "Function", at = "main.cpp │ void ⟦process⟧(Stream& stream);", container = "io" },
     { name = "io::process_all", kind = "Function", at = "main.cpp │ void ⟦process_all⟧();", container = "io" },
     { name = "io::detail", kind = "Namespace", at = "main.cpp │ namespace ⟦detail⟧ {", container = "io" },
-    { name = "io::detail::processor", kind = "Function", at = "main.cpp │ void ⟦processor⟧();", container = "io::detail" },
+    {
+        name = "io::detail::processor",
+        kind = "Function",
+        at = "main.cpp │ void ⟦processor⟧();",
+        container = "io::detail",
+    },
 ]
 
 [answers."process kind:function"]

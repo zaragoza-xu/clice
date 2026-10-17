@@ -2,7 +2,13 @@
 items = [
     { label = "for", kind = "Keyword", insert = "for" },
     { label = "Foo", kind = "Class", insert = "Foo" },
-    { label = "foooo(int x, float y)", kind = "Function", detail = "int", insert = "foooo(${1:int x}, ${2:float y})", snippet = true },
+    {
+        label = "foooo(int x, float y)",
+        kind = "Function",
+        detail = "int",
+        insert = "foooo(${1:int x}, ${2:float y})",
+        snippet = true,
+    },
 ]
 
 [default.no_arguments.completion]
@@ -13,7 +19,13 @@ items = [
 
 [default.method.completion]
 items = [
-    { label = "bazzzz(int a, int b)", kind = "Method", detail = "int", insert = "bazzzz(${1:int a}, ${2:int b})", snippet = true },
+    {
+        label = "bazzzz(int a, int b)",
+        kind = "Method",
+        detail = "int",
+        insert = "bazzzz(${1:int a}, ${2:int b})",
+        snippet = true,
+    },
 ]
 
 [delimiters.free_function.completion]

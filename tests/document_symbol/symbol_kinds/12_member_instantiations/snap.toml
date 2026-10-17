@@ -41,5 +41,10 @@ document_symbols = [
             },
         ],
     },
-    { name = "Outer<int>::Inner", kind = "Struct", at = "template struct Outer<int>::⟦Inner⟧;", range = "⟦template struct Outer<int>::Inner⟧;" },
+    {
+        name = "Outer<int>::Inner",
+        kind = "Struct",
+        at = "template struct Outer<int>::⟦Inner⟧;",
+        range = "⟦template struct Outer<int>::Inner⟧;",
+    },
 ]

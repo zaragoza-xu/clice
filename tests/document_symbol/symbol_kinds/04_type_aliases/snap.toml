@@ -32,17 +32,42 @@ document_symbols = [
         range = "⟦namespace aliases { … }⟧ (19 lines)",
         children = [
             { name = "Widget", kind = "Struct", at = "struct ⟦Widget⟧ {};", range = "⟦struct Widget {}⟧;" },
-            { name = "LegacyWidget", kind = "Class", at = "typedef Widget ⟦LegacyWidget⟧;", range = "⟦typedef Widget LegacyWidget⟧;" },
-            { name = "ModernWidget", kind = "Class", at = "using ⟦ModernWidget⟧ = Widget;", range = "⟦using ModernWidget = Widget⟧;" },
-            { name = "Box", kind = "Struct", at = "struct ⟦Box⟧ {};", range = "⟦template <typename T> … struct Box {}⟧ (2 lines)" },
-            { name = "BoxOf", kind = "Class", at = "using ⟦BoxOf⟧ = Box<T>;", range = "⟦template <typename T> … using BoxOf = Box<T>⟧ (2 lines)" },
+            {
+                name = "LegacyWidget",
+                kind = "Class",
+                at = "typedef Widget ⟦LegacyWidget⟧;",
+                range = "⟦typedef Widget LegacyWidget⟧;",
+            },
+            {
+                name = "ModernWidget",
+                kind = "Class",
+                at = "using ⟦ModernWidget⟧ = Widget;",
+                range = "⟦using ModernWidget = Widget⟧;",
+            },
+            {
+                name = "Box",
+                kind = "Struct",
+                at = "struct ⟦Box⟧ {};",
+                range = "⟦template <typename T> … struct Box {}⟧ (2 lines)",
+            },
+            {
+                name = "BoxOf",
+                kind = "Class",
+                at = "using ⟦BoxOf⟧ = Box<T>;",
+                range = "⟦template <typename T> … using BoxOf = Box<T>⟧ (2 lines)",
+            },
             {
                 name = "Holder",
                 kind = "Struct",
                 at = "struct ⟦Holder⟧ {",
                 range = "⟦struct Holder { … }⟧ (3 lines)",
                 children = [
-                    { name = "Inner", kind = "Class", at = "using ⟦Inner⟧ = Widget;", range = "⟦using Inner = Widget⟧;" },
+                    {
+                        name = "Inner",
+                        kind = "Class",
+                        at = "using ⟦Inner⟧ = Widget;",
+                        range = "⟦using Inner = Widget⟧;",
+                    },
                 ],
             },
         ],

@@ -11,8 +11,18 @@ document_symbols = [
                 at = "enum class ⟦Season⟧ { spring, autumn };",
                 detail = "enum",
                 children = [
-                    { name = "spring", kind = "EnumMember", at = "enum class Season { ⟦spring⟧, autumn };", detail = "Season" },
-                    { name = "autumn", kind = "EnumMember", at = "enum class Season { spring, ⟦autumn⟧ };", detail = "Season" },
+                    {
+                        name = "spring",
+                        kind = "EnumMember",
+                        at = "enum class Season { ⟦spring⟧, autumn };",
+                        detail = "Season",
+                    },
+                    {
+                        name = "autumn",
+                        kind = "EnumMember",
+                        at = "enum class Season { spring, ⟦autumn⟧ };",
+                        detail = "Season",
+                    },
                 ],
             },
             {
@@ -22,7 +32,12 @@ document_symbols = [
                 detail = "struct",
                 children = [
                     { name = "width", kind = "Field", at = "int ⟦width⟧;", detail = "int" },
-                    { name = "plant", kind = "Method", at = "void ⟦plant⟧(Season season);", detail = "void (Season season)" },
+                    {
+                        name = "plant",
+                        kind = "Method",
+                        at = "void ⟦plant⟧(Season season);",
+                        detail = "void (Season season)",
+                    },
                 ],
             },
             { name = "water", kind = "Function", at = "void ⟦water⟧(Bed& bed);", detail = "void (Bed &bed)" },
@@ -44,8 +59,18 @@ document_symbols = [
                 at = "enum class ⟦Season⟧ { spring, autumn };",
                 range = "⟦enum class Season { spring, autumn }⟧;",
                 children = [
-                    { name = "spring", kind = "EnumMember", at = "enum class Season { ⟦spring⟧, autumn };", range = "enum class Season { ⟦spring⟧, autumn };" },
-                    { name = "autumn", kind = "EnumMember", at = "enum class Season { spring, ⟦autumn⟧ };", range = "enum class Season { spring, ⟦autumn⟧ };" },
+                    {
+                        name = "spring",
+                        kind = "EnumMember",
+                        at = "enum class Season { ⟦spring⟧, autumn };",
+                        range = "enum class Season { ⟦spring⟧, autumn };",
+                    },
+                    {
+                        name = "autumn",
+                        kind = "EnumMember",
+                        at = "enum class Season { spring, ⟦autumn⟧ };",
+                        range = "enum class Season { spring, ⟦autumn⟧ };",
+                    },
                 ],
             },
             {
@@ -55,7 +80,12 @@ document_symbols = [
                 range = "⟦struct Bed { … }⟧ (4 lines)",
                 children = [
                     { name = "width", kind = "Field", at = "int ⟦width⟧;", range = "⟦int width⟧;" },
-                    { name = "plant", kind = "Method", at = "void ⟦plant⟧(Season season);", range = "⟦void plant(Season season)⟧;" },
+                    {
+                        name = "plant",
+                        kind = "Method",
+                        at = "void ⟦plant⟧(Season season);",
+                        range = "⟦void plant(Season season)⟧;",
+                    },
                 ],
             },
             { name = "water", kind = "Function", at = "void ⟦water⟧(Bed& bed);", range = "⟦void water(Bed& bed)⟧;" },

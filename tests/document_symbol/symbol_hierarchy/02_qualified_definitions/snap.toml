@@ -16,7 +16,12 @@ document_symbols = [
                     { name = "manhattan", kind = "Method", at = "int ⟦manhattan⟧() const;", detail = "int () const" },
                 ],
             },
-            { name = "Point::manhattan", kind = "Method", at = "int Point::⟦manhattan⟧() const {", detail = "int () const" },
+            {
+                name = "Point::manhattan",
+                kind = "Method",
+                at = "int Point::⟦manhattan⟧() const {",
+                detail = "int () const",
+            },
             {
                 name = "Axis",
                 kind = "Enum",
@@ -27,7 +32,12 @@ document_symbols = [
                     { name = "Y", kind = "EnumMember", at = "enum class Axis { X, ⟦Y⟧ };", detail = "Axis" },
                 ],
             },
-            { name = "origin_distance", kind = "Function", at = "int ⟦origin_distance⟧(const Point& p);", detail = "int (const Point &p)" },
+            {
+                name = "origin_distance",
+                kind = "Function",
+                at = "int ⟦origin_distance⟧(const Point& p);",
+                detail = "int (const Point &p)",
+            },
             {
                 name = "inner",
                 kind = "Namespace",
@@ -79,28 +89,58 @@ document_symbols = [
                 children = [
                     { name = "x", kind = "Field", at = "int ⟦x⟧;", range = "⟦int x⟧;" },
                     { name = "y", kind = "Field", at = "int ⟦y⟧;", range = "⟦int y⟧;" },
-                    { name = "manhattan", kind = "Method", at = "int ⟦manhattan⟧() const;", range = "⟦int manhattan() const⟧;" },
+                    {
+                        name = "manhattan",
+                        kind = "Method",
+                        at = "int ⟦manhattan⟧() const;",
+                        range = "⟦int manhattan() const⟧;",
+                    },
                 ],
             },
-            { name = "Point::manhattan", kind = "Method", at = "int Point::⟦manhattan⟧() const {", range = "⟦int Point::manhattan() const { … }⟧ (3 lines)" },
+            {
+                name = "Point::manhattan",
+                kind = "Method",
+                at = "int Point::⟦manhattan⟧() const {",
+                range = "⟦int Point::manhattan() const { … }⟧ (3 lines)",
+            },
             {
                 name = "Axis",
                 kind = "Enum",
                 at = "enum class ⟦Axis⟧ { X, Y };",
                 range = "⟦enum class Axis { X, Y }⟧;",
                 children = [
-                    { name = "X", kind = "EnumMember", at = "enum class Axis { ⟦X⟧, Y };", range = "enum class Axis { ⟦X⟧, Y };" },
-                    { name = "Y", kind = "EnumMember", at = "enum class Axis { X, ⟦Y⟧ };", range = "enum class Axis { X, ⟦Y⟧ };" },
+                    {
+                        name = "X",
+                        kind = "EnumMember",
+                        at = "enum class Axis { ⟦X⟧, Y };",
+                        range = "enum class Axis { ⟦X⟧, Y };",
+                    },
+                    {
+                        name = "Y",
+                        kind = "EnumMember",
+                        at = "enum class Axis { X, ⟦Y⟧ };",
+                        range = "enum class Axis { X, ⟦Y⟧ };",
+                    },
                 ],
             },
-            { name = "origin_distance", kind = "Function", at = "int ⟦origin_distance⟧(const Point& p);", range = "⟦int origin_distance(const Point& p)⟧;" },
+            {
+                name = "origin_distance",
+                kind = "Function",
+                at = "int ⟦origin_distance⟧(const Point& p);",
+                range = "⟦int origin_distance(const Point& p)⟧;",
+            },
             {
                 name = "inner",
                 kind = "Namespace",
                 at = "namespace ⟦inner⟧ {",
                 range = "⟦namespace inner { … }⟧ (3 lines)",
                 children = [
-                    { name = "level", kind = "Variable", at = "constexpr int ⟦level⟧ = 2;", range = "⟦constexpr int level = 2⟧;" },
+                    {
+                        name = "level",
+                        kind = "Variable",
+                        at = "constexpr int ⟦level⟧ = 2;",
+                        range = "⟦constexpr int level = 2⟧;",
+                    },
                 ],
             },
         ],

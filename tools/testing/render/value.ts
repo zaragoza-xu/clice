@@ -1,7 +1,7 @@
 /// What an output holds and how snap.toml writes it: text, numbers, flags,
 /// places, lists and tables. Short values stay on a line; text spanning
 /// lines is a raw ''' string, so code, markdown and diffs read as they are,
-/// unescaped.
+/// unescaped. A line holds 120 columns, a column a grapheme.
 
 import { parse } from "smol-toml";
 import type { Location } from "./position.ts";
@@ -66,8 +66,9 @@ export function mapText(value: Value, map: (text: string) => string): Value {
     return value;
 }
 
-const WIDTH = 100;
+const WIDTH = 120;
 const INDENT = "    ";
+const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const BARE = /^[A-Za-z0-9_-]+$/;
 /// What a literal string cannot hold: control characters but the tab.
 const CONTROL = /[\u0000-\u0008\u000a-\u001f\u007f]/;
@@ -125,10 +126,14 @@ function scalarLike(value: Value): boolean {
     return isList(value) ? value.length === 0 : !isTable(value) || Object.keys(value).length === 0;
 }
 
-/// `value` written inline. A table of scalars stays on one line, an entry
-/// of a list reads as a row; a list of tables, and anything holding text of
-/// several lines or not fitting after `used` columns, takes a line per item
-/// under `indent`.
+function columns(text: string): number {
+    return [...GRAPHEMES.segment(text)].length;
+}
+
+/// `value` written inline under `indent`, its line holding `used` columns
+/// besides it. A list or table stays on one line while the line fits; a
+/// list of tables or lists, and anything holding text of several lines or
+/// not fitting, takes a line per item, each ending with a comma.
 function inline(value: Value, indent: string, used: number): string {
     if (typeof value === "string") {
         return text(value);
@@ -139,31 +144,23 @@ function inline(value: Value, indent: string, used: number): string {
     if (typeof value === "number" || typeof value === "boolean") {
         return scalar(value);
     }
+    if (scalarLike(value)) {
+        return isList(value) ? "[]" : "{}";
+    }
     const inner = indent + INDENT;
-    if (isList(value)) {
-        if (value.length === 0) {
-            return "[]";
-        }
-        const items = value.map((item) => inline(item, inner, inner.length));
-        const flat = `[${items.join(", ")}]`;
-        const rows = value.some((item) => !scalarLike(item)) || flat.includes("\n");
-        return !rows && used + flat.length <= WIDTH
-            ? flat
-            : `[\n${items.map((item) => `${inner}${item},`).join("\n")}\n${indent}]`;
+    const items = isList(value)
+        ? value.map((item) => inline(item, inner, inner.length + 1))
+        : Object.entries(value).map(([key, item]) => {
+              const head = `${tomlKey(key)} = `;
+              return head + inline(item, inner, columns(inner + head) + 1);
+          });
+    const flat = isList(value) ? `[${items.join(", ")}]` : `{ ${items.join(", ")} }`;
+    const rows = flat.includes("\n") || (isList(value) && value.some((item) => !scalarLike(item)));
+    if (!rows && used + columns(flat) <= WIDTH) {
+        return flat;
     }
-    const entries = Object.entries(value);
-    if (entries.length === 0) {
-        return "{}";
-    }
-    const items = entries.map(([key, item]) => {
-        const head = `${tomlKey(key)} = `;
-        return head + inline(item, inner, inner.length + head.length);
-    });
-    const flat = `{ ${items.join(", ")} }`;
-    const scalars = entries.every(([, item]) => scalarLike(item));
-    return !flat.includes("\n") && (scalars || used + flat.length <= WIDTH)
-        ? flat
-        : `{\n${items.map((item) => `${inner}${item},`).join("\n")}\n${indent}}`;
+    const [open, close] = isList(value) ? ["[", "]"] : ["{", "}"];
+    return `${open}\n${items.map((item) => `${inner}${item},`).join("\n")}\n${indent}${close}`;
 }
 
 /// Whether `value` holds text of several lines.
@@ -197,7 +194,7 @@ function sections(path: readonly string[], table: Table, item = false): string[]
             item ? `[[${keys}]]` : `[${keys}]`,
             ...flat.map(([key, value]) => {
                 const head = `${tomlKey(key)} = `;
-                return head + inline(value, "", head.length);
+                return head + inline(value, "", columns(head));
             }),
         ]);
     }

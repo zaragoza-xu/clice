@@ -10,17 +10,9 @@ semantic_tokens = [
         modifiers = ["declaration", "readonly", "member", "userDefined"],
     },
     { at = "int operator()(⟦int⟧ left, int right) const;", type = "primitive" },
-    {
-        at = "int operator()(int ⟦left⟧, int right) const;",
-        type = "parameter",
-        modifiers = ["definition", "local"],
-    },
+    { at = "int operator()(int ⟦left⟧, int right) const;", type = "parameter", modifiers = ["definition", "local"] },
     { at = "int operator()(int left, ⟦int⟧ right) const;", type = "primitive" },
-    {
-        at = "int operator()(int left, int ⟦right⟧) const;",
-        type = "parameter",
-        modifiers = ["definition", "local"],
-    },
+    { at = "int operator()(int left, int ⟦right⟧) const;", type = "parameter", modifiers = ["definition", "local"] },
     { at = "int operator()(int left, int right) ⟦const⟧;", type = "keyword" },
     { at = "⟦struct⟧ Counter : Adder {};", type = "keyword" },
     { at = "struct ⟦Counter⟧ : Adder {};", type = "struct", modifiers = ["definition", "global"] },
@@ -78,31 +70,15 @@ semantic_tokens = [
     },
     { at = "auto twice ⟦=⟧ [](int x) { return x * 2; };", type = "operator" },
     { at = "auto twice = [](⟦int⟧ x) { return x * 2; };", type = "primitive" },
-    {
-        at = "auto twice = [](int ⟦x⟧) { return x * 2; };",
-        type = "parameter",
-        modifiers = ["definition", "local"],
-    },
-    {
-        at = "auto twice = [](int x) { ⟦return⟧ x * 2; };",
-        type = "keyword",
-        modifiers = ["controlFlow"],
-    },
-    {
-        at = "auto twice = [](int x) { return ⟦x⟧ * 2; };",
-        type = "parameter",
-        modifiers = ["local"],
-    },
+    { at = "auto twice = [](int ⟦x⟧) { return x * 2; };", type = "parameter", modifiers = ["definition", "local"] },
+    { at = "auto twice = [](int x) { ⟦return⟧ x * 2; };", type = "keyword", modifiers = ["controlFlow"] },
+    { at = "auto twice = [](int x) { return ⟦x⟧ * 2; };", type = "parameter", modifiers = ["local"] },
     { at = "auto twice = [](int x) { return x ⟦*⟧ 2; };", type = "operator" },
     { at = "auto twice = [](int x) { return x * ⟦2⟧; };", type = "number" },
     { at = "⟦void⟧ (Adder::*member)() = nullptr;", type = "primitive" },
     { at = "void (⟦Adder⟧::*member)() = nullptr;", type = "struct", modifiers = ["global"] },
     { at = "void (Adder::⟦*⟧member)() = nullptr;", type = "operator", modifiers = ["declarator"] },
-    {
-        at = "void (Adder::*⟦member⟧)() = nullptr;",
-        type = "variable",
-        modifiers = ["definition", "local", "callable"],
-    },
+    { at = "void (Adder::*⟦member⟧)() = nullptr;", type = "variable", modifiers = ["definition", "local", "callable"] },
     { at = "void (Adder::*member)() ⟦=⟧ nullptr;", type = "operator" },
     { at = "void (Adder::*member)() = ⟦nullptr⟧;", type = "keyword", modifiers = ["literal"] },
     {
@@ -125,7 +101,10 @@ semantic_tokens = [
         type = "parameter",
         modifiers = ["local"],
     },
-    { at = "return operation(value, value) ⟦+⟧ adder(value, value) + counter(value, 1) + twice(value);", type = "operator" },
+    {
+        at = "return operation(value, value) ⟦+⟧ adder(value, value) + counter(value, 1) + twice(value);",
+        type = "operator",
+    },
     {
         at = "return operation(value, value) + ⟦adder⟧(value, value) + counter(value, 1) + twice(value);",
         type = "parameter",
@@ -151,7 +130,10 @@ semantic_tokens = [
         type = "operator",
         modifiers = ["readonly", "member", "userDefined"],
     },
-    { at = "return operation(value, value) + adder(value, value) ⟦+⟧ counter(value, 1) + twice(value);", type = "operator" },
+    {
+        at = "return operation(value, value) + adder(value, value) ⟦+⟧ counter(value, 1) + twice(value);",
+        type = "operator",
+    },
     {
         at = "return operation(value, value) + adder(value, value) + ⟦counter⟧(value, 1) + twice(value);",
         type = "parameter",
@@ -167,13 +149,19 @@ semantic_tokens = [
         type = "parameter",
         modifiers = ["local"],
     },
-    { at = "return operation(value, value) + adder(value, value) + counter(value, ⟦1⟧) + twice(value);", type = "number" },
+    {
+        at = "return operation(value, value) + adder(value, value) + counter(value, ⟦1⟧) + twice(value);",
+        type = "number",
+    },
     {
         at = "return operation(value, value) + adder(value, value) + counter(value, 1⟦)⟧ + twice(value);",
         type = "operator",
         modifiers = ["readonly", "member", "userDefined"],
     },
-    { at = "return operation(value, value) + adder(value, value) + counter(value, 1) ⟦+⟧ twice(value);", type = "operator" },
+    {
+        at = "return operation(value, value) + adder(value, value) + counter(value, 1) ⟦+⟧ twice(value);",
+        type = "operator",
+    },
     {
         at = "return operation(value, value) + adder(value, value) + counter(value, 1) + ⟦twice⟧(value);",
         type = "variable",

@@ -8,11 +8,7 @@ references = [
     "struct Dog : public ⟦Animal⟧ {",
     "struct Cat : public ⟦Animal⟧ {",
 ]
-uses = [
-    "virtual ~⟦Animal⟧() = default;",
-    "struct Dog : public ⟦Animal⟧ {",
-    "struct Cat : public ⟦Animal⟧ {",
-]
+uses = ["virtual ~⟦Animal⟧() = default;", "struct Dog : public ⟦Animal⟧ {", "struct Cat : public ⟦Animal⟧ {"]
 type_hierarchy = [
     { name = "Animal", kind = "Struct", at = "struct ⟦Animal⟧ {" },
 ]
@@ -111,12 +107,7 @@ call_hierarchy = [
     { name = "global_var", kind = "Variable", at = "int ⟦global_var⟧ = 42;" },
 ]
 incoming_calls = [
-    {
-        name = "use_global",
-        kind = "Function",
-        at = "int ⟦use_global⟧() {",
-        sites = ["return ⟦global_var⟧ + 1;"],
-    },
+    { name = "use_global", kind = "Function", at = "int ⟦use_global⟧() {", sites = ["return ⟦global_var⟧ + 1;"] },
     {
         name = "use_global_again",
         kind = "Function",
@@ -131,22 +122,13 @@ definition = []
 [test.area]
 definition = ["nav.h │ int ⟦area⟧(const Shape& s);"]
 declaration = ["nav.h │ int ⟦area⟧(const Shape& s);"]
-references = [
-    "int ⟦area⟧(const Shape& s) {",
-    "return ⟦area⟧(global_shape);",
-    "nav.h │ int ⟦area⟧(const Shape& s);",
-]
+references = ["int ⟦area⟧(const Shape& s) {", "return ⟦area⟧(global_shape);", "nav.h │ int ⟦area⟧(const Shape& s);"]
 uses = ["return ⟦area⟧(global_shape);"]
 call_hierarchy = [
     { name = "area", kind = "Function", at = "int ⟦area⟧(const Shape& s) {" },
 ]
 incoming_calls = [
-    {
-        name = "shape_area",
-        kind = "Function",
-        at = "int ⟦shape_area⟧() {",
-        sites = ["return ⟦area⟧(global_shape);"],
-    },
+    { name = "shape_area", kind = "Function", at = "int ⟦shape_area⟧() {", sites = ["return ⟦area⟧(global_shape);"] },
 ]
 
 [test.area_decl]
@@ -208,12 +190,7 @@ call_hierarchy = [
     { name = "global_shape", kind = "Variable", at = "Shape ⟦global_shape⟧;" },
 ]
 incoming_calls = [
-    {
-        name = "shape_area",
-        kind = "Function",
-        at = "int ⟦shape_area⟧() {",
-        sites = ["return area(⟦global_shape⟧);"],
-    },
+    { name = "shape_area", kind = "Function", at = "int ⟦shape_area⟧() {", sites = ["return area(⟦global_shape⟧);"] },
 ]
 
 [test.area_scale]
@@ -248,7 +225,12 @@ declaration = ["nav.cpp │ void GLRenderer::⟦render⟧() {}"]
 implementation = ["nav.cpp │ void DebugGLRenderer::⟦render⟧() {}"]
 references = ["nav.cpp │ void GLRenderer::⟦render⟧() {}", "void ⟦render⟧() override; @+0"]
 call_hierarchy = [
-    { name = "render", kind = "Method", at = "nav.cpp │ void GLRenderer::⟦render⟧() {}", detail = "GLRenderer::render" },
+    {
+        name = "render",
+        kind = "Method",
+        at = "nav.cpp │ void GLRenderer::⟦render⟧() {}",
+        detail = "GLRenderer::render",
+    },
 ]
 
 [test.make_unit_shape]

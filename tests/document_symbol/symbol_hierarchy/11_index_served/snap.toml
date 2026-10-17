@@ -1,7 +1,12 @@
 [outline.index]
 document_symbols = [
     { name = "LIMIT", kind = "Constant", at = "#define ⟦LIMIT⟧ 8", range = "#define ⟦LIMIT 8⟧" },
-    { name = "FIELDS", kind = "Constant", at = "#define ⟦FIELDS⟧ int generated_a; int generated_b;", range = "#define ⟦FIELDS int generated_a; int generated_b;⟧" },
+    {
+        name = "FIELDS",
+        kind = "Constant",
+        at = "#define ⟦FIELDS⟧ int generated_a; int generated_b;",
+        range = "#define ⟦FIELDS int generated_a; int generated_b;⟧",
+    },
     {
         name = "app",
         kind = "Namespace",
@@ -27,11 +32,26 @@ document_symbols = [
                             { name = "generated_b", kind = "Field", at = "⟦FIELDS⟧", range = "⟦FIELDS⟧" },
                         ],
                     },
-                    { name = "convert", kind = "Method", at = "U ⟦convert⟧() const;", range = "⟦template <typename U> … U convert() const⟧ (2 lines)" },
+                    {
+                        name = "convert",
+                        kind = "Method",
+                        at = "U ⟦convert⟧() const;",
+                        range = "⟦template <typename U> … U convert() const⟧ (2 lines)",
+                    },
                 ],
             },
-            { name = "Box<T>::convert", kind = "Method", at = "U Box<T>::⟦convert⟧() const {", range = "⟦template <typename T> … }⟧ (5 lines)" },
-            { name = "Box<int>", kind = "Struct", at = "template struct ⟦Box⟧<int>;", range = "⟦template struct Box<int>⟧;" },
+            {
+                name = "Box<T>::convert",
+                kind = "Method",
+                at = "U Box<T>::⟦convert⟧() const {",
+                range = "⟦template <typename T> … }⟧ (5 lines)",
+            },
+            {
+                name = "Box<int>",
+                kind = "Struct",
+                at = "template struct ⟦Box⟧<int>;",
+                range = "⟦template struct Box<int>⟧;",
+            },
             {
                 name = "Size",
                 kind = "Struct",
@@ -48,7 +68,12 @@ document_symbols = [
                 at = "[[nodiscard]] int ⟦scale⟧(int value) {",
                 range = "⟦[[nodiscard]] int scale(int value) { … }⟧ (4 lines)",
                 children = [
-                    { name = "doubled", kind = "Variable", at = "int ⟦doubled⟧ = value * LIMIT;", range = "⟦int doubled = value * LIMIT⟧;" },
+                    {
+                        name = "doubled",
+                        kind = "Variable",
+                        at = "int ⟦doubled⟧ = value * LIMIT;",
+                        range = "⟦int doubled = value * LIMIT⟧;",
+                    },
                 ],
             },
         ],
@@ -58,7 +83,12 @@ document_symbols = [
 [outline.ast]
 document_symbols = [
     { name = "LIMIT", kind = "Constant", at = "#define ⟦LIMIT⟧ 8", range = "#define ⟦LIMIT 8⟧" },
-    { name = "FIELDS", kind = "Constant", at = "#define ⟦FIELDS⟧ int generated_a; int generated_b;", range = "#define ⟦FIELDS int generated_a; int generated_b;⟧" },
+    {
+        name = "FIELDS",
+        kind = "Constant",
+        at = "#define ⟦FIELDS⟧ int generated_a; int generated_b;",
+        range = "#define ⟦FIELDS int generated_a; int generated_b;⟧",
+    },
     {
         name = "app",
         kind = "Namespace",
@@ -84,11 +114,26 @@ document_symbols = [
                             { name = "generated_b", kind = "Field", at = "⟦FIELDS⟧", range = "⟦FIELDS⟧" },
                         ],
                     },
-                    { name = "convert", kind = "Method", at = "U ⟦convert⟧() const;", range = "⟦template <typename U> … U convert() const⟧ (2 lines)" },
+                    {
+                        name = "convert",
+                        kind = "Method",
+                        at = "U ⟦convert⟧() const;",
+                        range = "⟦template <typename U> … U convert() const⟧ (2 lines)",
+                    },
                 ],
             },
-            { name = "Box<T>::convert", kind = "Method", at = "U Box<T>::⟦convert⟧() const {", range = "⟦template <typename T> … }⟧ (5 lines)" },
-            { name = "Box<int>", kind = "Struct", at = "template struct ⟦Box⟧<int>;", range = "⟦template struct Box<int>⟧;" },
+            {
+                name = "Box<T>::convert",
+                kind = "Method",
+                at = "U Box<T>::⟦convert⟧() const {",
+                range = "⟦template <typename T> … }⟧ (5 lines)",
+            },
+            {
+                name = "Box<int>",
+                kind = "Struct",
+                at = "template struct ⟦Box⟧<int>;",
+                range = "⟦template struct Box<int>⟧;",
+            },
             {
                 name = "Size",
                 kind = "Struct",
@@ -105,7 +150,12 @@ document_symbols = [
                 at = "[[nodiscard]] int ⟦scale⟧(int value) {",
                 range = "⟦[[nodiscard]] int scale(int value) { … }⟧ (4 lines)",
                 children = [
-                    { name = "doubled", kind = "Variable", at = "int ⟦doubled⟧ = value * LIMIT;", range = "⟦int doubled = value * LIMIT⟧;" },
+                    {
+                        name = "doubled",
+                        kind = "Variable",
+                        at = "int ⟦doubled⟧ = value * LIMIT;",
+                        range = "⟦int doubled = value * LIMIT⟧;",
+                    },
                 ],
             },
         ],

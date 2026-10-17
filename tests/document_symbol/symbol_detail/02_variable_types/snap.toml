@@ -6,7 +6,12 @@ document_symbols = [
         at = "namespace ⟦detail⟧ {",
         children = [
             { name = "timeout", kind = "Variable", at = "int ⟦timeout⟧ = 30;", detail = "int" },
-            { name = "logger_name", kind = "Variable", at = 'const char* ⟦logger_name⟧ = "core";', detail = "const char *" },
+            {
+                name = "logger_name",
+                kind = "Variable",
+                at = 'const char* ⟦logger_name⟧ = "core";',
+                detail = "const char *",
+            },
             {
                 name = "Config",
                 kind = "Struct",
@@ -17,7 +22,12 @@ document_symbols = [
                     { name = "backoff", kind = "Field", at = "double ⟦backoff⟧;", detail = "double" },
                 ],
             },
-            { name = "on_error", kind = "Variable", at = "auto ⟦on_error⟧ = [](int code) {", detail = "bool (int code)" },
+            {
+                name = "on_error",
+                kind = "Variable",
+                at = "auto ⟦on_error⟧ = [](int code) {",
+                detail = "bool (int code)",
+            },
         ],
     },
 ]
@@ -31,7 +41,12 @@ document_symbols = [
         range = "⟦namespace detail { … }⟧ (15 lines)",
         children = [
             { name = "timeout", kind = "Variable", at = "int ⟦timeout⟧ = 30;", range = "⟦int timeout = 30⟧;" },
-            { name = "logger_name", kind = "Variable", at = 'const char* ⟦logger_name⟧ = "core";', range = '⟦const char* logger_name = "core"⟧;' },
+            {
+                name = "logger_name",
+                kind = "Variable",
+                at = 'const char* ⟦logger_name⟧ = "core";',
+                range = '⟦const char* logger_name = "core"⟧;',
+            },
             {
                 name = "Config",
                 kind = "Struct",
@@ -42,7 +57,12 @@ document_symbols = [
                     { name = "backoff", kind = "Field", at = "double ⟦backoff⟧;", range = "⟦double backoff⟧;" },
                 ],
             },
-            { name = "on_error", kind = "Variable", at = "auto ⟦on_error⟧ = [](int code) {", range = "⟦auto on_error = [](int code) { … }⟧ (3 lines)" },
+            {
+                name = "on_error",
+                kind = "Variable",
+                at = "auto ⟦on_error⟧ = [](int code) {",
+                range = "⟦auto on_error = [](int code) { … }⟧ (3 lines)",
+            },
         ],
     },
 ]

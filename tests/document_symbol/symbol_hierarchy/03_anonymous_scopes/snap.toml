@@ -43,7 +43,12 @@ document_symbols = [
                         at = "⟦struct⟧ {",
                         detail = "struct",
                         children = [
-                            { name = "anonymous_member", kind = "Field", at = "int ⟦anonymous_member⟧;", detail = "int" },
+                            {
+                                name = "anonymous_member",
+                                kind = "Field",
+                                at = "int ⟦anonymous_member⟧;",
+                                detail = "int",
+                            },
                         ],
                     },
                     {
@@ -70,7 +75,12 @@ document_symbols = [
         at = "namespace ⟦{⟧",
         range = "⟦namespace { … }⟧ (5 lines)",
         children = [
-            { name = "hidden_counter", kind = "Variable", at = "int ⟦hidden_counter⟧ = 0;", range = "⟦int hidden_counter = 0⟧;" },
+            {
+                name = "hidden_counter",
+                kind = "Variable",
+                at = "int ⟦hidden_counter⟧ = 0;",
+                range = "⟦int hidden_counter = 0⟧;",
+            },
         ],
     },
     {
@@ -110,7 +120,12 @@ document_symbols = [
                         at = "⟦struct⟧ {",
                         range = "⟦struct { … }⟧ (3 lines)",
                         children = [
-                            { name = "anonymous_member", kind = "Field", at = "int ⟦anonymous_member⟧;", range = "⟦int anonymous_member⟧;" },
+                            {
+                                name = "anonymous_member",
+                                kind = "Field",
+                                at = "int ⟦anonymous_member⟧;",
+                                range = "⟦int anonymous_member⟧;",
+                            },
                         ],
                     },
                     {
@@ -120,7 +135,12 @@ document_symbols = [
                         range = "⟦union { … }⟧ (4 lines)",
                         children = [
                             { name = "as_int", kind = "Field", at = "int ⟦as_int⟧;", range = "⟦int as_int⟧;" },
-                            { name = "as_float", kind = "Field", at = "float ⟦as_float⟧;", range = "⟦float as_float⟧;" },
+                            {
+                                name = "as_float",
+                                kind = "Field",
+                                at = "float ⟦as_float⟧;",
+                                range = "⟦float as_float⟧;",
+                            },
                         ],
                     },
                 ],

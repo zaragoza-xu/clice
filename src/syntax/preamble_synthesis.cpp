@@ -143,26 +143,6 @@ static std::optional<TopLevel> last_top_level(llvm::StringRef content, std::uint
     };
 }
 
-/// Whether the text guards itself with `#pragma once`: the compile enters
-/// it once, so its other includes find it skipped.
-static bool pragma_once(llvm::StringRef content) {
-    Lexer lexer(content);
-    for(auto token = lexer.advance(); !token.is_eof(); token = lexer.advance()) {
-        if(!token.is_directive_hash()) {
-            continue;
-        }
-        auto keyword = lexer.advance();
-        if(keyword.is_eod() || keyword.text(content) != "pragma") {
-            continue;
-        }
-        auto name = lexer.advance();
-        if(!name.is_eod() && name.text(content) == "once") {
-            return true;
-        }
-    }
-    return false;
-}
-
 /// Append a #line marker for line `line` (1-based) of `path`.
 static void append_line_marker(std::string& out, llvm::StringRef path, std::uint32_t line) {
     out += "#line ";
@@ -282,7 +262,7 @@ std::optional<SynthesizedContext>
                        std::optional<llvm::StringRef> target_content) {
     SynthesizedContext context;
     std::string snapshot_path;
-    if(target_content && !pragma_once(*target_content)) {
+    if(target_content && !pragma_once(*target_content, target_content->size())) {
         snapshot_path =
             synthesized_path(llvm::sys::path::parent_path(target_path), *target_content);
     }

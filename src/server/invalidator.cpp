@@ -12,11 +12,10 @@ namespace clice {
 Invalidator::Invalidator(Project& project,
                          const SessionStore& store,
                          const EditorContext& contexts,
-                         const ASTProjectionTable& projections,
+                         const ASTFamily& ast,
                          PCMFamily& pcm,
                          const IndexStore& index) :
-    project(project), store(store), contexts(contexts), projections(projections), pcm(pcm),
-    index(index) {}
+    project(project), store(store), contexts(contexts), ast(ast), pcm(pcm), index(index) {}
 
 llvm::SmallVector<FileEvent> take_disk_events(FileTable& files) {
     llvm::SmallVector<FileEvent> events;
@@ -69,12 +68,29 @@ llvm::SmallVector<Fid> Invalidator::readers(Fid path_id) const {
             }
         }
     }
+    auto names = [&](const DepsSnapshot& deps) {
+        return llvm::any_of(deps, [&](const DepState& dep) { return dep.path_id == path_id; });
+    };
     for(auto document: llvm::make_first_range(store.sessions)) {
-        if(projections.read(document, path_id, project.pch_cache)) {
+        bool read = false;
+        ast.each_input(document, [&](const DepsSnapshot& deps) { read = read || names(deps); });
+        if(read) {
             add(document);
         }
     }
+    for(auto& [unit, build]: project.pcm_builds) {
+        if(names(build.deps)) {
+            add(unit);
+        }
+    }
     return result;
+}
+
+void Invalidator::mark_readers(llvm::ArrayRef<Fid> readers, DirtySet& dirty) {
+    for(auto reader: readers) {
+        cascade_compile_graph(reader, dirty);
+        mark_dependent(reader, dirty);
+    }
 }
 
 void Invalidator::cascade_compile_graph(Fid path_id, DirtySet& dirty) {
@@ -110,8 +126,7 @@ void Invalidator::provider_appeared(llvm::StringRef module_name, DirtySet& dirty
                 }
             }
         } else {
-            // A dirtied module unit: the family already dropped its
-            // cached PCM state; its importers are in this same list.
+            // A dirtied module unit: its importers are in this same list.
             mark_dependent(path_id, dirty);
         }
     }
@@ -129,8 +144,11 @@ void Invalidator::rescan_disk_state(Fid path_id, DirtySet& dirty) {
     // name its first provider: consumers that scanned it unresolved hold
     // edges to its sentinel, not to any real node a module-graph cascade
     // could reach.
-    if(!new_module.empty() && project.dep_graph.lookup_module(new_module).size() == 1) {
-        provider_appeared(new_module, dirty);
+    if(!new_module.empty()) {
+        if(project.dep_graph.lookup_module(new_module).size() == 1) {
+            provider_appeared(new_module, dirty);
+        }
+        cascade_providers(new_module, path_id, dirty);
     }
 
     // The dropped name's consumers hold edges to this provider's real
@@ -139,6 +157,15 @@ void Invalidator::rescan_disk_state(Fid path_id, DirtySet& dirty) {
     // no cache entry for its staleness check to see.
     if(!old_module.empty()) {
         cascade_compile_graph(path_id, dirty);
+        cascade_providers(old_module, path_id, dirty);
+    }
+}
+
+void Invalidator::cascade_providers(llvm::StringRef module_name, Fid except, DirtySet& dirty) {
+    for(auto provider: llvm::to_vector(project.dep_graph.lookup_module(module_name))) {
+        if(provider != except) {
+            cascade_compile_graph(provider, dirty);
+        }
     }
 }
 
@@ -167,30 +194,15 @@ void Invalidator::cascade_disk_content_change(Fid path_id, DirtySet& dirty) {
     // the cascade names every affected module unit.
     rescan_disk_state(path_id, dirty);
     cascade_compile_graph(path_id, dirty);
-    // Module units whose PCM read the file (a header in a global module
-    // fragment): the artifact's own record names them, the module graph
-    // knows only imports.
-    llvm::SmallVector<Fid> pcm_readers;
-    for(auto& [unit, state]: project.pcm_cache) {
-        if(unit != path_id &&
-           llvm::any_of(state.deps, [&](const DepState& dep) { return dep.path_id == path_id; })) {
-            pcm_readers.push_back(unit);
-        }
-    }
-    for(auto unit: pcm_readers) {
-        cascade_compile_graph(unit, dirty);
-    }
 
-    // The new content is a compile input of every TU that transitively
-    // includes it: open dependents recompile, closed ones reindex so
-    // cross-file references stop serving the stale state. Enqueueing is
+    // The new content is an input of every unit that read it: open ones
+    // recompile, closed ones reindex so cross-file references stop serving
+    // the stale state, module units check their PCM again. Enqueueing is
     // O(1) per TU and deliberately uncapped — the index's content-hash
     // staleness check filters TUs whose dependencies did not actually
     // change, and the idle/priority scheduling throttles the rest.
     // TODO: observe on large projects before adding debouncing.
-    for(auto root: dependents) {
-        mark_dependent(root, dirty);
-    }
+    mark_readers(dependents, dirty);
 
     // Headers whose resolved context was derived from the file through its
     // include chain resolve it again: the synthesized context copies the
@@ -251,12 +263,13 @@ DirtySet Invalidator::apply(llvm::ArrayRef<FileEvent> events) {
                 // ones recompile (the missing-file diagnostic is the truth),
                 // closed ones reindex — nothing else would ever queue them.
                 // Snapshot before the scrub below rewrites the graph.
-                for(auto root: readers(path_id)) {
-                    mark_dependent(root, dirty);
-                }
+                mark_readers(readers(path_id), dirty);
                 // A removed module unit takes its PCM with it: importers'
                 // build products went stale.
                 cascade_compile_graph(path_id, dirty);
+                cascade_providers(std::string(project.dep_graph.module_of(path_id)),
+                                  path_id,
+                                  dirty);
                 // Any reindex reason recorded before the removal — e.g. a
                 // DiskChanged observed moments earlier — is dropped: there
                 // is nothing to reindex any more, and the file's shard stays
@@ -295,10 +308,10 @@ DirtySet Invalidator::apply(llvm::ArrayRef<FileEvent> events) {
                 // sentinel's dependents are the TUs that scanned it
                 // unresolved — the delta walk below cannot reach them
                 // (they hold no edge to any real node). A name whose
-                // selection moved to another provider: importers hold
-                // edges to the old selected node, and when its own entry
-                // is unchanged the delta walk cannot reach them either —
-                // cascade from that node so their next rounds re-resolve.
+                // providers changed: importers hold edges to the ones they
+                // picked, and when those entries are unchanged the delta
+                // walk cannot reach them either — cascade from them so
+                // their next rounds pick again.
                 for(auto& name: providers.appeared) {
                     provider_appeared(name, dirty);
                 }

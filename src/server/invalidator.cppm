@@ -7,7 +7,7 @@ module clice:server.invalidator;
 import :project.index_store;
 import :project.project;
 import :sched.families.pcm;
-import :server.ast_projection;
+import :server.ast_family;
 import :server.editor_context;
 import :server.session_store;
 
@@ -198,8 +198,9 @@ public:
 /// derived-state invalidation.
 ///
 /// Ownership charter:
-///   - reads the session store, the editor context and the index store's
-///     recorded header hosts, never mutates them;
+///   - reads the session store, the editor context, the AST family's
+///     record of what open documents read and the index store's recorded
+///     header hosts, never mutates them;
 ///   - directly updates the derived graphs Project owns (include graph,
 ///     module map, ...);
 ///   - anything touching Sessions, context-domain state (header results, choices,
@@ -222,18 +223,21 @@ public:
     Invalidator(Project& project,
                 const SessionStore& store,
                 const EditorContext& contexts,
-                const ASTProjectionTable& projections,
+                const ASTFamily& ast,
                 PCMFamily& pcm,
                 const IndexStore& index);
 
     /// Fold a batch of events into one deduplicated effect set.
     DirtySet apply(llvm::ArrayRef<FileEvent> events);
 
-    /// The root TUs and open documents whose compiles depend on the file:
-    /// the ones the lexical scan sees including it, and the ones whose
-    /// compiles read it, imported a module built from it, or looked for it
-    /// — the scan cannot resolve a macro include, never follows an import,
-    /// and never sees a file before it exists.
+    /// Every unit whose compile or build depends on the file — the single
+    /// answer to "who read this": the root TUs the lexical scan sees
+    /// including it, the TUs whose index records reading, looking for or
+    /// importing a module built from it, the open documents whose inputs
+    /// (ASTFamily::each_input) name it, and the module units whose last
+    /// PCM build read it, failed builds included — the scan cannot resolve
+    /// a macro include, never follows an import, and never sees a file
+    /// before it exists.
     llvm::SmallVector<Fid> readers(Fid path_id) const;
 
 private:
@@ -248,14 +252,23 @@ private:
     /// open (recompile) and closed (reindex).
     void cascade_disk_content_change(Fid path_id, DirtySet& dirty);
 
-    /// Cascade a module unit's compile-graph invalidation (PCM caches,
-    /// dependent module units), splitting dirtied units open/closed.
+    /// Cascade a module unit's compile-graph invalidation (its PCM and the
+    /// units importing it), splitting dirtied units open/closed.
     void cascade_compile_graph(Fid path_id, DirtySet& dirty);
+
+    /// Treat every reader of a file that changed or vanished: open ones
+    /// recompile, closed ones reindex, module units check their PCM again
+    /// (which voids a build in flight).
+    void mark_readers(llvm::ArrayRef<Fid> readers, DirtySet& dirty);
 
     /// A module name just gained its first provider: cascade through its
     /// sentinel node and route the dirtied consumers to recompiles and
     /// ContentChanged reindexes.
     void provider_appeared(llvm::StringRef module_name, DirtySet& dirty);
+
+    /// The providers of `module_name` but `except` changed: the importers
+    /// of every other one choose among them again.
+    void cascade_providers(llvm::StringRef module_name, Fid except, DirtySet& dirty);
 
     /// See the definition: the open/closed/index-only split of a
     /// dependency invalidation.
@@ -264,7 +277,7 @@ private:
     Project& project;
     const SessionStore& store;
     const EditorContext& contexts;
-    const ASTProjectionTable& projections;
+    const ASTFamily& ast;
     PCMFamily& pcm;
     const IndexStore& index;
 };

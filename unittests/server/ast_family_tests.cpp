@@ -485,7 +485,9 @@ ZEST_CASE(BufferImportBuildsPCM) {
     ZEXPECT(stack.ast.projections.current(session->path_id));
     auto mod_ids = stack.project.dep_graph.lookup_module("m");
     ZASSERT(!mod_ids.empty());
-    ZEXPECT(stack.project.pcm_cache.contains(mod_ids[0]));
+    auto build = stack.project.pcm_builds.find(mod_ids[0]);
+    ZASSERT(build != stack.project.pcm_builds.end());
+    ZEXPECT(!build->second.path.empty());
 }
 
 ZEST_CASE(DiamondDepsDeduplicated) {
@@ -544,8 +546,8 @@ ZEST_CASE(DiamondDepsDeduplicated) {
 
     auto top = stack.project.dep_graph.lookup_module("top");
     ZASSERT(!top.empty());
-    auto entry = stack.project.pcm_cache.find(top[0]);
-    ZASSERT(entry != stack.project.pcm_cache.end());
+    auto entry = stack.project.pcm_builds.find(top[0]);
+    ZASSERT(entry != stack.project.pcm_builds.end());
     auto base = stack.project.file_table.intern(Spelling::absolute(tmp.path("base.cppm")));
     auto& deps = entry->second.deps;
     ZEXPECT(llvm::count_if(deps, [&](const DepState& dep) { return dep.path_id == base; }) == 1);

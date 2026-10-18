@@ -446,6 +446,11 @@ namespace {
 template <typename TemplateDeclTy>
 clang::NamedDecl* only_instantiation_impl(TemplateDeclTy* TD) {
     clang::NamedDecl* Only = nullptr;
+    // A call whose body fails to instantiate for it, as a generic lambda's
+    // deduced return type makes it, leaves its specialization invalid and
+    // unreferenced: the instantiation only when no call succeeds.
+    clang::NamedDecl* Failed = nullptr;
+    bool failed_more = false;
     for(auto* Spec: TD->specializations()) {
         if(Spec->getTemplateSpecializationKind() == clang::TSK_ExplicitSpecialization)
             continue;
@@ -453,8 +458,13 @@ clang::NamedDecl* only_instantiation_impl(TemplateDeclTy* TD) {
         // it deduces; only the one a call picks is referenced.
         if constexpr(std::is_same_v<TemplateDeclTy, clang::FunctionTemplateDecl>) {
             if(Spec->getTemplateSpecializationKind() == clang::TSK_ImplicitInstantiation &&
-               !Spec->isReferenced())
+               !Spec->isReferenced()) {
+                if(Spec->isInvalidDecl()) {
+                    failed_more |= Failed != nullptr;
+                    Failed = Spec;
+                }
                 continue;
+            }
         }
         // A class template specialization the code only names, through a
         // pointer to it, is not instantiated; one a partial specialization
@@ -469,7 +479,7 @@ clang::NamedDecl* only_instantiation_impl(TemplateDeclTy* TD) {
             return nullptr;
         Only = Spec;
     }
-    return Only;
+    return Only != nullptr || failed_more ? Only : Failed;
 }
 
 }  // namespace

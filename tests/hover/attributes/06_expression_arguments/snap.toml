@@ -1,0 +1,22 @@
+[answers.call.hover]
+markdown = '''
+**function** `unlock`
+
+```cpp
+void unlock(int rq) releases(lockp(rq))
+```
+
+`releases(lockp(rq))` is `__attribute__((release_capability(lockp(rq))))`
+'''
+range = "⟦unlock⟧(1);"
+
+[answers.declared_by_macro.hover]
+markdown = '''
+**function** `unlock_all`
+
+```cpp
+__attribute__((release_capability(lockp(rq))))
+void unlock_all(int rq)
+```
+'''
+range = "⟦unlock_all⟧(1);"

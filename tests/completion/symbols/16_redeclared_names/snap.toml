@@ -1,0 +1,29 @@
+[answers.friend_declared.completion]
+items = [
+    { label = "span<typename Tp>", kind = "Class" },
+]
+
+[answers.typedef_named.completion]
+items = [
+    { label = "attr", kind = "TypeParameter" },
+]
+
+[answers.redeclared_function.completion]
+items = [
+    { label = "reset(int level = 0)", kind = "Function", detail = "void" },
+]
+
+[answers.default_added_later.completion]
+items = [
+    { label = "Later<>", kind = "Class" },
+]
+
+[answers.enum_keyword.completion]
+items = [
+    { label = "Color", kind = "Enum" },
+]
+
+[answers.c_enum_keyword.completion]
+items = [
+    { label = "Color", kind = "Enum" },
+]

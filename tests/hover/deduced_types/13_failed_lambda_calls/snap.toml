@@ -1,0 +1,21 @@
+[answers.parameter.hover]
+markdown = '''
+**parameter** `e` · lambda in function `payroll`
+
+```cpp
+auto &e
+```
+Type: `Employee &`
+'''
+range = "auto pay = [](auto& ⟦e⟧) { @+0"
+
+[answers.only_failed.hover]
+markdown = '''
+**parameter** `e` · lambda in function `failed`
+
+```cpp
+auto &e
+```
+Type: `int &`
+'''
+range = "auto pay = [](auto& ⟦e⟧) { @+0"

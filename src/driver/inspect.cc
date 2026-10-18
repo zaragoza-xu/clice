@@ -2713,6 +2713,10 @@ int run_inspect(const InspectOptions& opts, const FeatureSpec& spec) {
     }
 
     auto name = path::filename(file.path).str();
+    if(is_other_language_path(file.path)) {
+        LOG_ERROR("{}: not a C-family source file", name);
+        return 1;
+    }
     auto buffer = vfs::read(file.path);
     if(!buffer) {
         LOG_ERROR("cannot read {}: {}", abs_path, buffer.error().message());

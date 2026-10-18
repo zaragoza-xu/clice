@@ -127,6 +127,123 @@ bool rarely_accessed(const clang::NamedDecl* decl) {
            kind == clang::DeclarationName::CXXConversionFunctionName;
 }
 
+/// The declaration an item shows of what Sema offers, whichever of its
+/// declarations Sema met first, but never a friend's, which names the
+/// parameters for itself and gives them no defaults: the newest one, with
+/// the prototype and the defaults of those before it; a variable's first
+/// one, as its later one is its out-of-line definition, its type spelled
+/// through its class. Under a preamble's PCH, the friend an instantiation
+/// of another class template declared before the class itself is the
+/// first declaration of the class template.
+const clang::NamedDecl* shown_declaration(const clang::NamedDecl* decl) {
+    bool first = llvm::isa<clang::VarDecl, clang::VarTemplateDecl>(decl);
+    const clang::Decl* shown = decl;
+    for(const clang::Decl* each = decl->getMostRecentDecl(); each; each = each->getPreviousDecl()) {
+        if(each->getFriendObjectKind() == clang::Decl::FOK_None) {
+            shown = each;
+            if(!first) {
+                break;
+            }
+        }
+    }
+    return llvm::cast<clang::NamedDecl>(shown);
+}
+
+/// The completion string Sema builds for a class template, with the
+/// template parameters of `pattern`: Sema reads them from the first
+/// declaration, whichever it is.
+const clang::CodeCompletionString&
+    class_template_string(clang::CodeCompletionBuilder& builder,
+                          const clang::CodeCompletionResult& candidate,
+                          const clang::ClassTemplateDecl& pattern,
+                          clang::Sema& sema) {
+    auto policy = sema.getPrintingPolicy();
+    policy.AnonymousTagNameStyle =
+        llvm::to_underlying(clang::PrintingPolicy::AnonymousTagMode::Plain);
+    policy.SuppressStrongLifetime = true;
+    policy.SuppressUnwrittenScope = true;
+    policy.CleanUglifiedParameters = true;
+    auto copy = [&](llvm::StringRef text) {
+        return builder.getAllocator().CopyString(text);
+    };
+    if(candidate.Qualifier) {
+        std::string qualifier;
+        llvm::raw_string_ostream stream(qualifier);
+        candidate.Qualifier.print(stream, policy);
+        if(candidate.QualifierIsInformative) {
+            builder.AddInformativeChunk(copy(qualifier));
+        } else {
+            builder.AddTextChunk(copy(qualifier));
+        }
+    }
+    builder.AddTypedTextChunk(copy(pattern.getName()));
+    builder.AddChunk(clang::CodeCompletionString::CK_LeftAngle);
+    // The parameters from the first with a default on are optional: no
+    // part of the item shows them.
+    bool first = true;
+    for(const auto* param: *pattern.getTemplateParameters()) {
+        std::string placeholder;
+        auto named = [&](const clang::IdentifierInfo* name) {
+            if(name) {
+                placeholder += ' ';
+                placeholder += name->deuglifiedName();
+            }
+        };
+        if(const auto* type = llvm::dyn_cast<clang::TemplateTypeParmDecl>(param)) {
+            if(type->hasDefaultArgument()) {
+                break;
+            }
+            if(type->wasDeclaredWithTypename()) {
+                placeholder = "typename";
+            } else if(const auto* constraint = type->getTypeConstraint()) {
+                llvm::raw_string_ostream stream(placeholder);
+                constraint->print(stream, policy);
+            } else {
+                placeholder = "class";
+            }
+            named(type->getIdentifier());
+        } else if(const auto* value = llvm::dyn_cast<clang::NonTypeTemplateParmDecl>(param)) {
+            if(value->hasDefaultArgument()) {
+                break;
+            }
+            if(const auto* name = value->getIdentifier()) {
+                placeholder = name->deuglifiedName();
+            }
+            value->getType().getAsStringInternal(placeholder, policy);
+        } else {
+            const auto* nested = llvm::cast<clang::TemplateTemplateParmDecl>(param);
+            if(nested->hasDefaultArgument()) {
+                break;
+            }
+            placeholder = "template<...> class";
+            named(nested->getIdentifier());
+        }
+        if(!first) {
+            builder.AddChunk(clang::CodeCompletionString::CK_Comma);
+        }
+        first = false;
+        builder.AddPlaceholderChunk(copy(placeholder));
+    }
+    builder.AddChunk(clang::CodeCompletionString::CK_RightAngle);
+    return *builder.TakeString();
+}
+
+/// Whether a typedef of the tag's own name in its scope names it, as C
+/// headers write `typedef union attr attr;`: where names of both kinds
+/// complete, Sema offers the tag only when it meets the tag before the
+/// typedef, and the typedef either way.
+bool named_by_typedef(const clang::TagDecl* tag) {
+    const auto* scope = tag->getDeclContext()->getRedeclContext();
+    if(!tag->getDeclName() || !scope->isFileContext()) {
+        return false;
+    }
+    return llvm::any_of(scope->lookup(tag->getDeclName()), [&](const clang::NamedDecl* found) {
+        const auto* alias = llvm::dyn_cast<clang::TypedefNameDecl>(found);
+        const auto* named = alias ? alias->getUnderlyingType()->getAsTagDecl() : nullptr;
+        return named && named->getCanonicalDecl() == tag->getCanonicalDecl();
+    });
+}
+
 /// The place of each field a designator in an initializer of `record`
 /// names, in declaration order; a field of an anonymous member by its own
 /// name.
@@ -1611,8 +1728,18 @@ public:
         };
 
         llvm::DenseSet<const clang::Decl*> offered;
+        /// After `struct`, `union` or `enum`, where Sema offers only tags.
+        bool tags_only = llvm::is_contained({clang::CodeCompletionContext::CCC_ClassOrStructTag,
+                                             clang::CodeCompletionContext::CCC_UnionTag,
+                                             clang::CodeCompletionContext::CCC_EnumTag},
+                                            context.getKind());
         /// `relevance` scales what the context makes of the candidate.
         auto add_declaration = [&](clang::CodeCompletionResult& candidate, float relevance) {
+            if(auto* tag = llvm::dyn_cast<clang::TagDecl>(candidate.Declaration);
+               tag && !tags_only && named_by_typedef(tag)) {
+                return;
+            }
+            candidate.Declaration = shown_declaration(candidate.Declaration);
             auto* declaration = candidate.Declaration;
             offered.insert(declaration->getCanonicalDecl());
             auto name = display::name_of(declaration,
@@ -1691,11 +1818,15 @@ public:
                 item.bundle = item.label;
             }
 
-            auto& ccs = *candidate.CreateCodeCompletionString(sema,
-                                                              context,
-                                                              getAllocator(),
-                                                              getCodeCompletionTUInfo(),
-                                                              /*IncludeBriefComments=*/false);
+            clang::CodeCompletionBuilder builder(getAllocator(), getCodeCompletionTUInfo());
+            const auto* pattern = llvm::dyn_cast<clang::ClassTemplateDecl>(declaration);
+            auto& ccs = pattern && !candidate.StartsNestedNameSpecifier
+                            ? class_template_string(builder, candidate, *pattern, sema)
+                            : *candidate.CreateCodeCompletionString(sema,
+                                                                    context,
+                                                                    getAllocator(),
+                                                                    getCodeCompletionTUInfo(),
+                                                                    /*IncludeBriefComments=*/false);
             // Clang gives a variable holding a lambda the signature of its
             // call operator, whose `const` is no part of calling it.
             bool method = llvm::isa_and_present<clang::CXXMethodDecl>(declaration->getAsFunction());

@@ -91,6 +91,41 @@ const clang::FunctionDecl* shown(const clang::FunctionDecl* function) {
     return function;
 }
 
+/// Puts a class's implicit constructors, which Sema ranks alike with the
+/// declared ones for a call with no argument written yet, after those, in
+/// the order Sema declares them: Sema leaves them where its lookup found
+/// them, which depends on when something first needed one, in a
+/// preamble's PCH or later in the file. Constructor templates, which Sema
+/// ranks after both, stay last.
+void place_implicit(
+    llvm::MutableArrayRef<clang::CodeCompleteConsumer::OverloadCandidate> candidates) {
+    auto implicit = [](const clang::CodeCompleteConsumer::OverloadCandidate& candidate) {
+        const auto* function = candidate.getFunction();
+        return function && function->isImplicit() && llvm::isa<clang::CXXConstructorDecl>(function);
+    };
+    if(llvm::none_of(candidates, implicit)) {
+        return;
+    }
+    auto rank = [](const clang::CodeCompleteConsumer::OverloadCandidate& candidate) {
+        const auto* function = candidate.getFunction();
+        if(function &&
+           (function->getPrimaryTemplate() || function->getDescribedFunctionTemplate())) {
+            return 4;
+        }
+        const auto* constructor = llvm::dyn_cast_or_null<clang::CXXConstructorDecl>(function);
+        if(!constructor || !constructor->isImplicit()) {
+            return 0;
+        }
+        return constructor->isDefaultConstructor() ? 1
+               : constructor->isCopyConstructor()  ? 2
+               : constructor->isMoveConstructor()  ? 3
+                                                   : 0;
+    };
+    llvm::stable_sort(candidates, [&](const auto& left, const auto& right) {
+        return rank(left) < rank(right);
+    });
+}
+
 /// The parameters an instantiation expanded from a pack of the
 /// declaration it was instantiated from, as indices [begin, end): each
 /// is named after the pack, which names none of them. A member template
@@ -200,6 +235,9 @@ public:
         policy = display::printing_policy(*context, options);
 
         bool ranked = object_written(sema, open_paren);
+        if(current_arg == 0) {
+            place_implicit({candidates, candidate_count});
+        }
         llvm::SmallVector<const clang::FunctionDecl*> listed;
         for(auto& candidate: llvm::make_range(candidates, candidates + candidate_count)) {
             if(auto* function = candidate.getFunction()) {

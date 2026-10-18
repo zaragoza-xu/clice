@@ -138,6 +138,11 @@ bool is_header_path(llvm::StringRef path);
 /// a source, preprocessed or a module interface, never a header.
 bool is_source_path(llvm::StringRef path);
 
+/// Whether the extension names a file clang knows that is no C-family
+/// code: an assembler source, preprocessed or not, LLVM IR, a module file,
+/// an object file.
+bool is_other_language_path(llvm::StringRef path);
+
 /// Whether the extension marks a fragment only ever included into a
 /// translation unit — a `.def` list, a `.inc`, `.inl`, `.tpp`, `.ipp`,
 /// `.tcc` or `.txx` body — which compiles only under its includer's
@@ -441,7 +446,7 @@ public:
     /// extension decides (what input_kind() falls back to).
     llvm::StringRef forced_language(ConfigID id) const;
 
-    /// Whether the config's selector forces a language clang compiles.
+    /// Whether the config's selector forces a C-family language (is_c_family_type).
     bool forces_c_family(ConfigID id) const;
 
     /// The precompiled header the config's command writes: its output, when

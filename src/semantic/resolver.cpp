@@ -8,6 +8,7 @@ module clice;
 
 import :semantic.decls;
 import :semantic.resolver;
+import :semantic.types;
 import :semantic.unifier;
 import :support.logging;
 
@@ -1647,6 +1648,41 @@ public:
         });
     }
 
+    /// Whether every one of `arguments` may initialize its parameter of
+    /// `FD`, none certain to fail (never_initializes): both sides
+    /// non-dependent, matched by position up to an argument or a parameter
+    /// pack.
+    bool accepts(const clang::FunctionDecl* FD,
+                 llvm::ArrayRef<const clang::Expr*> arguments,
+                 bool member_call) {
+        if(FD->isInvalidDecl()) {
+            return true;
+        }
+        unsigned offset = 0;
+        if(auto method = llvm::dyn_cast<clang::CXXMethodDecl>(FD);
+           method && method->isExplicitObjectMemberFunction()) {
+            if(!member_call) {
+                return true;
+            }
+            offset = 1;
+        }
+        for(unsigned index = 0; index < arguments.size(); index += 1) {
+            auto argument = arguments[index];
+            if(llvm::isa<clang::PackExpansionExpr>(argument) ||
+               index + offset >= FD->getNumParams()) {
+                break;
+            }
+            auto param = FD->getParamDecl(index + offset);
+            if(param->isParameterPack()) {
+                break;
+            }
+            if(never_initializes(context, *argument, param->getType())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// Overloads that differ only in their object parameter — its cv- and
     /// ref-qualifiers, `front()` and `front() const`, `value() &` and
     /// `value() &&` — are told apart by the object, an lvalue unless
@@ -1721,11 +1757,12 @@ public:
     /// A call's candidate set: the callee clang resolved itself (a call
     /// that is only value-dependent, a member of the current
     /// instantiation), else the resolved overload set filtered down to
-    /// overloads whose parameter list can accept the call's argument count,
-    /// and for a member call those its object can bind best. Full overload
-    /// resolution needs conversion rules (Sema territory); arity and the
-    /// object's qualifiers are the safe, conversion-free subset of it. The
-    /// frames of the lookup that found the set stay on the stack.
+    /// overloads whose parameter list can accept the call's argument count
+    /// and whose parameters its arguments can initialize, and for a member
+    /// call those its object can bind best. Only what certainly fails is
+    /// dropped: ranking the rest is full overload resolution (Sema
+    /// territory). The frames of the lookup that found the set stay on the
+    /// stack.
     llvm::SmallVector<const clang::NamedDecl*, 4> call_candidates(const clang::CallExpr* expr) {
         if(auto* callee = llvm::dyn_cast_or_null<clang::NamedDecl>(expr->getCalleeDecl())) {
             return {callee};
@@ -1733,10 +1770,12 @@ public:
         if(llvm::isa<clang::CXXOperatorCallExpr>(expr)) {
             return {};
         }
-        bool pack = expands_pack({expr->getArgs(), expr->getNumArgs()});
+        llvm::ArrayRef<const clang::Expr*> arguments(expr->getArgs(), expr->getNumArgs());
+        bool pack = expands_pack(arguments);
         return callee_candidates(expr->getCallee(),
                                  [&](const clang::FunctionDecl* FD, bool member) {
-                                     return pack || arity_viable(FD, expr->getNumArgs(), member);
+                                     return (pack || arity_viable(FD, arguments.size(), member)) &&
+                                            accepts(FD, arguments, member);
                                  });
     }
 

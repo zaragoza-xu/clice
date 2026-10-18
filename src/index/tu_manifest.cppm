@@ -2,10 +2,10 @@ module;
 
 #include "modules/prelude.h"
 
-module clice:index.manifest;
+module clice:index.tu_manifest;
 
-import :index.include_tree;
-import :index.serialization;
+import :index.format;
+import :index.symbol;
 import :vfs.file_table;
 
 namespace clice::index {
@@ -22,16 +22,16 @@ struct IncludeEdge {
 /// resolve in, and the ones declaring it behind the precompiled header or a
 /// module. No project-wide table lists such a symbol: this is how a query
 /// reaches its entries in files other than the one it started from.
-struct LocalFanout {
+struct SharedLocal {
     std::uint64_t symbol = 0;
     std::vector<VersionID> files;
 
-    friend bool operator==(const LocalFanout&, const LocalFanout&) = default;
+    friend bool operator==(const SharedLocal&, const SharedLocal&) = default;
 };
 
 /// The instantiation resolutions a TU uses in one file — the ones it walked
 /// and the ones the known keys it skipped there stand for — by the identity
-/// of their set (index::use_identity), which the file's instantiation blob
+/// of their set (index::use_hash), which the file's instantiation blob
 /// stores.
 struct InstantiationUse {
     VersionID file;
@@ -48,20 +48,20 @@ struct InstantiationUse {
 /// touching any shard. In memory its versions are the file table's ids;
 /// persisted, the index's own (ProjectIndex::export_manifest).
 struct TUManifest {
-    /// ProjectIndex::global_generation recorded by the save that persisted
-    /// this manifest. The global blob pins the generation it expects per TU and
+    /// ProjectIndex::table_generation recorded by the save that persisted
+    /// this manifest. The project table pins the generation it expects per TU and
     /// the loader adopts a manifest only on an exact match: a manifest
-    /// that outran a lost global write would otherwise serve against a
+    /// that outran a lost project table write would otherwise serve against a
     /// symbol table that never learned its symbols, and a manifest whose
     /// own write failed would pass off the previous reindex's dependency
     /// set and variants as current.
-    std::uint64_t global_gen = 0;
+    std::uint64_t table_generation = 0;
 
     /// Milliseconds since epoch, sampled before the indexed build started.
     std::uint64_t built_at = 0;
 
     /// The TU's own file version.
-    VersionID tu_fv;
+    VersionID tu_version;
 
     std::vector<IncludeNode> nodes;
 
@@ -82,7 +82,7 @@ struct TUManifest {
     std::vector<VersionID> imports;
 
     /// Sorted by symbol.
-    std::vector<LocalFanout> local_fanout;
+    std::vector<SharedLocal> shared_locals;
 
     /// One entry per file holding instantiation resolutions the TU uses: what
     /// keeps those resolutions alive.
@@ -97,7 +97,7 @@ void serialize_manifest(const TUManifest& manifest, llvm::raw_ostream& os);
 
 /// Verify and decode a manifest blob; nullopt for corrupt, truncated or
 /// old-format data. FileVersion ids are not resolved here — the loader
-/// drops manifests referencing ids the global table does not know.
+/// drops manifests referencing ids the project table does not know.
 std::optional<TUManifest> deserialize_manifest(llvm::StringRef data);
 
 /// Add the fields of a manifest blob to `bytes`, for `clice index stats`.

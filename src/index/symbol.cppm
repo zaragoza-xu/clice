@@ -6,7 +6,7 @@ module;
 /// builders accumulate them, blob readers hand them out, the project
 /// table stores them.
 
-module clice:index.types;
+module clice:index.symbol;
 
 import :semantic.symbol;
 import :semantic.token_class;
@@ -18,6 +18,50 @@ namespace clice::index {
 using Range = LocalSourceRange;
 using SymbolHash = std::uint64_t;
 
+/// Identity of one variant of a file's index: xxh3_64 over the encoded
+/// single-variant blob bytes the worker produced. Encoding is canonical
+/// and deterministic, so two compilation contexts whose preprocessing of
+/// the file agrees produce byte-identical blobs and share one identity.
+using VariantHash = std::uint64_t;
+
+/// The identity of one resolution — the records one instantiated definition or
+/// macro expansion resolves in one file (resolution_hash).
+using ResolutionHash = std::uint64_t;
+
+/// The identity of the resolutions a TU uses in one file (use_hash). TUs
+/// using the same ones share it, and the file's blob stores them once.
+using UseHash = std::uint64_t;
+
+/// The parent of a node whose directive sits in the TU's own file, and
+/// node_of's answer for a file entered without a directive: the TU root is
+/// not itself a node.
+constexpr inline std::uint32_t no_node = ~0u;
+
+/// One include directive of an include tree: which file it names, in
+/// which file it sits (the parent node's file at `line`), and whether the
+/// preprocessor entered the file there. Multiple entries of one file
+/// (headers without guards) are distinct nodes; so is a directive whose
+/// target was skipped (guarded or `#pragma once`, entered earlier) — an
+/// edge of the document with no file entry behind it. The same nodes
+/// travel in the TU index and persist in the manifest; only `file`
+/// changes meaning at merge: a TU-local path id in the TU index, a
+/// FileVersion id (VersionID::raw) in a manifest.
+struct IncludeNode {
+    std::uint32_t file = 0;
+
+    /// Index of the including node.
+    std::uint32_t parent = no_node;
+
+    /// 1-based line of the include directive in the parent.
+    std::uint32_t line = 0;
+
+    /// The directive did not enter the file: nothing hangs off this node
+    /// and node_of never answers it.
+    bool skipped = false;
+
+    friend bool operator==(const IncludeNode&, const IncludeNode&) = default;
+};
+
 /// Visibility scope of a symbol, determining which level of the multi-level
 /// symbol table stores it.
 enum class SymbolScope : std::uint8_t {
@@ -28,13 +72,13 @@ enum class SymbolScope : std::uint8_t {
     /// Can be referenced across files within one TU but not across TUs
     /// (internal linkage: static, anonymous namespace). Stored in the
     /// shards holding its entries; the TUs that reference it from several
-    /// files list those files (TUManifest::local_fanout).
-    TULocal = 1,
+    /// files list those files (TUManifest::shared_locals).
+    Internal = 1,
     /// Declared inside a function (local variables, parameters, labels,
     /// local classes). Stored in the defining file's Shard blob; one another
     /// file names — through an instantiation, a macro expansion, or a local
-    /// class a function returns — is listed as for TULocal.
-    FileLocal = 2,
+    /// class a function returns — is listed as for Internal.
+    FunctionLocal = 2,
 };
 
 struct Relation {
@@ -47,14 +91,14 @@ struct Relation {
 
     LocalSourceRange range;
 
-    SymbolHash target_symbol;
+    SymbolHash target;
 
-    constexpr void set_definition_range(LocalSourceRange range) {
-        target_symbol = std::bit_cast<SymbolHash>(range);
+    constexpr void set_extent(LocalSourceRange range) {
+        target = std::bit_cast<SymbolHash>(range);
     }
 
-    constexpr auto definition_range() const {
-        return std::bit_cast<LocalSourceRange>(target_symbol);
+    constexpr auto extent() const {
+        return std::bit_cast<LocalSourceRange>(target);
     }
 };
 
@@ -68,7 +112,7 @@ struct Occurrence {
 };
 
 /// One file's index while a build accumulates it; encoded into a shard
-/// blob (index/shard.h) at build end and consumed as bytes from then on.
+/// blob (index/shard.cppm) at build end and consumed as bytes from then on.
 struct FileIndex {
     /// The braces matter: fbs decode value-constructs map entries with
     /// `FileIndex{}`, and without an initializer this member would be
@@ -175,9 +219,9 @@ constexpr NameForm name_form(SymbolFlags flags) {
 /// No canonical file: the symbol has entries but none of them declares it.
 constexpr inline std::uint32_t no_file = ~0u;
 
-/// A symbol's identity as a blob reader hands it out; the strings borrow
+/// A symbol's facts as a blob reader hands them out; the strings borrow
 /// the blob's bytes.
-struct SymbolIdentity {
+struct SymbolView {
     llvm::StringRef name;
     llvm::StringRef args;
     llvm::StringRef signature;
@@ -236,8 +280,8 @@ struct Symbol {
     /// and type hierarchy read, not rename or the name search.
     Bitmap instantiation_files;
 
-    /// The identity a reader hands out for this entry; the strings borrow it.
-    SymbolIdentity identity() const {
+    /// The view a reader hands out for this entry; the strings borrow it.
+    SymbolView view() const {
         return {
             .name = name,
             .args = args,
@@ -256,9 +300,9 @@ struct Symbol {
 
 using SymbolTable = llvm::DenseMap<SymbolHash, Symbol>;
 
-/// A symbol as queries hand it out: its identity plus the stored facts,
-/// owned — the strings outlive whichever table answered.
-struct SymbolRef {
+/// A symbol as queries hand it out: its hash and its facts, owned — the
+/// strings outlive whichever table answered.
+struct SymbolInfo {
     SymbolHash hash = 0;
     std::string name;
     std::string args;
@@ -269,7 +313,7 @@ struct SymbolRef {
     SymbolFlags flags = SymbolFlags::None;
     TokenClass token_class;
 
-    static SymbolRef from(SymbolHash hash, const SymbolIdentity& identity) {
+    static SymbolInfo from(SymbolHash hash, const SymbolView& identity) {
         return {
             .hash = hash,
             .name = identity.name.str(),

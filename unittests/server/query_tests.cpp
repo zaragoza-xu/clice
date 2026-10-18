@@ -5,7 +5,10 @@ module;
 module clice;
 
 import :feature.feature;
+import :index.indexer;
+import :index.navigation;
 import :index.query;
+import :index.search;
 import :index.tu_index;
 import :project.command_resolver;
 import :project.index_store;
@@ -18,8 +21,8 @@ import :server.ast_projection;
 import :server.live_sources;
 import :server.session_store;
 import :unittests.utils.merge_unit;
-import :unittests.utils;
 import :unittests.utils.tester;
+import :unittests.utils;
 import :worker.pool;
 
 namespace clice::testing {
@@ -39,9 +42,10 @@ struct CountingSessions : index::LiveSources {
         return std::nullopt;
     }
 
-    void each_session(llvm::function_ref<bool(const index::IndexSource&)>) const override {}
+    void for_each_session(llvm::function_ref<bool(const index::IndexSource&)>) const override {}
 
-    void each_session_index(llvm::function_ref<bool(const index::TUIndex&)> visit) const override {
+    void for_each_session_index(
+        llvm::function_ref<bool(const index::TUIndex&)> visit) const override {
         for(auto& table: tables) {
             visits += 1;
             if(!visit(table)) {
@@ -50,11 +54,11 @@ struct CountingSessions : index::LiveSources {
         }
     }
 
-    void each_preamble(llvm::function_ref<bool(const index::IndexSource&)>) const override {}
+    void for_each_preamble(llvm::function_ref<bool(const index::IndexSource&)>) const override {}
 
-    void each_overlay(llvm::function_ref<bool(const index::TUIndex&)>) const override {}
+    void for_each_overlay(llvm::function_ref<bool(const index::TUIndex&)>) const override {}
 
-    std::shared_ptr<index::TUIndex> preamble_blob(Fid) const override {
+    std::shared_ptr<index::TUIndex> preamble_index(Fid) const override {
         return nullptr;
     }
 };
@@ -76,17 +80,17 @@ TURunFamily turun{graph, project, resolver, pcm, pch, index_store, pool};
 IndexPump indexer{loop, project, turun, index_store, pool};
 ServerLiveSources live{project, pch, store, projections};
 index::FreshnessGate gate{project.file_table};
-index::IndexQuery query{project.project_index, project.file_table, &gate, &live};
+index::IndexQuery query{project.index, project.file_table, &gate, &live};
 
 Fid focus_id;
 Fid header_id;
 
 std::vector<index::IndexQuery::Located> search(llvm::StringRef text, std::size_t limit = 10) {
-    return query.search(*index::SymbolQuery::parse(text), limit);
+    return index::search(query, *index::SymbolQuery::parse(text), limit);
 }
 
 std::vector<index::IndexQuery::Located> locate(llvm::StringRef text) {
-    return query.locate(*index::SymbolQuery::parse(text));
+    return index::locate(query, *index::SymbolQuery::parse(text));
 }
 
 /// Compile the added sources as the background index does and merge the
@@ -112,7 +116,7 @@ ZEST_CASE(DefinitionAcrossFiles) {
 
     auto hit_offset = point("use");
     index::SymbolHash symbol = 0;
-    project.project_index.shards[focus_id].lookup(hit_offset, [&](const index::Occurrence& o) {
+    project.index.shards[focus_id].occurrences_at(hit_offset, [&](const index::Occurrence& o) {
         symbol = o.target;
         return false;
     });
@@ -134,7 +138,7 @@ ZEST_CASE(ReferencesAcrossFiles) {
     index_workspace();
 
     index::SymbolHash symbol = 0;
-    project.project_index.shards[focus_id].lookup(point("use"), [&](const index::Occurrence& o) {
+    project.index.shards[focus_id].occurrences_at(point("use"), [&](const index::Occurrence& o) {
         symbol = o.target;
         return false;
     });
@@ -159,7 +163,7 @@ ZEST_CASE(LocalReferencesClosed) {
     }) {
         auto cursor = query.symbol_at(focus_id, point(marker));
         ZASSERT(cursor);
-        ZEXPECT(query.references(*cursor, true).size() == expected);
+        ZEXPECT(index::references(query, *cursor, true).size() == expected);
     }
 }
 
@@ -175,7 +179,7 @@ ZEST_CASE(HighlightsClosedFile) {
 
     auto cursor = query.symbol_at(focus_id, point("read"));
     ZASSERT(cursor);
-    auto highlights = query.document_highlights(*cursor);
+    auto highlights = index::document_highlights(query, *cursor);
     ZASSERT(highlights.size() == 3U);
     ZEXPECT(highlights[0].site.range == range("decl"));
     ZEXPECT(highlights[0].kind == index::HighlightKind::Text);
@@ -201,8 +205,8 @@ ZEST_CASE(InternalAcrossFiles) {
     ZASSERT(from_main);
     ZASSERT(from_header);
     ZASSERT(from_main->symbols == from_header->symbols);
-    ZEXPECT(query.references(*from_main, true).size() == 3U);
-    ZEXPECT(query.references(*from_header, true).size() == 3U);
+    ZEXPECT(index::references(query, *from_main, true).size() == 3U);
+    ZEXPECT(index::references(query, *from_header, true).size() == 3U);
     auto located = query.resolve_at(*from_main);
     ZASSERT(located.size() == 1U);
     ZEXPECT(located.front().site.path.ends_with("header.h"));
@@ -224,7 +228,7 @@ ZEST_CASE(InternalTypeTarget) {
 
     auto cursor = query.symbol_at(focus_id, point("var"));
     ZASSERT(cursor);
-    auto sites = query.type_definition(*cursor, cursor->symbols.front());
+    auto sites = index::type_definition(query, *cursor, cursor->symbols.front());
     ZASSERT(sites.size() == 1U);
     ZEXPECT(sites.front().path.ends_with("header.h"));
 }
@@ -250,7 +254,7 @@ ZEST_CASE(InternalAcrossUnits) {
 
     auto cursor = query.symbol_at(a_id, a_use);
     ZASSERT(cursor);
-    ZEXPECT(query.references(*cursor, true).size() == 3U);
+    ZEXPECT(index::references(query, *cursor, true).size() == 3U);
 }
 
 ZEST_CASE(OverloadSetCursor) {
@@ -264,7 +268,7 @@ ZEST_CASE(OverloadSetCursor) {
     auto cursor = query.symbol_at(focus_id, point("use"));
     ZASSERT(cursor);
     ZASSERT(cursor->symbols.size() == 2U);
-    auto sites = query.definition(*cursor);
+    auto sites = index::definition(query, *cursor);
     ZASSERT(sites.size() == 2U);
     ZEXPECT(sites[0].range.begin == point("int"));
     ZEXPECT(sites[1].range.begin == point("double"));
@@ -318,7 +322,7 @@ ZEST_CASE(UnnamedScopes) {
 
     auto at = [&](llvm::StringRef name) {
         index::SymbolHash found = 0;
-        project.project_index.shards[focus_id].lookup(point(name), [&](const index::Occurrence& o) {
+        project.index.shards[focus_id].occurrences_at(point(name), [&](const index::Occurrence& o) {
             found = o.target;
             return false;
         });
@@ -347,7 +351,7 @@ ZEST_CASE(QualifiedNames) {
     index_workspace();
 
     index::SymbolHash method = 0;
-    project.project_index.shards[focus_id].lookup(point("method"), [&](const index::Occurrence& o) {
+    project.index.shards[focus_id].occurrences_at(point("method"), [&](const index::Occurrence& o) {
         method = o.target;
         return false;
     });
@@ -382,7 +386,7 @@ ZEST_CASE(QualifiedNames) {
     ZASSERT(query.container_name(versioned.front().symbol.hash) == "outer");
     ZASSERT(query.qualified_name(versioned.front().symbol.hash) == "outer::versioned");
     index::SymbolHash hidden = 0;
-    project.project_index.shards[focus_id].lookup(point("hidden"), [&](const index::Occurrence& o) {
+    project.index.shards[focus_id].occurrences_at(point("hidden"), [&](const index::Occurrence& o) {
         hidden = o.target;
         return false;
     });
@@ -419,16 +423,16 @@ ZEST_CASE(LocalsAndCursors) {
     ZASSERT(!search("use").empty());
 
     // A cursor on the file's own static function resolves through the
-    // serving source, which the global table knows nothing about.
+    // serving source, which the project table knows nothing about.
     index::SymbolQuery at;
     at.position = {.path = project.file_table.resolve(focus_id).str(), .line = 3, .column = 21};
-    auto located = query.locate(at);
+    auto located = index::locate(query, at);
     ZASSERT(located.size() == std::size_t(1));
     ZASSERT(located.front().symbol.name == "helper");
     ZASSERT(located.front().site.path.ends_with("main.cpp"));
     // The line alone lists it too.
     at.position->column.reset();
-    auto on_line = query.locate(at);
+    auto on_line = index::locate(query, at);
     ZASSERT(on_line.size() == std::size_t(1));
     ZASSERT(on_line.front().symbol.name == "helper");
 }
@@ -441,7 +445,7 @@ ZEST_CASE(LocalSymbolName) {
     index_workspace();
 
     index::SymbolHash symbol = 0;
-    project.project_index.shards[focus_id].lookup(point("local"), [&](const index::Occurrence& o) {
+    project.index.shards[focus_id].occurrences_at(point("local"), [&](const index::Occurrence& o) {
         symbol = o.target;
         return false;
     });
@@ -468,7 +472,7 @@ ZEST_CASE(LocalsByPath) {
 
     auto helper = locate(R"("helper" path:main.cpp)");
     ZASSERT(helper.size() == 1U);
-    ZEXPECT(helper.front().symbol.scope == index::SymbolScope::TULocal);
+    ZEXPECT(helper.front().symbol.scope == index::SymbolScope::Internal);
     ZEXPECT(helper.front().site.path.ends_with("main.cpp"));
 }
 
@@ -501,7 +505,7 @@ ZEST_CASE(OpenSessionServedByShard) {
 
     auto cursor = query.symbol_at(focus_id, point("use"));
     ZASSERT(cursor);
-    auto sites = query.definition(*cursor);
+    auto sites = index::definition(query, *cursor);
     ZASSERT(!sites.empty());
     ZASSERT(sites.front().path.ends_with("header.h"));
 }
@@ -541,14 +545,14 @@ ZEST_CASE(HeaderEdgesFromHostManifest) {
     // the host TU's manifest hanging off the header's node.
     auto session = store.open(header_id);
     store.apply_open(*session, sources.all_files.lookup("header.h").content, 1);
-    auto edges = query.include_edges(session->path_id);
+    auto edges = query.project().include_edges(query.file_table(), session->path_id);
     ZASSERT(edges.size() == std::size_t(1));
     ZASSERT(llvm::StringRef(edges[0].target).ends_with("inner.h"));
 
     // The TU's own manifest still answers for the TU itself.
     auto focus_session = store.open(focus_id);
     store.apply_open(*focus_session, unit->focus_file().content().str(), 1);
-    auto focus_edges = query.include_edges(focus_session->path_id);
+    auto focus_edges = query.project().include_edges(query.file_table(), focus_session->path_id);
     ZASSERT(focus_edges.size() == std::size_t(1));
     ZASSERT(llvm::StringRef(focus_edges[0].target).ends_with("header.h"));
 }
@@ -561,7 +565,7 @@ ZEST_CASE(StaleContributionSuppressed) {
     index_workspace();
 
     index::SymbolHash symbol = 0;
-    project.project_index.shards[focus_id].lookup(point("use"), [&](const index::Occurrence& o) {
+    project.index.shards[focus_id].occurrences_at(point("use"), [&](const index::Occurrence& o) {
         symbol = o.target;
         return false;
     });
@@ -669,11 +673,8 @@ ZEST_CASE(ScopedSearchScalesLinearly) {
     auto visits_with = [&](int buffers) {
         CountingSessions sessions;
         open_buffers(sessions, buffers);
-        index::IndexQuery session_query{project.project_index,
-                                        project.file_table,
-                                        nullptr,
-                                        &sessions};
-        session_query.search(*index::SymbolQuery::parse("app::fn0_1"), 10);
+        index::IndexQuery session_query{project.index, project.file_table, nullptr, &sessions};
+        index::search(session_query, *index::SymbolQuery::parse("app::fn0_1"), 10);
         return sessions.visits;
     };
     // Four times the open buffers: a scan of each buffer's table grows

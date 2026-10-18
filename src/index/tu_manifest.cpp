@@ -4,56 +4,13 @@ module;
 
 module clice;
 
-import :index.manifest;
-import :index.serialization;
+import :index.columns;
+import :index.format;
+import :index.tu_manifest;
 
 namespace clice::index {
 
 namespace {
-
-/// The manifest's persisted form. Node and contribution payloads are
-/// varint-packed by hand: a big TU enters thousands of files, and LEB128
-/// on the small ids and lines roughly halves the blob against fixed-width
-/// columns.
-struct ManifestBlob {
-    std::uint32_t format_version = 0;
-
-    std::uint64_t global_gen = 0;
-
-    std::uint64_t built_at = 0;
-
-    std::uint32_t tu_fv = 0;
-
-    std::uint32_t node_count = 0;
-
-    std::uint32_t contribution_count = 0;
-
-    /// node_count × (varint fv, varint parent, varint line): the parent 0
-    /// for the previous node's, 1 for the root, else its index plus 2; the
-    /// line shifted left by two over a bit for a skipped node and a bit for
-    /// a line stored as its distance past the previous node's — only
-    /// beside the previous node's parent, at or past its line.
-    std::vector<std::uint8_t> nodes;
-
-    /// contribution_count × (varint fv, 8-byte little-endian variant hash —
-    /// hashes are random bits, varint would only inflate them)
-    std::vector<std::uint8_t> contributions;
-
-    std::vector<std::uint32_t> absent;
-
-    std::vector<std::uint32_t> imports;
-
-    /// TUManifest::local_fanout as columns: the symbols ascending, each
-    /// one's file versions back to back.
-    std::vector<std::uint64_t> local_symbols;
-    std::vector<std::uint32_t> local_file_ends;
-    std::vector<std::uint32_t> local_files;
-
-    /// TUManifest::instantiations as columns: per file its version and its
-    /// use.
-    std::vector<std::uint32_t> instantiation_files;
-    std::vector<std::uint64_t> instantiation_uses;
-};
 
 void write_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
     while(value >= 0x80) {
@@ -87,11 +44,11 @@ bool read_varint(std::span<const std::uint8_t> data, std::size_t& pos, std::uint
 }  // namespace
 
 void serialize_manifest(const TUManifest& manifest, llvm::raw_ostream& os) {
-    ManifestBlob blob;
+    TUManifestBlob blob;
     blob.format_version = index_format_version;
-    blob.global_gen = manifest.global_gen;
+    blob.table_generation = manifest.table_generation;
     blob.built_at = manifest.built_at;
-    blob.tu_fv = manifest.tu_fv.raw;
+    blob.tu_version = manifest.tu_version.raw;
 
     blob.node_count = static_cast<std::uint32_t>(manifest.nodes.size());
     blob.nodes.reserve(manifest.nodes.size() * 5);
@@ -109,24 +66,24 @@ void serialize_manifest(const TUManifest& manifest, llvm::raw_ostream& os) {
 
     blob.contribution_count = static_cast<std::uint32_t>(manifest.contributions.size());
     blob.contributions.reserve(manifest.contributions.size() * 10);
-    for(auto& [fv, hash]: manifest.contributions) {
-        write_varint(blob.contributions, fv.raw);
+    for(auto& [version, hash]: manifest.contributions) {
+        write_varint(blob.contributions, version.raw);
         std::uint8_t bytes[8];
         std::memcpy(bytes, &hash, sizeof(hash));
         blob.contributions.insert(blob.contributions.end(), bytes, bytes + sizeof(bytes));
     }
 
-    for(auto fv: manifest.absent) {
-        blob.absent.push_back(fv.raw);
+    for(auto version: manifest.absent) {
+        blob.absent.push_back(version.raw);
     }
-    for(auto fv: manifest.imports) {
-        blob.imports.push_back(fv.raw);
+    for(auto version: manifest.imports) {
+        blob.imports.push_back(version.raw);
     }
 
-    for(auto& fanout: manifest.local_fanout) {
-        blob.local_symbols.push_back(fanout.symbol);
-        for(auto fv: fanout.files) {
-            blob.local_files.push_back(fv.raw);
+    for(auto& local: manifest.shared_locals) {
+        blob.local_symbols.push_back(local.symbol);
+        for(auto version: local.files) {
+            blob.local_files.push_back(version.raw);
         }
         blob.local_file_ends.push_back(static_cast<std::uint32_t>(blob.local_files.size()));
     }
@@ -140,7 +97,7 @@ void serialize_manifest(const TUManifest& manifest, llvm::raw_ostream& os) {
 }
 
 std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
-    ManifestBlob blob;
+    TUManifestBlob blob;
     if(!deserialize_blob(data, blob) || blob.format_version != index_format_version) {
         return std::nullopt;
     }
@@ -155,19 +112,19 @@ std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
     }
 
     TUManifest manifest;
-    manifest.global_gen = blob.global_gen;
+    manifest.table_generation = blob.table_generation;
     manifest.built_at = blob.built_at;
-    manifest.tu_fv = VersionID{blob.tu_fv};
+    manifest.tu_version = VersionID{blob.tu_version};
 
     constexpr std::uint64_t id_max = std::numeric_limits<std::uint32_t>::max();
     std::span<const std::uint8_t> nodes(blob.nodes);
     std::size_t pos = 0;
     manifest.nodes.reserve(blob.node_count);
     for(std::uint32_t i = 0; i < blob.node_count; i += 1) {
-        std::uint64_t fv = 0;
+        std::uint64_t version = 0;
         std::uint64_t parent = 0;
         std::uint64_t code = 0;
-        if(!read_varint(nodes, pos, fv) || !read_varint(nodes, pos, parent) ||
+        if(!read_varint(nodes, pos, version) || !read_varint(nodes, pos, parent) ||
            !read_varint(nodes, pos, code)) {
             return std::nullopt;
         }
@@ -177,7 +134,7 @@ std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
         // set.
         auto* previous = manifest.nodes.empty() ? nullptr : &manifest.nodes.back();
         bool delta = (code & 1) != 0;
-        if(fv > id_max || parent > std::uint64_t(blob.node_count) + 1 ||
+        if(version > id_max || parent > std::uint64_t(blob.node_count) + 1 ||
            (parent == 0 && !previous) || (delta && parent != 0)) {
             return std::nullopt;
         }
@@ -186,7 +143,7 @@ std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
             return std::nullopt;
         }
         manifest.nodes.push_back({
-            .file = static_cast<std::uint32_t>(fv),
+            .file = static_cast<std::uint32_t>(version),
             .parent = parent == 0   ? previous->parent
                       : parent == 1 ? no_node
                                     : static_cast<std::uint32_t>(parent - 2),
@@ -202,8 +159,8 @@ std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
     pos = 0;
     manifest.contributions.reserve(blob.contribution_count);
     for(std::uint32_t i = 0; i < blob.contribution_count; i += 1) {
-        std::uint64_t fv = 0;
-        if(!read_varint(contributions, pos, fv) || fv > id_max) {
+        std::uint64_t version = 0;
+        if(!read_varint(contributions, pos, version) || version > id_max) {
             return std::nullopt;
         }
         if(pos + 8 > contributions.size()) {
@@ -212,17 +169,17 @@ std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
         std::uint64_t hash = 0;
         std::memcpy(&hash, contributions.data() + pos, sizeof(hash));
         pos += 8;
-        manifest.contributions.emplace_back(VersionID{static_cast<std::uint32_t>(fv)}, hash);
+        manifest.contributions.emplace_back(VersionID{static_cast<std::uint32_t>(version)}, hash);
     }
     if(pos != contributions.size()) {
         return std::nullopt;
     }
 
-    for(auto fv: blob.absent) {
-        manifest.absent.push_back(VersionID{fv});
+    for(auto version: blob.absent) {
+        manifest.absent.push_back(VersionID{version});
     }
-    for(auto fv: blob.imports) {
-        manifest.imports.push_back(VersionID{fv});
+    for(auto version: blob.imports) {
+        manifest.imports.push_back(VersionID{version});
     }
 
     if(blob.local_file_ends.size() != blob.local_symbols.size() ||
@@ -236,10 +193,10 @@ std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
             return std::nullopt;
         }
         auto end = blob.local_file_ends[i];
-        auto& fanout = manifest.local_fanout.emplace_back();
-        fanout.symbol = blob.local_symbols[i];
-        for(auto fv: llvm::ArrayRef(blob.local_files).slice(begin, end - begin)) {
-            fanout.files.push_back(VersionID{fv});
+        auto& local = manifest.shared_locals.emplace_back();
+        local.symbol = blob.local_symbols[i];
+        for(auto version: llvm::ArrayRef(blob.local_files).slice(begin, end - begin)) {
+            local.files.push_back(VersionID{version});
         }
         begin = end;
     }
@@ -259,7 +216,7 @@ std::optional<TUManifest> deserialize_manifest(llvm::StringRef data) {
 }
 
 void measure_manifest(llvm::StringRef data, FieldBytes& bytes) {
-    if(ManifestBlob blob; deserialize_blob(data, blob)) {
+    if(TUManifestBlob blob; deserialize_blob(data, blob)) {
         measure_fields(blob, bytes);
     }
 }

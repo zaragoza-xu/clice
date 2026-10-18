@@ -2,58 +2,16 @@ module;
 
 #include "modules/prelude.h"
 
-module clice:index.serialization;
+/// The persisted index format: every blob layout the index writes, to the
+/// database or between processes, and the version gating them. Writers,
+/// load-time validation and the hand-built blobs of corruption tests share
+/// the layouts; everything else consumes blobs through their readers.
 
-import :index.shard;
-import :index.types;
-import :semantic.symbol;
-import :support.bitmap;
+module clice:index.format;
+
+import :index.symbol;
 
 namespace clice::index {
-
-/// A bitmap over a portable image in place: the container payloads stay
-/// in `data`, which must outlive the bitmap, and the bitmap is read-only
-/// (croaring aborts on a write to a frozen one). Validated without
-/// trusting the bytes — bounded by the buffer, croaring's internal
-/// invariants checked — plus the container offsets the image's header carries:
-/// the in-place reader follows them instead of walking the payload, so a
-/// corrupt one would send it outside the image.
-std::optional<Bitmap> view_bitmap(const void* data, std::size_t size);
-
-/// Encode a bitmap as its portable image — the only format with a bounded
-/// deserializer.
-inline std::vector<std::byte> write_bitmap(const Bitmap& bitmap) {
-    std::vector<std::byte> buffer(bitmap.getSizeInBytes(true));
-    bitmap.write(reinterpret_cast<char*>(buffer.data()), true);
-    return buffer;
-}
-
-/// An ascending set of ids below `universe` as an Elias–Fano list, about
-/// 2 + log2(universe / count) bits an id: the count as a varint; then
-/// the low log2(universe / count) bits of each id, back to back; then a
-/// bit vector holding, for the i-th id, a one at its remaining high bits
-/// plus i. Every bit past the last of each part is zero, and the vector
-/// ends with the byte holding its last one.
-std::vector<std::uint8_t> write_postings(const Bitmap& ids, std::uint32_t universe);
-
-/// The ids of a list write_postings wrote for `universe`; nullopt for
-/// bytes it would not have written.
-std::optional<Bitmap> read_postings(llvm::ArrayRef<std::uint8_t> bytes, std::uint32_t universe);
-
-/// The two highest values of an id type are reserved: they were DenseMap's
-/// sentinel keys when the format was defined, so no writer has ever emitted
-/// them, and IPC or disk bytes carrying one are corrupt.
-template <typename T>
-bool reserved_key(T value) {
-    static_assert(std::is_unsigned_v<T>);
-    return value >= std::numeric_limits<T>::max() - 1;
-}
-
-/// A symbol's id on the command line and in JSON answers: `#<hex>`, which
-/// a JavaScript number would round.
-inline std::string symbol_id(SymbolHash hash) {
-    return std::format("#{:016x}", hash);
-}
 
 /// On-disk index blob schema version. Every persisted blob carries it as a
 /// regular field and every loader discards blobs with a different value —
@@ -69,7 +27,7 @@ inline std::string symbol_id(SymbolHash hash) {
 /// entities computed by semantic/identity; v13: symbol entries carry the bare
 /// name, parent, specialization arguments, flags and canonical file, the
 /// include tree is one node type in the TU index and in manifests, and module
-/// names are keyed by their entity; v15: the global blob is columnar in
+/// names are keyed by their entity; v15: the project table is columnar in
 /// hash order with a stable path table and pins its search blob, so it
 /// is read in place; v16: entity hashes follow clang 23's node kinds;
 /// v17: file versions carry no stat stamps; v18: files under the
@@ -79,7 +37,7 @@ inline std::string symbol_id(SymbolHash hash) {
 /// scope are global symbols, and the entries cover weak call edges, implicit
 /// calls and the names the traversal used to skip; v22: specializations
 /// relate to their templates, manifests list the files their internal
-/// symbols span, the global blob carries the reverse include graph,
+/// symbols span, the project table carries the reverse include graph,
 /// module linkage is external, and C tags and C-linkage functions follow
 /// C's identity rules; v23: names without linkage outside a function reach
 /// as far as their scope, `defined` operands reference their macro,
@@ -110,7 +68,7 @@ inline std::string symbol_id(SymbolHash hash) {
 /// their signature, a deduced type sees through a library's internal
 /// aliases, an abbreviated template's `auto` names no parameter, a virtual
 /// function named by qualification carries a Direct relation, and the
-/// global blob lists the files whose names of internal linkage the search
+/// project table lists the files whose names of internal linkage the search
 /// index misses; v37: what instantiations and macro expansions resolve
 /// lives in per-file instantiation blobs, manifests list the resolutions of
 /// those they use, symbols the files whose instantiation blobs name them,
@@ -119,13 +77,13 @@ inline std::string symbol_id(SymbolHash hash) {
 /// v39: id and offset columns are as narrow as their tables allow, masks as
 /// their variant count, occurrences store their begins as deltas, relation
 /// payloads are placed by kind bits and block counts, shards keep only the
-/// text of their non-ASCII lines, the global table's file sets of one or two
+/// text of their non-ASCII lines, the project table's file sets of one or two
 /// files are raw ids, and manifests name the use set their unit shares in a
 /// file's instantiation blob and encode runs of include siblings; v40: a
-/// local fanout names its files by version, including files the unit reads
+/// shared local names its files by version, including files the unit reads
 /// through a precompiled header or a module, function-local symbols other
-/// files name join the TU index's table and the fanout, and the global
-/// table lists the files the fanouts name per symbol.
+/// files name join the TU index's table and the shared locals, and the project
+/// table lists the files the shared locals name per symbol.
 constexpr inline std::uint32_t index_format_version = 40;
 
 /// Serialize a reflected index blob to `os` as a verified-readable
@@ -138,10 +96,29 @@ void serialize_blob(const T& value, llvm::raw_ostream& os) {
     os.write(reinterpret_cast<const char*>(encoded->data()), encoded->size());
 }
 
-/// ---------------------------------------------------------------------
-/// Persisted blob layouts. Shared by writers, load-time validation and the
-/// hand-built blobs of corruption tests; everything else consumes blobs
-/// through their readers.
+/// The bytes of `data` as the span every kota fbs entry point takes.
+inline std::span<const std::uint8_t> blob_bytes(llvm::StringRef data) {
+    return {reinterpret_cast<const std::uint8_t*>(data.data()), data.size()};
+}
+
+/// Verify and deserialize a blob into `out`. The out-parameter overload of
+/// from_bytes is deliberate: index types hold llvm::DenseMap members whose
+/// explicit default constructors fail std::default_initializable, which the
+/// value-returning overload requires.
+template <typename T>
+bool deserialize_blob(llvm::StringRef data, T& out) {
+    return kota::codec::fbs::from_bytes(blob_bytes(data), out).has_value();
+}
+
+/// The two highest values of an id type are reserved: they were DenseMap's
+/// sentinel keys when the format was defined, so no writer has ever emitted
+/// them, and IPC or disk bytes carrying one are corrupt.
+template <typename T>
+bool reserved_key(T value) {
+    static_assert(std::is_unsigned_v<T>);
+    return value >= std::numeric_limits<T>::max() - 1;
+}
+
 /// Sentinel in a length column: the sparse escape table holds an entry
 /// range's real end, a line's real length.
 constexpr inline std::uint8_t length_escape = 0xff;
@@ -175,7 +152,7 @@ constexpr inline std::uint32_t delta_block = 16;
 /// holds the begin.
 constexpr inline std::uint8_t delta_escape = 0xff;
 
-/// One side of a blob's entry storage (occurrences, relations, records).
+/// One side of a blob's entries (occurrences, relations, records).
 ///
 /// Ranges use exactly one of three self-describing encodings:
 ///   - delta, for a side sorted by begin (occurrences, records): the begin
@@ -212,7 +189,7 @@ struct RangeColumns {
     std::vector<std::uint8_t> roaring;
 };
 
-/// Relations per block of the payload counts (ShardBlob::rel_target_ranks).
+/// Relations per block of the payload counts (ShardBlob::relation_target_ranks).
 constexpr inline std::uint32_t rank_block = 64;
 
 /// The bit of a stored relation kind saying the relation carries a payload.
@@ -272,20 +249,20 @@ struct ShardBlob {
     /// Referenced symbols and the parents of the local ones, sorted by
     /// hash; the index into this table is the symbol id the entry columns
     /// use.
-    std::vector<std::uint64_t> sym_hashes;
+    std::vector<std::uint64_t> symbol_hashes;
 
     /// Relation slice per symbol: entry i's relations occupy positions
-    /// [rel_offsets[i], rel_offsets[i + 1]). Size is table size + 1.
-    IdColumn rel_offsets;
+    /// [relation_offsets[i], relation_offsets[i + 1]). Size is table size + 1.
+    IdColumn relation_offsets;
 
-    /// Symbols local to this file (FileLocal) or its TU (TULocal), whose
+    /// Symbols local to this file (FunctionLocal) or its TU (Internal), whose
     /// names live nowhere else: sparse over the symbol table, ascending.
-    IdColumn local_syms;
+    IdColumn local_symbols;
     /// Names back to back, an end offset each.
     std::string local_names;
     IdColumn local_name_ends;
     /// Arguments and signatures of the few locals having them: those
-    /// locals' positions in `local_syms`, ascending, and their text back
+    /// locals' positions in `local_symbols`, ascending, and their text back
     /// to back.
     IdColumn local_args_of;
     std::string local_args;
@@ -302,31 +279,31 @@ struct ShardBlob {
     std::vector<std::uint32_t> local_token_modifiers;
 
     /// Occurrences sorted by (begin, end, symbol hash), delta-encoded.
-    RangeColumns occs;
-    IdColumn occ_syms;
+    RangeColumns occurrences;
+    IdColumn occurrence_symbols;
 
     /// Relations in symbol-table order, sorted by (kind, begin, end,
     /// payload) within each group.
-    RangeColumns rels;
+    RangeColumns relations;
     /// The RelationKind, payload_bit set for a relation carrying a payload:
     /// for the kinds carrying an extent the extent of what it declares,
     /// for the others a target symbol.
-    std::vector<std::uint8_t> rel_kinds;
+    std::vector<std::uint8_t> relation_kinds;
     /// Per block of rank_block relations, the target and the extent
     /// payloads before it; with the payload bits inside the block they
     /// place a relation's payload in its column.
-    IdColumn rel_target_ranks;
-    IdColumn rel_extent_ranks;
-    IdColumn rel_targets;
+    IdColumn relation_target_ranks;
+    IdColumn relation_extent_ranks;
+    IdColumn relation_targets;
     /// An extent as the distance from its begin back to the relation's
     /// begin, and its length. One that does not fit has extent_escape for a
     /// head, 0 for a length and its bounds in the sparse (extent, begin,
     /// end) table.
-    std::vector<std::uint16_t> rel_extent_heads;
-    std::vector<std::uint16_t> rel_extent_lengths;
-    std::vector<std::uint32_t> rel_far_extents;
-    std::vector<std::uint32_t> rel_far_begins;
-    std::vector<std::uint32_t> rel_far_ends;
+    std::vector<std::uint16_t> relation_extent_heads;
+    std::vector<std::uint16_t> relation_extent_lengths;
+    std::vector<std::uint32_t> relation_far_extents;
+    std::vector<std::uint32_t> relation_far_begins;
+    std::vector<std::uint32_t> relation_far_ends;
 };
 
 /// A file's instantiation shard as one persisted blob: what the template
@@ -343,7 +320,7 @@ struct ShardBlob {
 /// file with its TU's resolutions there and the keys it walked; the
 /// master merges them into the file's blob, which records who walked each
 /// key.
-struct InstantiationBlob {
+struct InstantiationShardBlob {
     /// index_format_version, gated by InstantiationShard::from_buffer.
     std::uint32_t format_version = 0;
 
@@ -354,7 +331,7 @@ struct InstantiationBlob {
 
     /// The symbols the records and the keys name, sorted by hash; an index
     /// into this table is a symbol id.
-    std::vector<std::uint64_t> sym_hashes;
+    std::vector<std::uint64_t> symbol_hashes;
 
     /// Records sorted by (begin, end, kind, expansion, target, from) — no
     /// masks: the resolutions list their records.
@@ -374,7 +351,7 @@ struct InstantiationBlob {
     IdColumn resolution_records;
 
     /// The sets of resolutions the TUs use here, which manifests name by
-    /// identity (use_identity), ascending; use i's resolutions are
+    /// identity (use_hash), ascending; use i's resolutions are
     /// use_resolutions[use_ends[i - 1], use_ends[i]), ascending. A worker's
     /// blob has none: the master knows what its TU uses.
     std::vector<std::uint64_t> uses;
@@ -397,8 +374,306 @@ struct InstantiationBlob {
     std::vector<std::uint64_t> producer_runs;
 };
 
+/// One file's index in the TU index blob: a self-contained single-variant shard
+/// blob (index/shard.cppm). `hash` is xxh3 of `blob` — the variant's
+/// identity — so the master can skip blobs it already stores without
+/// touching their bytes; the blob is left empty for a variant the master
+/// said it stores.
+struct FileSection {
+    std::uint32_t path_id = 0;
+
+    std::uint64_t hash = 0;
+
+    std::vector<std::uint8_t> blob;
+};
+
+/// One file's instantiations in the TU index: the instantiation blob of what
+/// the run resolved there, empty when it resolved nothing, and the known keys
+/// whose definition the file holds that the run skipped, ascending.
+struct InstantiationSection {
+    std::uint32_t path_id = 0;
+
+    std::vector<std::uint8_t> blob;
+
+    std::vector<std::uint64_t> skipped;
+};
+
+/// The TU index's serialized layout. Only the indexer materializes it (and
+/// tests planting shapes it never emits); every consumer reads the bytes
+/// through the TUIndex reader.
+struct TUIndexBlob {
+    /// Serialized schema version (index_format_version), gated by
+    /// TUIndex::from_bytes.
+    /// A worker respawned after the binary on disk changed can be one
+    /// build ahead of the server, and a layout change need not be
+    /// structurally detectable.
+    std::uint32_t format_version = 0;
+
+    /// Milliseconds since epoch, sampled before the build started.
+    std::int64_t built_at = 0;
+
+    /// The include tree (IncludeTree's persisted vectors): the path table,
+    /// the consumed-content hash per path, and every include edge of the
+    /// parse.
+    std::vector<std::string> paths;
+    std::vector<std::uint64_t> content_hashes;
+    std::vector<IncludeNode> nodes;
+
+    /// The symbols the entries name, sorted by hash, except the file-local
+    /// ones (a function's locals, a template's parameters) — only their
+    /// own file can mention one, and that file's section names it — and
+    /// the external symbols only sections left empty name. Names, arguments and signatures are
+    /// back to back with one end offset per entry; so are the reference files, as path ids.
+    std::vector<std::uint64_t> symbol_hashes;
+    std::string symbol_names;
+    std::vector<std::uint32_t> symbol_name_ends;
+    std::string symbol_args;
+    std::vector<std::uint32_t> symbol_args_ends;
+    std::string symbol_signatures;
+    std::vector<std::uint32_t> symbol_signature_ends;
+    std::vector<std::uint64_t> symbol_parents;
+    std::vector<std::uint8_t> symbol_kinds;
+    std::vector<std::uint8_t> symbol_scopes;
+    std::vector<std::uint16_t> symbol_flags;
+    std::vector<std::uint8_t> symbol_token_kinds;
+    std::vector<std::uint32_t> symbol_token_modifiers;
+    /// Path ids, `no_file` for a symbol without a declaring relation.
+    std::vector<std::uint32_t> symbol_files;
+    std::vector<std::uint32_t> symbol_reference_ends;
+    std::vector<std::uint32_t> symbol_references;
+
+    /// Per symbol, the files whose instantiation section names it, back to
+    /// back as path ids.
+    std::vector<std::uint32_t> symbol_instantiation_ends;
+    std::vector<std::uint32_t> symbol_instantiations;
+
+    /// One entry per file with an index, ascending by path id.
+    std::vector<FileSection> sections;
+
+    /// One entry per file the run's instantiations or macro expansions
+    /// resolve something in or skipped a known key of, ascending by path id.
+    std::vector<InstantiationSection> instantiations;
+
+    /// Preamble ride-alongs, empty on ordinary TU indexes: identity of the
+    /// exact preamble text the PCH was built from (matches_preamble), and
+    /// the PCH-derived feature state spliced into focus-file results. The
+    /// refs borrow the builder's inputs — encode-only, like the section
+    /// blobs are for readers.
+    std::uint64_t preamble_hash = 0;
+    std::uint32_t preamble_size = 0;
+    llvm::ArrayRef<DocumentLink> links;
+    llvm::ArrayRef<std::uint32_t> inactive_regions;
+    llvm::ArrayRef<std::uint8_t> open_conditionals;
+
+    /// The places the parse's failed lookups looked that held no file
+    /// (CompilationUnit::absent).
+    std::vector<std::string> absent;
+
+    /// Preamble ride-along: the diagnostics the preamble's build raised,
+    /// as published (a JSON array of LSP diagnostics) — a compile that
+    /// consumes the PCH never raises them again.
+    std::string diagnostics;
+};
+
+/// The project table's persisted form, read in place: the FileVersion table
+/// as parallel columns, the symbol table as parallel columns in hash order
+/// with its names, arguments and reference bitmaps in arenas, and the path
+/// table those columns index.
+struct ProjectTableBlob {
+    std::uint32_t format_version = 0;
+
+    /// See ProjectIndex::table_generation.
+    std::uint64_t generation = 0;
+
+    std::uint32_t next_version_id = 0;
+
+    std::vector<std::uint32_t> version_ids;
+    std::vector<std::string> version_paths;
+    std::vector<std::uint64_t> version_hashes;
+
+    /// Path id -> path for every id the symbol columns reference. Ids
+    /// are dense and stable across writes: a path keeps its id for as
+    /// long as the blob lineage lives, so a base entry's bitmap image is
+    /// copied into the next blob verbatim.
+    std::vector<std::string> paths;
+
+    /// The external symbol table, sorted by hash. A symbol's reference
+    /// files are a file set (append_file_set) in the arena, one end offset
+    /// per symbol.
+    std::vector<std::uint64_t> symbol_hashes;
+    std::string symbol_names;
+    std::vector<std::uint32_t> symbol_name_ends;
+    /// The arguments of the few symbols having them: those symbols,
+    /// ascending, and their text back to back.
+    std::vector<std::uint32_t> symbol_args_entries;
+    std::string symbol_args;
+    std::vector<std::uint32_t> symbol_args_ends;
+    std::string symbol_signatures;
+    std::vector<std::uint32_t> symbol_signature_ends;
+    /// The parent's position in the table plus one; 0 for none, or for one
+    /// outside the table, which the sparse (symbol, parent hash) table names.
+    IdColumn symbol_parents;
+    std::vector<std::uint32_t> symbol_far_parents;
+    std::vector<std::uint64_t> symbol_far_parent_hashes;
+    std::vector<std::uint8_t> symbol_kinds;
+    std::vector<std::uint16_t> symbol_flags;
+    std::vector<std::uint8_t> symbol_token_kinds;
+    std::vector<std::uint32_t> symbol_token_modifiers;
+    /// Path ids plus one, 0 for a symbol without a declaring relation.
+    IdColumn symbol_files;
+    /// The files referencing each symbol, counted: at most the path count,
+    /// so they take the width of path ids.
+    IdColumn symbol_reference_counts;
+    std::vector<std::uint32_t> symbol_bitmap_ends;
+    std::vector<std::uint8_t> symbol_bitmaps;
+    /// The files whose instantiation shards name a symbol, as file sets for
+    /// the few symbols some instantiation names, ascending.
+    std::vector<std::uint32_t> symbol_instantiation_entries;
+    std::vector<std::uint32_t> symbol_instantiation_ends;
+    std::vector<std::uint8_t> symbol_instantiations;
+
+    /// tu_version -> generation of every manifest current at this save.
+    /// The loader adopts a manifest blob only on an exact generation match, so
+    /// a manifest whose write failed while the project table was persisted (or one that
+    /// outran a lost project table write) reads as lost and its TU reindexes,
+    /// instead of an older on-disk manifest serving as current.
+    std::vector<std::uint32_t> manifest_versions;
+    std::vector<std::uint64_t> manifest_generations;
+
+    /// The generation of the search blob this table was saved with, and
+    /// the entries and the files whose names of internal linkage (path
+    /// ids, ascending) changed since that blob was built.
+    std::uint64_t search_generation = 0;
+    std::vector<std::uint64_t> search_pending;
+    std::vector<std::uint32_t> search_pending_files;
+
+    /// The reverse include graph, for readers holding no manifests: every
+    /// file some TU contributed a variant to (path ids, ascending), and those
+    /// TUs' path ids as file sets back to back.
+    std::vector<std::uint32_t> contributed_files;
+    std::vector<std::uint32_t> contributor_ends;
+    std::vector<std::uint8_t> contributors;
+
+    /// The symbols below external scope some TU's shared locals list
+    /// (TUManifest::shared_locals), ascending; the end of each symbol's run
+    /// of file sets; and the sets, file sets back to back.
+    std::vector<std::uint64_t> shared_local_symbols;
+    std::vector<std::uint32_t> shared_local_set_ends;
+    std::vector<std::uint32_t> shared_local_file_ends;
+    std::vector<std::uint8_t> shared_local_files;
+};
+
+/// Layout and scoring version of the search blob, apart from the index
+/// format it is derived from: a bump rebuilds the search index alone.
+constexpr std::uint32_t search_format_version = 3;
+
+/// The persisted search index. Entries are in quality order (ties by hash),
+/// which is the entry id order every bitmap speaks; the arenas hold the
+/// names back to back with one end offset per entry; posting arenas hold
+/// posting lists over the entries (write_postings) the same way.
+struct SearchIndexBlob {
+    std::uint32_t format_version = 0;
+    std::uint32_t search_version = 0;
+    /// See SearchSnapshot::generation.
+    std::uint64_t generation = 0;
+
+    std::vector<std::uint64_t> hashes;
+    std::string names;
+    std::vector<std::uint32_t> name_ends;
+    std::string args;
+    std::vector<std::uint32_t> args_ends;
+    /// The entry of the nearest enclosing symbol that is not an inline
+    /// namespace, or no_entry at the translation unit or when that symbol
+    /// is not in the index.
+    std::vector<std::uint32_t> parents;
+    std::vector<float> qualities;
+    /// Entries sorted by lowercase name, then name, then entry.
+    std::vector<std::uint32_t> by_lower_name;
+    /// Entries sorted by hash.
+    std::vector<std::uint32_t> by_hash;
+
+    std::vector<std::uint32_t> token_keys;
+    std::vector<std::uint32_t> token_ends;
+    std::vector<std::uint8_t> token_postings;
+
+    /// Entries with members, sorted; their members as bitmaps.
+    std::vector<std::uint32_t> container_entries;
+    std::vector<std::uint32_t> children_ends;
+    std::vector<std::uint8_t> children_postings;
+    /// The entries with no parent in the index, one posting list.
+    std::vector<std::uint8_t> top_level;
+
+    /// The entries whose name runs past the token bound (name_bound), one
+    /// posting list: their tail carries no token, so every name lookup scans
+    /// them.
+    std::vector<std::uint8_t> long_names;
+
+    /// Namespace entries, sorted; everything below each as bitmaps.
+    std::vector<std::uint32_t> subtree_entries;
+    std::vector<std::uint32_t> subtree_ends;
+    std::vector<std::uint8_t> subtree_postings;
+
+    /// One bitmap per SymbolKind value.
+    std::vector<std::uint32_t> kind_ends;
+    std::vector<std::uint8_t> kind_postings;
+
+    /// The files of the entries, one bitmap each.
+    std::vector<std::string> paths;
+    std::vector<std::uint32_t> file_ends;
+    std::vector<std::uint8_t> file_postings;
+
+    /// The entries of internal linkage, sorted, and the path each one's
+    /// entries live in.
+    std::vector<std::uint32_t> local_entries;
+    std::vector<std::uint32_t> local_paths;
+};
+
+/// The manifest's persisted form. Node and contribution payloads are
+/// varint-packed by hand: a big TU enters thousands of files, and LEB128
+/// on the small ids and lines roughly halves the blob against fixed-width
+/// columns.
+struct TUManifestBlob {
+    std::uint32_t format_version = 0;
+
+    std::uint64_t table_generation = 0;
+
+    std::uint64_t built_at = 0;
+
+    std::uint32_t tu_version = 0;
+
+    std::uint32_t node_count = 0;
+
+    std::uint32_t contribution_count = 0;
+
+    /// node_count × (varint version, varint parent, varint line): the parent 0
+    /// for the previous node's, 1 for the root, else its index plus 2; the
+    /// line shifted left by two over a bit for a skipped node and a bit for
+    /// a line stored as its distance past the previous node's — only
+    /// beside the previous node's parent, at or past its line.
+    std::vector<std::uint8_t> nodes;
+
+    /// contribution_count × (varint version, 8-byte little-endian variant hash —
+    /// hashes are random bits, varint would only inflate them)
+    std::vector<std::uint8_t> contributions;
+
+    std::vector<std::uint32_t> absent;
+
+    std::vector<std::uint32_t> imports;
+
+    /// TUManifest::shared_locals as columns: the symbols ascending, each
+    /// one's file versions back to back.
+    std::vector<std::uint64_t> local_symbols;
+    std::vector<std::uint32_t> local_file_ends;
+    std::vector<std::uint32_t> local_files;
+
+    /// TUManifest::instantiations as columns: per file its version and its
+    /// use.
+    std::vector<std::uint32_t> instantiation_files;
+    std::vector<std::uint64_t> instantiation_uses;
+};
+
 /// The bytes the fields of persisted blobs hold, summed over the blobs
-/// measured, by field path (`occs.packed`) in declaration order — how
+/// measured, by field path (`occurrences.packed`) in declaration order — how
 /// `clice index stats` splits a blob kind. Scalar fields and vector
 /// headers are left to the framing, the rest of the blobs' size.
 struct FieldBytes {
@@ -446,60 +721,6 @@ void measure_fields(const T& blob, FieldBytes& bytes, llvm::StringRef prefix) {
     [&]<std::size_t... Is>(std::index_sequence<Is...>) {
         (measure_field<Is>(blob, bytes, prefix), ...);
     }(std::make_index_sequence<kota::meta::field_count<T>()>{});
-}
-
-/// The bytes of `data` as the span every kota fbs entry point takes.
-inline std::span<const std::uint8_t> blob_bytes(llvm::StringRef data) {
-    return {reinterpret_cast<const std::uint8_t*>(data.data()), data.size()};
-}
-
-/// Verify and deserialize a blob into `out`. The out-parameter overload of
-/// from_bytes is deliberate: index types hold llvm::DenseMap members whose
-/// explicit default constructors fail std::default_initializable, which the
-/// value-returning overload requires.
-template <typename T>
-bool deserialize_blob(llvm::StringRef data, T& out) {
-    return kota::codec::fbs::from_bytes(blob_bytes(data), out).has_value();
-}
-
-inline llvm::StringRef to_ref(std::string_view text) {
-    return {text.data(), text.size()};
-}
-
-/// A scalar array view as an ArrayRef borrowing the mapped blob.
-template <typename T>
-llvm::ArrayRef<T> to_array_ref(kota::codec::fbs::array_view<T> view) {
-    if(!view.valid()) {
-        return {};
-    }
-    return {view.raw()->data(), view.raw()->size()};
-}
-
-/// Whether an end-offset column stays within its arena and never moves
-/// back: the shape of every "entries back to back" column pair.
-inline bool monotone_ends(llvm::ArrayRef<std::uint32_t> ends, std::size_t arena_size) {
-    std::uint32_t last = 0;
-    for(auto end: ends) {
-        if(end < last || end > arena_size) {
-            return false;
-        }
-        last = end;
-    }
-    return true;
-}
-
-/// monotone_ends whose entries cover the whole arena.
-inline bool covering_ends(llvm::ArrayRef<std::uint32_t> ends, std::size_t arena_size) {
-    return monotone_ends(ends, arena_size) &&
-           (ends.empty() ? arena_size == 0 : ends.back() == arena_size);
-}
-
-/// Entry `i` of an "entries back to back" column pair: the arena between
-/// the previous entry's end and its own.
-template <typename Arena>
-Arena back_to_back(Arena arena, llvm::ArrayRef<std::uint32_t> ends, std::uint32_t i) {
-    auto begin = i == 0 ? 0 : ends[i - 1];
-    return arena.drop_front(begin).take_front(ends[i] - begin);
 }
 
 }  // namespace clice::index

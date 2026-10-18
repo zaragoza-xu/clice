@@ -4,22 +4,22 @@ module;
 
 module clice;
 
-import :index.serialization;
+import :index.columns;
 import :unittests.utils;
 
 namespace clice::testing {
 namespace {
 
-using index::view_bitmap;
+using index::read_bitmap;
 using index::write_bitmap;
 
 std::optional<Bitmap> view_of(const std::vector<std::byte>& image) {
-    return view_bitmap(image.data(), image.size());
+    return read_bitmap(image.data(), image.size());
 }
 
-ZEST_SUITE(BitmapImage) {
+ZEST_SUITE(Columns) {
 
-ZEST_CASE(ViewMatchesBitmap) {  // Array containers alone (no run cookie, offsets stored), one run
+ZEST_CASE(ReadBitmapMatches) {  // Array containers alone (no run cookie, offsets stored), one run
     // container (too few containers to store offsets), and bitset, run
     // and array containers together (offsets stored).
     Bitmap arrays;
@@ -58,7 +58,7 @@ ZEST_CASE(ViewMatchesBitmap) {  // Array containers alone (no run cookie, offset
     ZEXPECT(view_of(empty)->isEmpty());
 }
 
-ZEST_CASE(ViewRejectsMalformed) {
+ZEST_CASE(ReadBitmapRejectsMalformed) {
     Bitmap bitmap;
     bitmap.add(1);
     bitmap.add(2);
@@ -69,7 +69,7 @@ ZEST_CASE(ViewRejectsMalformed) {
     ZASSERT(image.size() == 22u);
     ZASSERT(view_of(image));
 
-    ZEXPECT(!view_bitmap(image.data(), 0).has_value());
+    ZEXPECT(!read_bitmap(image.data(), 0).has_value());
     auto truncated = image;
     truncated.pop_back();
     ZEXPECT(!view_of(truncated).has_value());
@@ -94,7 +94,7 @@ ZEST_CASE(ViewRejectsMalformed) {
     ZEXPECT(!view_of(unsorted).has_value());
 }
 
-};  // ZEST_SUITE(BitmapImage)
+};  // ZEST_SUITE(Columns)
 
 }  // namespace
 }  // namespace clice::testing

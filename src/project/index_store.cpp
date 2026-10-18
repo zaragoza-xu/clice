@@ -436,9 +436,10 @@ std::expected<IndexStore::Report, IndexStore::MergeError>
     auto record_consumed = [&](std::uint32_t local_id, std::uint64_t content_hash) {
         auto compiled_hash = view.content_hash(local_id);
         if(compiled_hash != 0 && compiled_hash != content_hash) {
-            LOG_WARN("Reject merge for {}: rows for {} consumed other content than the compiler",
-                     tu_path,
-                     project.file_table.resolve(file_ids_map[local_id]));
+            LOG_WARN(
+                "Reject merge for {}: the entries for {} consumed other content than the compiler",
+                tu_path,
+                project.file_table.resolve(file_ids_map[local_id]));
             return false;
         }
         consumed_hashes[local_id] = content_hash;
@@ -481,14 +482,14 @@ std::expected<IndexStore::Report, IndexStore::MergeError>
         // with this file's index missing or stale — reject the whole
         // result; nothing is committed yet.
         if(llvm::xxh3_64bits(bytes) != blob_hash) {
-            LOG_WARN("Reject merge for {}: rows section for {} failed verification",
+            LOG_WARN("Reject merge for {}: the section for {} failed verification",
                      tu_path,
                      project.file_table.resolve(global_id));
             return std::unexpected(MergeError::Invalid);
         }
         auto fresh = index::Shard::from_buffer(llvm::MemoryBuffer::getMemBufferCopy(bytes));
         if(!fresh.loaded()) {
-            LOG_WARN("Reject merge for {}: rows for {} do not form a valid shard",
+            LOG_WARN("Reject merge for {}: the entries for {} do not form a valid shard",
                      tu_path,
                      project.file_table.resolve(global_id));
             return std::unexpected(MergeError::Invalid);
@@ -1349,6 +1350,8 @@ kota::task<> IndexStore::rebuild_search_index() {
     llvm::DenseMap<std::uint32_t, std::uint32_t> path_index;
     project_index.for_each_symbol(
         [&](index::SymbolHash hash, const index::SymbolView& symbol, std::uint32_t references) {
+            // Unnamed scopes stay in: the build names their members through
+            // them, and leaves them out of the index itself.
             if(!index::is_searchable_kind(symbol.kind) || symbol.name.empty()) {
                 return true;
             }
@@ -1384,7 +1387,7 @@ kota::task<> IndexStore::rebuild_search_index() {
         shard.for_each_local_symbol([&](index::SymbolHash hash, const index::SymbolView& symbol) {
             if(symbol.scope != index::SymbolScope::Internal ||
                !index::is_searchable_kind(symbol.kind) || symbol.name.empty() ||
-               !index::declares(shard, hash)) {
+               !shard.declares(hash)) {
                 return true;
             }
             auto [path, inserted] =
@@ -2010,7 +2013,7 @@ void IndexStore::retire_excluded(Report& report) {
         }
     }
     for(auto tu: excluded) {
-        LOG_INFO("A rule keeps {} out of the index; dropping its rows",
+        LOG_INFO("A rule keeps {} out of the index; dropping its entries",
                  project.file_table.resolve(tu));
         drop_index_into(tu, report);
     }

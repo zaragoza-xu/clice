@@ -244,7 +244,10 @@ int main() { return 0; }
 
     // The definition text comes from the same preamble entries, sliced from
     // the buffer: the hover card for a `#define` above the PCH bound.
-    auto definition = index::definition_text(index_query, cursor.symbols.front(), cursor.site.file);
+    auto definition = index::declared_text(index_query,
+                                           cursor.symbols.front(),
+                                           cursor.site.file,
+                                           RelationKind::Definition);
     ZASSERT(definition);
     ZEXPECT(llvm::StringRef(definition->text).contains("FOO"));
 }
@@ -380,7 +383,7 @@ int main() { return 0; }
     dir.touch("main.cpp", sources.all_files.find("main.cpp")->second.content);
     merge_disk_index(dir.path("main.cpp"));
 
-    auto text = index::definition_text(disk_query, hash_of("FOO"), Fid{});
+    auto text = index::declared_text(disk_query, hash_of("FOO"), Fid{}, RelationKind::Definition);
     ZASSERT(text);
     ZEXPECT(llvm::StringRef(text->text).contains("FOO"));
 }
@@ -401,7 +404,7 @@ int main() { return 0; }
     merge_disk_index();
 
     auto foo = hash_of("FOO");
-    ZEXPECT(!index::definition_text(disk_query, foo, Fid{}).has_value());
+    ZEXPECT(!index::declared_text(disk_query, foo, Fid{}, RelationKind::Definition).has_value());
 
     auto references = disk_query.sites(foo, Fid{}, RelationKind::Reference);
     ZASSERT(!references.empty());
@@ -448,7 +451,8 @@ ZEST_CASE(PreviewFromDisk) {
     symbol.name = "value";
     symbol.reference_files.add(path_id.raw);
 
-    auto definition = index::definition_text(disk_query, symbol_hash, Fid{});
+    auto definition =
+        index::declared_text(disk_query, symbol_hash, Fid{}, RelationKind::Definition);
     ZASSERT(definition);
     ZEXPECT(definition->text == "int value = 1;");
 
@@ -458,10 +462,37 @@ ZEST_CASE(PreviewFromDisk) {
             std::vector<std::string>{"int other = value;"});
 
     dir.touch("preview.cpp", "int moved = 0;\n");
-    ZEXPECT(!index::definition_text(disk_query, symbol_hash, Fid{}).has_value());
+    ZEXPECT(!index::declared_text(disk_query, symbol_hash, Fid{}, RelationKind::Definition)
+                 .has_value());
     references = disk_query.sites(symbol_hash, Fid{}, RelationKind::Reference);
     ZASSERT(!references.empty());
     ZEXPECT(index::context_lines(disk_query, references) == std::vector<std::string>{""});
+}
+
+ZEST_CASE(PreviewDropsLineEnd) {
+    // A CRLF file's preview line ends before its "\r\n".
+    llvm::StringRef text = "int value = 1;\r\nint other = value;\r\n";
+    dir.touch("crlf.cpp", text);
+    auto path_id = project.file_table.intern(Spelling::absolute(dir.path("crlf.cpp")));
+
+    index::SymbolHash symbol_hash = 778;
+    index::FileIndex file_index;
+    file_index.relations[symbol_hash].push_back({
+        .kind = RelationKind::Reference,
+        .range = {28, 33},
+        .target = 0
+    });
+    std::string bytes;
+    llvm::raw_string_ostream os(bytes);
+    index::write_shard(file_index, {}, text, os);
+    project.index.shards[path_id] =
+        index::Shard::from_buffer(llvm::MemoryBuffer::getMemBufferCopy(bytes));
+    project.index.edit(symbol_hash).reference_files.add(path_id.raw);
+
+    auto references = disk_query.sites(symbol_hash, Fid{}, RelationKind::Reference);
+    ZASSERT(references.size() == 1U);
+    ZEXPECT(index::context_lines(disk_query, references) ==
+            std::vector<std::string>{"int other = value;"});
 }
 
 ZEST_CASE(SharedPreambleScoped) {

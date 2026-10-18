@@ -26,8 +26,6 @@ namespace {
 /// better compacted by the rebuild the rejection triggers.
 constexpr inline std::uint32_t max_persisted_versions = 1u << 24;
 
-using BlobView = kota::codec::fbs::table_view<ProjectTableBlob>;
-
 /// A table derived from the manifests: file -> (TU -> the hash it names there).
 using UnitHashes = llvm::DenseMap<Fid, llvm::SmallDenseMap<Fid, std::uint64_t, 2>>;
 
@@ -92,13 +90,12 @@ bool ProjectIndex::bind_table(std::unique_ptr<llvm::MemoryBuffer> blob, FileTabl
     if(!blob) {
         return false;
     }
-    auto root = BlobView::from_bytes(blob_bytes(blob->getBuffer()));
-    if(!root.valid()) {
-        LOG_DEBUG("Rejecting project table: structural verification failed");
+    auto root = verify_root<ProjectTableBlob>(blob->getBuffer(), "project table");
+    if(!root) {
         return false;
     }
     auto bound = std::make_unique<ProjectTable>();
-    if(auto ok = bound->bind(root); !ok) {
+    if(auto ok = bound->bind(*root); !ok) {
         LOG_DEBUG("Rejecting project table: {}", std::string_view(ok.error()));
         return false;
     }
@@ -106,7 +103,7 @@ bool ProjectIndex::bind_table(std::unique_ptr<llvm::MemoryBuffer> blob, FileTabl
     // are inert.
     bound->remap.reserve(bound->paths.size());
     for(std::uint32_t i = 0; i < bound->paths.size(); i += 1) {
-        bound->remap.push_back(files.intern(local(to_ref(bound->paths[i]))));
+        bound->remap.push_back(files.intern(local(bound->paths[i])));
     }
     bound->buffer = std::move(blob);
     base = std::move(bound);
@@ -160,8 +157,8 @@ std::expected<void, llvm::StringRef>
         return std::unexpected("duplicate file version id");
     }
     llvm::DenseSet<std::pair<llvm::StringRef, std::uint64_t>> blob_versions;
-    for(std::size_t i = 0; i < count; i += 1) {
-        if(!blob_versions.insert({to_ref(blob.version_paths[i]), blob.version_hashes[i]}).second) {
+    for(std::uint32_t i = 0; i < count; i += 1) {
+        if(!blob_versions.insert({blob.version_paths[i], blob.version_hashes[i]}).second) {
             return std::unexpected("duplicate file version");
         }
     }
@@ -176,13 +173,13 @@ std::expected<void, llvm::StringRef>
     // Two spellings of one file intern to the same version; the ids both
     // stay mapped to it.
     next_persisted_id = blob.next_version_id;
-    for(std::size_t i = 0; i < count; i += 1) {
-        auto path_id = files.intern(local(to_ref(blob.version_paths[i])));
+    for(std::uint32_t i = 0; i < count; i += 1) {
+        auto path_id = files.intern(local(blob.version_paths[i]));
         auto id = files.intern_version(path_id, blob.version_hashes[i]);
         runtime_ids.try_emplace(blob.version_ids[i], id);
         persisted_ids.try_emplace(id, blob.version_ids[i]);
     }
-    for(std::size_t k = 0; k < blob.manifest_versions.size(); k += 1) {
+    for(std::uint32_t k = 0; k < blob.manifest_versions.size(); k += 1) {
         manifest_pins[runtime_ids.find(blob.manifest_versions[k])->second] =
             blob.manifest_generations[k];
     }
@@ -361,8 +358,8 @@ void ProjectIndex::for_each_symbol(
     }
 }
 
-std::size_t ProjectIndex::symbol_count() const {
-    std::size_t count = base ? base->count() : 0;
+std::uint32_t ProjectIndex::symbol_count() const {
+    std::uint32_t count = base ? base->count() : 0;
     for(auto hash: llvm::make_first_range(changed)) {
         if(!written.contains(hash) && !(base && base->find(hash))) {
             count += 1;
@@ -569,7 +566,7 @@ void ProjectIndex::serialize_table(llvm::raw_ostream& os, const FileTable& files
     if(base) {
         blob.paths.reserve(base->paths.size());
         for(std::uint32_t i = 0; i < base->paths.size(); i += 1) {
-            blob.paths.emplace_back(to_ref(base->paths[i]));
+            blob.paths.emplace_back(base->paths[i]);
             id_of.try_emplace(base->remap[i], i);
         }
     }
@@ -598,7 +595,7 @@ void ProjectIndex::serialize_table(llvm::raw_ostream& os, const FileTable& files
     }
     llvm::sort(keys);
     std::uint32_t base_entry = 0;
-    std::size_t k = 0;
+    std::uint32_t k = 0;
     auto base_count = base ? base->count() : 0;
     while(base_entry < base_count || k < keys.size()) {
         if(k == keys.size() || (base_entry < base_count && base->hashes[base_entry] < keys[k])) {
@@ -636,16 +633,13 @@ void ProjectIndex::serialize_table(llvm::raw_ostream& os, const FileTable& files
         blob.symbol_signatures += identity.signature;
         blob.symbol_signature_ends.push_back(
             static_cast<std::uint32_t>(blob.symbol_signatures.size()));
-        auto parent = std::ranges::lower_bound(blob.symbol_hashes, identity.parent);
-        if(identity.parent != 0 && parent != blob.symbol_hashes.end() &&
-           *parent == identity.parent) {
-            parents.push_back(static_cast<std::uint32_t>(parent - blob.symbol_hashes.begin()) + 1);
-        } else {
-            parents.push_back(0);
-            if(identity.parent != 0) {
-                blob.symbol_far_parents.push_back(i);
-                blob.symbol_far_parent_hashes.push_back(identity.parent);
-            }
+        auto parent = identity.parent == 0
+                          ? std::nullopt
+                          : sorted_find(llvm::ArrayRef(blob.symbol_hashes), identity.parent);
+        parents.push_back(parent ? *parent + 1 : 0);
+        if(identity.parent != 0 && !parent) {
+            blob.symbol_far_parents.push_back(i);
+            blob.symbol_far_parent_hashes.push_back(identity.parent);
         }
         blob.symbol_kinds.push_back(identity.kind.value());
         blob.symbol_flags.push_back(static_cast<std::uint16_t>(identity.flags));

@@ -12,7 +12,6 @@ import :index.database;
 import :index.format;
 import :index.instantiation_shard;
 import :index.project_index;
-import :index.project_table;
 import :index.query;
 import :index.search_index;
 import :index.symbol_query;
@@ -368,9 +367,7 @@ IndexStats collect_stats(Project& project) {
         stats.occurrences += stat.occurrences;
         stats.relations += stat.relations;
         stats.variants_per_shard.add(stat.variants);
-        if(index::ShardBlob blob; index::deserialize_blob(shard.bytes(), blob)) {
-            index::measure_fields(blob, stats.shard_fields);
-        }
+        index::measure_blob<index::ShardBlob>(shard.bytes(), stats.shard_fields);
         stats.shards.push_back(stat);
     }
     std::ranges::sort(stats.shards, std::ranges::greater{}, &ShardStat::bytes);
@@ -389,10 +386,8 @@ IndexStats collect_stats(Project& project) {
             stats.keys_per_template[key.pattern] += 1;
             return true;
         });
-        if(index::InstantiationShardBlob blob;
-           index::deserialize_blob(instantiations.bytes(), blob)) {
-            index::measure_fields(blob, stats.instantiation_fields);
-        }
+        index::measure_blob<index::InstantiationShardBlob>(instantiations.bytes(),
+                                                           stats.instantiation_fields);
         stats.instantiation_bytes += stat.bytes;
         stats.stored_uses += instantiations.uses().size();
         stats.resolutions += stat.resolutions;
@@ -414,17 +409,18 @@ IndexStats collect_stats(Project& project) {
         if(auto blob = project.database->read(index::BlobKind::TUManifest,
                                               project_index.key_of(project.file_table, tu))) {
             stats.manifest_bytes += blob.buffer->getBufferSize();
-            index::measure_manifest(blob.buffer->getBuffer(), stats.manifest_fields);
+            index::measure_blob<index::TUManifestBlob>(blob.buffer->getBuffer(),
+                                                       stats.manifest_fields);
         }
     }
     auto& db = *project.database;
     if(auto blob = db.read(index::BlobKind::ProjectTable, "global")) {
         stats.table_bytes = blob.buffer->getBufferSize();
-        index::measure_table(blob.buffer->getBuffer(), stats.table_fields);
+        index::measure_blob<index::ProjectTableBlob>(blob.buffer->getBuffer(), stats.table_fields);
     }
     if(auto blob = db.read(index::BlobKind::SearchIndex, "search")) {
         stats.search_bytes = blob.buffer->getBufferSize();
-        index::measure_search(blob.buffer->getBuffer(), stats.search_fields);
+        index::measure_blob<index::SearchIndexBlob>(blob.buffer->getBuffer(), stats.search_fields);
     }
 
     stats.usage = db.usage();
@@ -666,12 +662,12 @@ int run_show_symbol(Project& project, CommandResolver& commands, llvm::StringRef
     for(auto hash: matches) {
         auto info = query.symbol_info(hash);
         if(!info) {
-            driver::println("{}: no table knows this hash", format_hash(hash));
+            driver::println("{}: no table knows this hash", index::symbol_id(hash));
             rc = 1;
             continue;
         }
         driver::println("symbol {}  kind={}  name={}  args={}  qualified={}  flags={}  form={}",
-                        format_hash(hash),
+                        index::symbol_id(hash),
                         kind_name(info->kind),
                         info->name,
                         info->args,
@@ -684,11 +680,11 @@ int run_show_symbol(Project& project, CommandResolver& commands, llvm::StringRef
         for(auto parent = info->parent; parent != 0 && visited.insert(parent).second;) {
             auto scope = query.symbol_info(parent);
             if(!scope) {
-                driver::println("  parent {}: unknown", format_hash(parent));
+                driver::println("  parent {}: unknown", index::symbol_id(parent));
                 break;
             }
             driver::println("  parent {}  kind={}  name={}",
-                            format_hash(parent),
+                            index::symbol_id(parent),
                             kind_name(scope->kind),
                             scope->display_name());
             parent = scope->parent;
@@ -741,7 +737,7 @@ int run_show_file(Project& project, llvm::StringRef argument) {
     auto file = project.file_table.find(path);
     auto shard_it = file ? project.index.shards.find(*file) : project.index.shards.end();
     if(shard_it == project.index.shards.end()) {
-        driver::println("No rows for {} in the index.",
+        driver::println("No entries for {} in the index.",
                         project.file_table.display(CanonicalPath(path)));
         return 1;
     }
@@ -806,7 +802,7 @@ int run_show_file(Project& project, llvm::StringRef argument) {
     }
     for(auto& [hash, identity]: locals) {
         driver::println("    local {}  kind={}  name={}{}",
-                        format_hash(hash),
+                        index::symbol_id(hash),
                         kind_name(identity.kind),
                         identity.name,
                         identity.args);

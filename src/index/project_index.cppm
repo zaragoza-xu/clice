@@ -169,6 +169,13 @@ struct ProjectIndex {
     /// loaded precompiled header -> the TUs reading it (TUManifest::imports).
     llvm::DenseMap<Fid, llvm::SmallDenseSet<Fid, 2>> importers;
 
+    /// Derived from `manifests`: a symbol below external scope -> the sets
+    /// of files the TUs' local fanouts list for it, each with how many list
+    /// it (TUManifest::local_fanout). Kept apart, as two TUs can name one
+    /// hash in files they do not share: a namespace nested in an anonymous
+    /// namespace has no file in its hash.
+    llvm::DenseMap<SymbolHash, std::map<std::vector<Fid>, std::uint32_t>> fanout_sets;
+
     /// Derived from `manifests`: file fid -> (TU fid -> the instantiation
     /// use it names there).
     llvm::DenseMap<Fid, llvm::SmallDenseMap<Fid, std::uint64_t, 2>> instantiation_uses;
@@ -229,16 +236,14 @@ struct ProjectIndex {
     /// holds no manifests to derive it from.
     void each_contributor(Fid file, llvm::function_ref<void(Fid)> visit) const;
 
-    /// The files holding entries of an internal-linkage symbol, starting from
-    /// `anchor`, a file that holds some: the anchor, and every file the
-    /// local fanout (TUManifest::local_fanout) of a TU contributing to a
-    /// file reached so far lists for the symbol. A `static` in a header is
-    /// thus reached in every unit including the header, whichever of its
-    /// files the walk starts from. Each file once.
-    void each_fanout_file(SymbolHash hash,
-                          Fid anchor,
-                          const FileTable& files,
-                          llvm::function_ref<void(Fid)> visit) const;
+    /// The files holding entries of a symbol below external scope: `anchor`,
+    /// a file that holds some, and the files of every TU local fanout
+    /// (TUManifest::local_fanout) for it that lists a file reached — from
+    /// `fanout_sets` in a writer, from the global blob's persisted copy in a
+    /// reader. A `static` in a header is thus reached in every unit
+    /// including the header or reading it through a precompiled header.
+    /// Each file once.
+    void each_fanout_file(SymbolHash hash, Fid anchor, llvm::function_ref<void(Fid)> visit) const;
 
     /// A TU's manifest: held by a writer, fetched on first use by a reader
     /// — whose copy names its versions by persisted ids. Null when the TU

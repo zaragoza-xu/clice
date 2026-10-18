@@ -121,8 +121,12 @@ inline std::string symbol_id(SymbolHash hash) {
 /// payloads are placed by kind bits and block counts, shards keep only the
 /// text of their non-ASCII lines, the global table's file sets of one or two
 /// files are raw ids, and manifests name the use set their unit shares in a
-/// file's instantiation blob and encode runs of include siblings.
-constexpr inline std::uint32_t index_format_version = 39;
+/// file's instantiation blob and encode runs of include siblings; v40: a
+/// local fanout names its files by version, including files the unit reads
+/// through a precompiled header or a module, function-local symbols other
+/// files name join the TU index's table and the fanout, and the global
+/// table lists the files the fanouts name per symbol.
+constexpr inline std::uint32_t index_format_version = 40;
 
 /// Serialize a reflected index blob to `os` as a verified-readable
 /// flatbuffer. Encoding only fails on structural impossibilities (e.g. more

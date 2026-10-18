@@ -185,11 +185,12 @@ private:
             return focus.contains(note.fid);
         };
         if(focus.contains(main.fid)) {
-            // A scope the focus file leaves open swallows the suffix
-            // appended past its text: the error the buffer's end raises
-            // shows where the scope opened.
+            // A scope the focus file leaves open swallows the include of a
+            // header context's suffix clang's buffer goes on with past the
+            // text: the error the buffer's end raises shows where the scope
+            // opened.
             auto anchor = main.range;
-            if(past_text(anchor.begin)) {
+            if(anchor.begin > focus.content().size()) {
                 auto note = llvm::find_if(main.notes, in_focus);
                 if(note == main.notes.end()) {
                     return false;
@@ -269,14 +270,6 @@ private:
                  main.id.level >= DiagnosticLevel::Error ? "error occurred here"
                                                          : "warning occurred here");
         return true;
-    }
-
-    /// Whether `offset` lies past the editor's text, on the include of a
-    /// header context's suffix the focus file's buffer goes on with.
-    bool past_text(std::uint32_t offset) {
-        auto focus = unit.focus_file();
-        auto end = unit.text_end(focus.file());
-        return end < focus.content().size() && offset > end;
     }
 
     /// The filename of the #include in the focus file that `fid` was

@@ -8,6 +8,7 @@ import :index.database;
 import :index.instantiation_shard;
 import :index.manifest;
 import :index.search_index;
+import :index.serialization;
 import :index.shard;
 import :index.tu_index;
 import :vfs.file_table;
@@ -168,12 +169,13 @@ struct ProjectIndex {
     /// loaded precompiled header -> the TUs reading it (TUManifest::imports).
     llvm::DenseMap<Fid, llvm::SmallDenseSet<Fid, 2>> importers;
 
-    /// Derived from `manifests`: file -> (instantiation resolution -> how many
-    /// TUs use it). Its resolutions are the file's live ones.
-    llvm::DenseMap<Fid, llvm::DenseMap<std::uint64_t, std::uint32_t>> instantiation_uses;
+    /// Derived from `manifests`: file fid -> (TU fid -> the instantiation
+    /// use it names there).
+    llvm::DenseMap<Fid, llvm::SmallDenseMap<Fid, std::uint64_t, 2>> instantiation_uses;
 
-    /// The live instantiation resolutions of `path_id`, ascending.
-    llvm::SmallVector<std::uint64_t> live_resolutions(Fid path_id) const;
+    /// The distinct uses named in `path_id`, ascending — the file's live
+    /// use set.
+    llvm::SmallVector<std::uint64_t> live_uses(Fid path_id) const;
 
     /// What an instantiation shard names a TU by: the hash of its database
     /// key.
@@ -287,23 +289,6 @@ struct ProjectIndex {
     /// from it on first use. False when there is no readable global blob.
     bool open(BlobDatabase& db, FileTable& files);
 
-    /// The byte split of the base blob's symbol table and reverse include
-    /// graph; everything else in the blob (file versions, the path table,
-    /// framing) is the remainder of its serialized size.
-    struct GlobalColumns {
-        std::size_t names = 0;
-        std::size_t args = 0;
-        std::size_t signatures = 0;
-        std::size_t bitmaps = 0;
-        std::size_t instantiation_bitmaps = 0;
-        /// Hash, parent, kind, flags and file per symbol.
-        std::size_t fixed = 0;
-        std::size_t contributors = 0;
-    };
-
-    /// For `clice index stats`.
-    GlobalColumns global_columns() const;
-
 private:
     struct Base;
     std::unique_ptr<Base> base;
@@ -339,5 +324,8 @@ private:
 
     std::uint32_t persisted_id(VersionID version);
 };
+
+/// Add the fields of a global blob to `bytes`, for `clice index stats`.
+void measure_global(llvm::StringRef data, FieldBytes& bytes);
 
 }  // namespace clice::index

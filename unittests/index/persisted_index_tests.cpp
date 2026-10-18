@@ -23,12 +23,24 @@ ZEST_CASE(ManifestRoundTrip) {
     manifest.global_gen = 7;
     manifest.built_at = 1234567;
     manifest.tu_fv = VersionID{300};
-    // A root node, a multi-byte-varint line, and a parent that FOLLOWS its
-    // child (the include tree resolves parent chains after appending).
+    // A root node, a multi-byte-varint line, a parent that FOLLOWS its child
+    // (the include tree resolves parent chains after appending), and runs of
+    // siblings — skipped or not, lines ascending or not, under a node or the
+    // root.
     manifest.nodes = {
-        {300, ~0u, 1    },
-        {301, 2,   70000},
-        {302, 0,   12   },
+        {300, ~0u, 1,     false},
+        {301, 2,   70000, false},
+        {302, 0,   12,    false},
+        {303, 0,   14,    true },
+        {304, 0,   14,    true },
+        {305, 0,   3,     true },
+        {306, 0,   90000, false},
+        {307, ~0u, 5,     true },
+        {308, ~0u, 2,     false},
+    };
+    manifest.instantiations = {
+        {.file = VersionID{301}, .use = 0x1234},
+        {.file = VersionID{302}, .use = 0x5678},
     };
     manifest.contributions = {
         {VersionID{300}, 0xdeadbeefdeadbeefull},
@@ -70,8 +82,7 @@ struct ManifestBlobMirror {
     std::vector<std::uint32_t> local_file_ends;
     std::vector<std::uint32_t> local_files;
     std::vector<std::uint32_t> instantiation_files;
-    std::vector<std::uint32_t> instantiation_ends;
-    std::vector<std::uint64_t> instantiation_resolutions;
+    std::vector<std::uint64_t> instantiation_uses;
 };
 
 ZEST_CASE(ManifestFanoutRejected) {
@@ -107,26 +118,44 @@ ZEST_CASE(ManifestFanoutRejected) {
     ZASSERT(!decodes(mirror));
 }
 
-ZEST_CASE(ManifestCorruptResolutionsRejected) {
-    // A resolution the manifest uses keys a DenseMap at load: a sentinel
-    // value must not decode, nor a resolution no file lists.
+ZEST_CASE(ManifestCorruptUsesRejected) {
+    // A use the manifest names keys a DenseMap at load: a sentinel value
+    // must not decode, nor a use no file lists.
     ManifestBlobMirror mirror;
     mirror.format_version = index::index_format_version;
     mirror.instantiation_files = {1};
-    mirror.instantiation_ends = {1};
-    mirror.instantiation_resolutions = {42};
+    mirror.instantiation_uses = {42};
     auto decodes = [&] {
         auto blob = kota::codec::fbs::to_bytes(mirror);
         return blob.has_value() && index::deserialize_manifest(bytes_of(*blob)).has_value();
     };
     ZASSERT(decodes());
-    mirror.instantiation_resolutions = {~0ull};
+    mirror.instantiation_uses = {~0ull};
     ZEXPECT(!decodes());
-    mirror.instantiation_resolutions = {~0ull - 1};
+    mirror.instantiation_uses = {~0ull - 1};
     ZEXPECT(!decodes());
     mirror.instantiation_files = {};
-    mirror.instantiation_ends = {};
-    mirror.instantiation_resolutions = {42};
+    mirror.instantiation_uses = {42};
+    ZEXPECT(!decodes());
+}
+
+ZEST_CASE(ManifestNodeCodesRejected) {
+    // A node can stand beside the previous node's parent only after one, and
+    // only beside it can its line be a distance.
+    ManifestBlobMirror mirror;
+    mirror.format_version = index::index_format_version;
+    mirror.node_count = 1;
+    auto decodes = [&] {
+        auto blob = kota::codec::fbs::to_bytes(mirror);
+        return blob.has_value() && index::deserialize_manifest(bytes_of(*blob)).has_value();
+    };
+    mirror.nodes = {7, 1, 5 << 2};
+    ZASSERT(decodes());
+    mirror.nodes = {7, 0, 5 << 2};
+    ZEXPECT(!decodes());
+    mirror.nodes = {7, 1, (5 << 2) | 1};
+    ZEXPECT(!decodes());
+    mirror.nodes = {7, 3, 5 << 2};
     ZEXPECT(!decodes());
 }
 
@@ -314,6 +343,23 @@ ZEST_CASE(GlobalVersionGate) {
     ZASSERT(!loaded.load_global("not a flatbuffer", pool, pins).has_value());
 }
 
+/// A file set as the writer stores it: up to two path ids raw as u32s, more
+/// as a portable roaring image.
+std::vector<std::uint8_t> file_set(const clice::Bitmap& ids) {
+    std::vector<std::uint8_t> bytes;
+    if(ids.cardinality() <= 2) {
+        for(std::uint32_t id: ids) {
+            auto* raw = reinterpret_cast<const std::uint8_t*>(&id);
+            bytes.insert(bytes.end(), raw, raw + sizeof(id));
+        }
+        return bytes;
+    }
+    for(auto byte: index::write_bitmap(ids)) {
+        bytes.push_back(static_cast<std::uint8_t>(byte));
+    }
+    return bytes;
+}
+
 /// Field order MUST mirror GlobalBlob (project_index.cpp).
 struct GlobalBlobMirror {
     std::uint32_t format_version = index::index_format_version;
@@ -326,19 +372,23 @@ struct GlobalBlobMirror {
     std::vector<std::uint64_t> sym_hashes;
     std::string sym_names;
     std::vector<std::uint32_t> sym_name_ends;
+    std::vector<std::uint32_t> sym_args_docs;
     std::string sym_args;
     std::vector<std::uint32_t> sym_args_ends;
     std::string sym_signatures;
     std::vector<std::uint32_t> sym_signature_ends;
-    std::vector<std::uint64_t> sym_parents;
+    index::IdColumn sym_parents;
+    std::vector<std::uint32_t> sym_far_parents;
+    std::vector<std::uint64_t> sym_far_parent_hashes;
     std::vector<std::uint8_t> sym_kinds;
     std::vector<std::uint16_t> sym_flags;
     std::vector<std::uint8_t> sym_token_kinds;
     std::vector<std::uint32_t> sym_token_modifiers;
-    std::vector<std::uint32_t> sym_files;
-    std::vector<std::uint32_t> sym_reference_counts;
+    index::IdColumn sym_files;
+    index::IdColumn sym_reference_counts;
     std::vector<std::uint32_t> sym_bitmap_ends;
     std::vector<std::uint8_t> sym_bitmaps;
+    std::vector<std::uint32_t> sym_instantiation_docs;
     std::vector<std::uint32_t> sym_instantiation_ends;
     std::vector<std::uint8_t> sym_instantiations;
     std::vector<std::uint32_t> manifest_fvs;
@@ -347,29 +397,30 @@ struct GlobalBlobMirror {
     std::vector<std::uint64_t> search_pending;
     std::vector<std::uint32_t> search_pending_files;
 
-    /// Append an entry; hashes must arrive ascending.
+    /// Append an entry, its parent outside the table; hashes must arrive
+    /// ascending, at most 255 of them.
     void add_symbol(std::uint64_t hash,
                     llvm::StringRef name,
-                    const std::vector<std::byte>& image,
+                    llvm::ArrayRef<std::uint8_t> image,
                     std::uint64_t parent = 0,
                     std::uint32_t file = index::no_file) {
+        if(parent != 0) {
+            sym_far_parents.push_back(static_cast<std::uint32_t>(sym_hashes.size()));
+            sym_far_parent_hashes.push_back(parent);
+        }
         sym_hashes.push_back(hash);
         sym_names += name;
         sym_name_ends.push_back(static_cast<std::uint32_t>(sym_names.size()));
-        sym_args_ends.push_back(static_cast<std::uint32_t>(sym_args.size()));
         sym_signature_ends.push_back(static_cast<std::uint32_t>(sym_signatures.size()));
-        sym_parents.push_back(parent);
+        sym_parents.push_back(0);
         sym_kinds.push_back(0);
         sym_flags.push_back(0);
         sym_token_kinds.push_back(0);
         sym_token_modifiers.push_back(0);
-        sym_files.push_back(file);
+        sym_files.push_back(static_cast<std::uint8_t>(file == index::no_file ? 0 : file + 1));
         sym_reference_counts.push_back(0);
-        for(auto byte: image) {
-            sym_bitmaps.push_back(static_cast<std::uint8_t>(byte));
-        }
+        sym_bitmaps.insert(sym_bitmaps.end(), image.begin(), image.end());
         sym_bitmap_ends.push_back(static_cast<std::uint32_t>(sym_bitmaps.size()));
-        sym_instantiation_ends.push_back(static_cast<std::uint32_t>(sym_instantiations.size()));
     }
 };
 
@@ -390,7 +441,7 @@ ZEST_CASE(GlobalBitmapPayloadGate) {
     bits.add(3);
     GlobalBlobMirror mirror;
     mirror.paths = four_paths();
-    mirror.add_symbol(42, "sym", index::write_bitmap(bits));
+    mirror.add_symbol(42, "sym", file_set(bits));
 
     clice::FileTable pool;
     llvm::DenseMap<VersionID, std::uint64_t> pins;
@@ -409,7 +460,7 @@ ZEST_CASE(GlobalBitmapPayloadGate) {
     mirror.fv_ids = {7};
     mirror.fv_paths = {"/proj/partial.h"};
     mirror.fv_hashes = {0x1};
-    mirror.add_symbol(43, "other", {std::byte{0xff}, std::byte{0xff}, std::byte{0xff}});
+    mirror.add_symbol(43, "other", std::vector<std::uint8_t>{0xff, 0xff, 0xff});
     auto corrupt = encode(mirror);
     ZASSERT(corrupt);
     index::ProjectIndex rejecting;
@@ -428,7 +479,7 @@ ZEST_CASE(UncoveredBitmapIdRejected) {
     bits.add(3);
     GlobalBlobMirror mirror;
     mirror.paths = {"/proj/0.h"};
-    mirror.add_symbol(42, "sym", index::write_bitmap(bits));
+    mirror.add_symbol(42, "sym", file_set(bits));
 
     clice::FileTable pool;
     llvm::DenseMap<VersionID, std::uint64_t> pins;
@@ -564,7 +615,7 @@ ZEST_CASE(UncoveredFileIdRejected) {
     // this session interned at that id: reject it like an uncovered
     // bitmap id.
     GlobalBlobMirror mirror;
-    mirror.add_symbol(42, "sym", index::write_bitmap(clice::Bitmap{}));
+    mirror.add_symbol(42, "sym", file_set(clice::Bitmap{}));
 
     clice::FileTable pool;
     llvm::DenseMap<VersionID, std::uint64_t> pins;
@@ -573,12 +624,41 @@ ZEST_CASE(UncoveredFileIdRejected) {
     index::ProjectIndex loaded;
     ZASSERT(loaded.load_global(bytes_of(*control), pool, pins));
 
-    mirror.sym_files = {5};
+    mirror.sym_files = {6};
     auto uncovered = encode(mirror);
     ZASSERT(uncovered);
     index::ProjectIndex rejecting;
     ZASSERT(!rejecting.load_global(bytes_of(*uncovered), pool, pins).has_value());
     ZASSERT(rejecting.symbol_count() == 0u);
+}
+
+ZEST_CASE(GlobalSparseColumnsRejected) {
+    // The sparse columns name symbols by position: one past the table or
+    // out of order would hand a symbol another's arguments or parent.
+    GlobalBlobMirror mirror;
+    mirror.add_symbol(42, "a", file_set(clice::Bitmap{}));
+    mirror.add_symbol(43, "b", file_set(clice::Bitmap{}));
+    mirror.sym_args_docs = {1};
+    mirror.sym_args = "<int>";
+    mirror.sym_args_ends = {5};
+
+    clice::FileTable pool;
+    llvm::DenseMap<VersionID, std::uint64_t> pins;
+    auto loads = [&] {
+        auto bytes = encode(mirror);
+        index::ProjectIndex loaded;
+        return bytes && loaded.load_global(bytes_of(*bytes), pool, pins).has_value();
+    };
+    ZASSERT(loads());
+    mirror.sym_args_docs = {2};
+    ZEXPECT(!loads());
+    mirror.sym_args_docs = {1};
+
+    mirror.sym_far_parents = {1, 0};
+    mirror.sym_far_parent_hashes = {7, 8};
+    ZEXPECT(!loads());
+    mirror.sym_far_parents = {0, 1};
+    ZEXPECT(loads());
 }
 
 ZEST_CASE(GlobalDuplicateSymbolRejected) {
@@ -590,8 +670,8 @@ ZEST_CASE(GlobalDuplicateSymbolRejected) {
     bits.add(3);
     GlobalBlobMirror mirror;
     mirror.paths = four_paths();
-    mirror.add_symbol(42, "sym", index::write_bitmap(bits));
-    mirror.add_symbol(42, "impostor", index::write_bitmap(bits));
+    mirror.add_symbol(42, "sym", file_set(bits));
+    mirror.add_symbol(42, "impostor", file_set(bits));
 
     clice::FileTable pool;
     llvm::DenseMap<VersionID, std::uint64_t> pins;
@@ -618,7 +698,7 @@ ZEST_CASE(GlobalTokenKindRejected) {
     // marks a corrupt blob.
     GlobalBlobMirror mirror;
     mirror.paths = four_paths();
-    mirror.add_symbol(42, "sym", index::write_bitmap(clice::Bitmap{}));
+    mirror.add_symbol(42, "sym", file_set(clice::Bitmap{}));
     mirror.sym_token_kinds = {200};
 
     clice::FileTable pool;
@@ -657,14 +737,14 @@ ZEST_CASE(GlobalReservedKeysRejected) {
         bits.add(3);
         GlobalBlobMirror mirror;
         mirror.paths = four_paths();
-        mirror.add_symbol(~std::uint64_t(0), "sym", index::write_bitmap(bits));
+        mirror.add_symbol(~std::uint64_t(0), "sym", file_set(bits));
         auto bytes = encode(mirror);
         ZASSERT(bytes);
         ZASSERT(!loaded.load_global(bytes_of(*bytes), pool, pins).has_value());
     }
     {
         GlobalBlobMirror mirror;
-        mirror.add_symbol(42, "sym", index::write_bitmap(clice::Bitmap{}), ~std::uint64_t(0));
+        mirror.add_symbol(42, "sym", file_set(clice::Bitmap{}), ~std::uint64_t(0));
         auto bytes = encode(mirror);
         ZASSERT(bytes);
         ZASSERT(!loaded.load_global(bytes_of(*bytes), pool, pins).has_value());

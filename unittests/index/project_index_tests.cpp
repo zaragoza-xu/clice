@@ -418,6 +418,121 @@ ZEST_CASE(GlobalRoundTripWithRealMerge) {
     ZASSERT(llvm::is_contained(reference_files(loaded, symbol), fresh_id->raw));
 }
 
+ZEST_CASE(GlobalColumnsRoundTrip) {
+    // Parents index the table, or a sparse column when outside it; only the
+    // symbols having arguments or instantiation files list them; a file set
+    // stores up to two ids raw and more as a roaring image. Every one reads
+    // back as written, and again after a rewrite copies the entries over.
+    clice::FileTable pool;
+    index::ProjectIndex project;
+    std::vector<Fid> files;
+    for(int i = 0; i < 4; i += 1) {
+        files.push_back(pool.intern(Spelling::absolute(std::format("/proj/{}.h", i))));
+    }
+    auto& scope = project.touch(10);
+    scope.name = "ns";
+    scope.kind = SymbolKind::Namespace;
+    scope.reference_files.add(files[0].raw);
+    auto& member = project.touch(20);
+    member.name = "f";
+    member.args = "<int>";
+    member.parent = 10;
+    member.file = files[1].raw;
+    member.reference_files.add(files[1].raw);
+    member.reference_files.add(files[2].raw);
+    auto& outsider = project.touch(30);
+    outsider.name = "g";
+    outsider.parent = 999;
+    for(auto file: files) {
+        outsider.reference_files.add(file.raw);
+    }
+    outsider.instantiation_files.add(files[3].raw);
+
+    auto check = [&](const index::ProjectIndex& index, const clice::FileTable& table) {
+        auto id_of = [&](llvm::StringRef path) {
+            return table.find(Spelling::absolute(path))->raw;
+        };
+        auto scope = index.identity_of(10);
+        ZASSERT(scope);
+        ZEXPECT(scope->parent == 0u);
+        ZEXPECT(scope->args.empty());
+        ZEXPECT(scope->file == index::no_file);
+        auto member = index.identity_of(20);
+        ZASSERT(member);
+        ZEXPECT(member->parent == 10u);
+        ZEXPECT(member->args == "<int>");
+        ZEXPECT(member->file == id_of("/proj/1.h"));
+        ZEXPECT(index.reference_count(20) == 2u);
+        auto outsider = index.identity_of(30);
+        ZASSERT(outsider);
+        ZEXPECT(outsider->parent == 999u);
+        ZEXPECT(index.reference_count(10) == 1u);
+        ZEXPECT(index.reference_count(30) == 4u);
+        std::vector<std::uint32_t> referencing;
+        index.each_reference_file(30, [&](Fid file) { referencing.push_back(file.raw); });
+        std::ranges::sort(referencing);
+        std::vector<std::uint32_t> expected{id_of("/proj/0.h"),
+                                            id_of("/proj/1.h"),
+                                            id_of("/proj/2.h"),
+                                            id_of("/proj/3.h")};
+        std::ranges::sort(expected);
+        ZEXPECT(referencing == expected);
+        std::vector<std::uint32_t> instantiating;
+        index.each_instantiation_file(30, [&](Fid file) { instantiating.push_back(file.raw); });
+        ZEXPECT(instantiating == std::vector{id_of("/proj/3.h")});
+        std::size_t none = 0;
+        index.each_instantiation_file(20, [&](Fid) { none += 1; });
+        ZEXPECT(none == 0u);
+    };
+
+    llvm::SmallString<4096> first;
+    llvm::raw_svector_ostream first_os(first);
+    project.serialize_global(first_os, pool);
+    clice::FileTable fresh;
+    index::ProjectIndex loaded;
+    llvm::DenseMap<VersionID, std::uint64_t> pins;
+    ZASSERT(loaded.load_global(first.str(), fresh, pins));
+    check(loaded, fresh);
+
+    llvm::SmallString<4096> second;
+    llvm::raw_svector_ostream second_os(second);
+    loaded.serialize_global(second_os, fresh);
+    clice::FileTable again;
+    index::ProjectIndex reloaded;
+    ZASSERT(reloaded.load_global(second.str(), again, pins));
+    check(reloaded, again);
+}
+
+ZEST_CASE(WidePathIds) {
+    // File ids take the width of the path table, which the files only the
+    // reverse include graph names grow after the symbols are written.
+    clice::FileTable pool;
+    index::ProjectIndex project;
+    auto file_of = [&](int i) {
+        return pool.intern(Spelling::absolute(std::format("/proj/{}.h", i)));
+    };
+    auto& symbol = project.touch(10);
+    symbol.name = "x";
+    symbol.file = file_of(0).raw;
+    symbol.reference_files.add(file_of(0).raw);
+    auto unit = file_of(1000);
+    for(int i = 1; i <= 300; i += 1) {
+        project.contributions[file_of(i)][unit] = 1;
+    }
+
+    llvm::SmallString<4096> bytes;
+    llvm::raw_svector_ostream os(bytes);
+    project.serialize_global(os, pool);
+    clice::FileTable fresh;
+    index::ProjectIndex loaded;
+    llvm::DenseMap<VersionID, std::uint64_t> pins;
+    ZASSERT(loaded.load_global(bytes.str(), fresh, pins));
+    auto identity = loaded.identity_of(10);
+    ZASSERT(identity);
+    ZEXPECT(fresh.find(Spelling::absolute("/proj/0.h")) == Fid{identity->file});
+    ZEXPECT(loaded.reference_count(10) == 1u);
+}
+
 ZEST_CASE(LazyShardsStayPut) {
     // A reader fetches shards while a query still holds the ones it read
     // first: the fan-out of a position query resolves other files between

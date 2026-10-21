@@ -194,10 +194,63 @@ std::expected<Job, std::string> ask_clang(llvm::ArrayRef<std::string> args,
     return query_driver(clang_args, cwd);
 }
 
-/// cl and clang-cl: clang's own driver in cl mode, which sets the
-/// windows-msvc target itself.
-std::expected<Job, std::string> ask_cl(llvm::ArrayRef<std::string> args, llvm::StringRef cwd) {
-    return ask_clang(args, {"--driver-mode=cl"}, cwd);
+/// cl and clang-cl: asked to preprocess a file naming their macros, the
+/// driver tells the C++ standard it compiles in — what `/std:c++latest`
+/// means moves from one version to the next — and cl its version, where
+/// clang's own detection would take the newest toolset installed. clang's
+/// own driver in cl mode, which sets the windows-msvc target itself, then
+/// builds the job in that standard and version. clang-cl's version is the
+/// one that detection finds, from the toolset its flags select
+/// (`/winsysroot`), as it does here.
+kota::task<std::expected<Job, std::string>> ask_cl(llvm::ArrayRef<std::string> args,
+                                                   CompilerFamily family,
+                                                   llvm::StringRef input,
+                                                   std::string cwd) {
+    if(auto error = vfs::write(input, cl_probe_source)) {
+        co_return std::unexpected(
+            std::format("Failed to write {}: {}", input.str(), error.message()));
+    }
+    // cl hears only the command's `/std:` (and the driver mode that makes
+    // a `clang` clang-cl): its other flags are spelled for clang's cl mode
+    // (`/WX` arrives as -Werror, which cl rejects), and a standard or
+    // version set in clang's spelling (a rule's `-std=c++23`) is clang's
+    // to read, not cl's.
+    std::vector<std::string> probe = {args[0], "/nologo", "/EP"};
+    bool names_standard = false;
+    bool names_version = false;
+    for(llvm::StringRef arg: args.drop_front()) {
+        if(arg.starts_with("/std:") || arg.starts_with("--driver-mode=")) {
+            probe.push_back(arg.str());
+        }
+        arg.consume_front("/clang:");
+        names_standard = names_standard || arg.starts_with("-std=");
+        names_version = names_version || arg.starts_with("-fms-compatibility-version=") ||
+                        arg.starts_with("-fmsc-version=");
+    }
+    probe.push_back(input.str());
+    auto output = co_await execute(std::move(probe), cwd);
+    if(!output) {
+        co_return std::unexpected(std::move(output.error()));
+    }
+    if(!output->failure.empty()) {
+        // cl reports its errors on stdout, clang-cl on stderr.
+        auto last_line = llvm::StringRef(output->err.empty() ? output->out : output->err).rtrim();
+        last_line = last_line.substr(last_line.rfind('\n') + 1);
+        co_return std::unexpected(std::format("{}: {}", output->failure, last_line.str()));
+    }
+    auto report = parse_cl_report(output->out);
+
+    auto job = ask_clang(args, {"--driver-mode=cl"}, cwd);
+    if(!job) {
+        co_return job;
+    }
+    if(!names_standard && !report.standard.empty()) {
+        job->push_back("-std=" + report.standard);
+    }
+    if(family == CompilerFamily::MSVC && !names_version && !report.version.empty()) {
+        job->push_back("-fms-compatibility-version=" + report.version);
+    }
+    co_return job;
 }
 
 /// A driver clice does not query: clang's own driver stands in for it, as a
@@ -534,10 +587,12 @@ kota::task<std::expected<Job, std::string>> query_one(const QuerySpec& spec) {
 
     std::size_t driver_tokens = spec.family == CompilerFamily::Zig ? 2 : 1;
     std::expected<Job, std::string> job;
-    if(spec.family == CompilerFamily::MSVC || spec.family == CompilerFamily::ClangCL) {
-        job = ask_cl(args, spec.cwd);
-    } else if(!spec.query_toolchain) {
-        job = ask_clang_for(std::move(args), driver_tokens, spec.cwd);
+    bool cl = spec.family == CompilerFamily::MSVC || spec.family == CompilerFamily::ClangCL;
+    if(!spec.query_toolchain) {
+        job = cl ? ask_clang(args, {"--driver-mode=cl"}, spec.cwd)
+                 : ask_clang_for(std::move(args), driver_tokens, spec.cwd);
+    } else if(cl) {
+        job = co_await ask_cl(args, spec.family, *input, spec.cwd);
     } else if(spec.family == CompilerFamily::NVCC) {
         job = co_await ask_nvcc(args, *input, spec.kind, spec.cwd);
     } else {

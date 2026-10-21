@@ -414,6 +414,62 @@ ZEST_CASE(ClangJobKeepsStandard, skip = Windows) {
     ZEXPECT(!contains(argv, "-std=gnu++14"));
 }
 
+/// A cl answering the macro probe as cl 19.44 does, and rejecting a flag
+/// spelled for clang's cl mode as cl does (`/WX` renders as -Werror: D8021).
+std::string fake_cl(llvm::StringRef name = "cl") {
+    return fake_driver(name, R"(case " $* " in *" -W"*|*" /clang:"*)
+  echo "cl : Command line error D8021 : invalid numeric argument '/Werror'"
+  exit 2 ;;
+esac
+case " $* " in
+*" /std:c++17 "*) echo 'msvc_lang 201703L' ;;
+*) echo 'msvc_lang 202400L' ;;
+esac
+echo 'msc_full_ver 194435207'
+)");
+}
+
+/// The standard the cc1 command compiles in: its last -std.
+llvm::StringRef last_standard(llvm::ArrayRef<const char*> argv) {
+    for(llvm::StringRef arg: llvm::reverse(argv)) {
+        if(arg.starts_with("-std=")) {
+            return arg;
+        }
+    }
+    return {};
+}
+
+ZEST_CASE(CLStandardAndVersion, skip = Windows) {
+    // `/std:c++latest` means the compiler's newest standard, not the linked
+    // clang's: C++26 to cl 19.44, whose version the job takes too. cl hears
+    // the standard alone: the command's other flags are spelled for clang.
+    auto cl = fake_cl();
+    auto argv = f.resolve(add("a.cpp", {cl.c_str(), "/std:c++latest", "/WX-", "/Wall"}));
+    ZEXPECT(last_standard(argv) == "-std=c++26");
+    ZEXPECT(contains(argv, "-fms-compatibility-version=19.44.35207"));
+}
+
+ZEST_CASE(CLKeepsClangSpellings, skip = Windows) {
+    // A standard and a version set in clang's spelling stay clang's reading.
+    auto cl = fake_cl();
+    auto argv = f.resolve(add("a.cpp",
+                              {cl.c_str(),
+                               "/std:c++17",
+                               "/clang:-std=c++23",
+                               "/clang:-fms-compatibility-version=19.29"}));
+    ZEXPECT(last_standard(argv) == "-std=c++23");
+    ZEXPECT(!contains(argv, "-fms-compatibility-version=19.44.35207"));
+}
+
+ZEST_CASE(ClangCLOwnVersion, skip = Windows) {
+    // clang-cl's version is the toolset its flags select, which the job
+    // finds as clang-cl does; its standard is still its own to tell.
+    auto clang_cl = fake_cl("clang-cl");
+    auto argv = f.resolve(add("a.cpp", {clang_cl.c_str(), "/std:c++latest"}));
+    ZEXPECT(last_standard(argv) == "-std=c++26");
+    ZEXPECT(!contains(argv, "-fms-compatibility-version=19.44.35207"));
+}
+
 ZEST_CASE(UserContentAttached, skip = Windows) {
     // The probe never sees user content; the render puts it back on the
     // driver's cc1 line.
@@ -687,6 +743,15 @@ ZEST_CASE(UnqueriedRunsNothing, skip = Windows) {
 
     ZEXPECT(!f.db.toolchain().resolve(ref.config, ref.input));
     ZEXPECT(vfs::exists(ran));
+}
+
+ZEST_CASE(UnqueriedCLRunsNothing, skip = Windows) {
+    // Nor is cl asked its standard: clang's own cl mode reads the command.
+    auto ran = tmp.path("ran");
+    auto cl = fake_driver("cl", std::format("touch '{}'\n", ran));
+    auto argv = f.resolve(unqueried(add("a.cpp", {cl.c_str(), "/std:c++17"})));
+    ZEXPECT(contains(argv, "-std=c++17"));
+    ZEXPECT(!vfs::exists(ran));
 }
 
 ZEST_CASE(UnqueriedTargetFromName) {

@@ -7,21 +7,21 @@ module clice:server.live_sources;
 import :index.query;
 import :project.project;
 import :sched.families.pch;
-import :server.ast_projection;
+import :server.document_compile;
 import :server.session_store;
 
 namespace clice {
 
 /// The server's live index sources: the open buffers' own file indexes
-/// (current per the AST projections), the PCH overlays their preambles
+/// (current per the AST family's latest compiles), the PCH overlays their preambles
 /// were compiled into, and the preamble regions those overlays indexed.
 class ServerLiveSources final : public index::LiveSources {
 public:
     ServerLiveSources(Project& project,
                       PCHFamily& pch,
                       const SessionStore& sessions,
-                      const ASTProjectionTable& projections) :
-        project(project), pch(pch), sessions(sessions), projections(projections) {}
+                      const DocumentCompiles& compiles) :
+        project(project), pch(pch), sessions(sessions), compiles(compiles) {}
 
     bool is_open(Fid file) const override;
     std::optional<index::IndexSource> buffer_index(Fid file) const override;
@@ -50,7 +50,7 @@ private:
     Project& project;
     PCHFamily& pch;
     const SessionStore& sessions;
-    const ASTProjectionTable& projections;
+    const DocumentCompiles& compiles;
 };
 
 }  // namespace clice

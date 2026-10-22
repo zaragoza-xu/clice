@@ -6,9 +6,10 @@ module;
 
 module clice;
 
-import :command.argument_parser;
-import :command.command;
-import :command.cygwin;
+import :command.argument;
+import :command.database;
+import :command.file_kind;
+import :command.table;
 import :command.toolchain;
 import :config.config;
 import :driver.driver;
@@ -17,6 +18,7 @@ import :project.load;
 import :project.open_index;
 import :project.project;
 import :support.shell;
+import :vfs.cygwin;
 import :vfs.file_system;
 import :vfs.file_table;
 import :vfs.path;
@@ -187,9 +189,11 @@ struct Rendered {
     std::optional<std::string> error;
 };
 
-Rendered render_command(CompilationDatabase& cdb, const CommandRef& ref) {
-    auto resolved = cdb.toolchain().resolve(ref.config, ref.input);
-    auto argv = resolved ? cdb.render(ref) : cdb.render_driver(ref);
+Rendered render_command(Project& project, const CommandRef& ref) {
+    auto resolved = project.toolchain.resolve(ref.command, ref.input);
+    auto path = project.cdb.spelling(ref.file);
+    auto argv =
+        resolved ? project.toolchain.render(ref, path) : project.commands.render_driver(ref, path);
     Rendered rendered{
         .arguments = {argv.begin(), argv.end()}
     };
@@ -264,10 +268,13 @@ int run_file(const FileOptions& opts) {
     }
     llvm::SmallVector<CommandRef> refs;
     for(auto& entry: entries) {
-        refs.push_back(
-            project.build.resolve(file, entry.config, CommandSource::CDBExact, identity, identity));
+        refs.push_back(project.build.resolve(file,
+                                             entry.command,
+                                             CommandSource::CDBExact,
+                                             identity,
+                                             identity));
     }
-    project.cdb.warm(refs);
+    project.toolchain.warm(refs);
     FileCommands commands{.file = files.display(file)};
     for(auto [entry, ref]: llvm::zip_equal(entries, refs)) {
         auto written = written_entry(project.cdb, entry);
@@ -276,8 +283,8 @@ int run_file(const FileOptions& opts) {
             LOG_ERROR("{} changed while it was read; run the command again", database);
             return 1;
         }
-        auto rendered = render_command(project.cdb, ref);
-        auto directory = Spelling::absolute(project.cdb.config(ref.config).directory);
+        auto rendered = render_command(project, ref);
+        auto directory = Spelling::absolute(project.commands.get(ref.command).directory);
         commands.commands.push_back({
             .database = files.display(CanonicalPath(database)),
             .entry = std::move(*written),
@@ -300,9 +307,8 @@ int run_file(const FileOptions& opts) {
 /// `directory` moved by -working-directory.
 llvm::SmallVector<Spelling> compiled_sources(llvm::ArrayRef<std::string> command,
                                              const Spelling& directory) {
-    auto family = llvm::is_contained(command, "--driver-mode=cl")
-                      ? CompilerFamily::ClangCL
-                      : Toolchain::driver_family(command.front());
+    auto family = llvm::is_contained(command, "--driver-mode=cl") ? CompilerFamily::ClangCL
+                                                                  : driver_family(command.front());
     std::vector<std::string> args(command.begin() + 1, command.end());
     auto options = kota::option::ParseOptions{.dash_dash_parsing = true,
                                               .visibility = family_visibility(family)};
@@ -358,7 +364,7 @@ int convert_command(Workspace& workspace, llvm::ArrayRef<std::string> command, b
     }
     auto& project = *workspace.project;
     auto& cdb = project.cdb;
-    cdb.set_workspace_root(CanonicalPath(workspace.root));
+    project.commands.set_workspace_root(CanonicalPath(workspace.root));
     project.build.reset_active(workspace.configuration);
 
     llvm::SmallVector<const char*> argv;
@@ -372,12 +378,12 @@ int convert_command(Workspace& workspace, llvm::ArrayRef<std::string> command, b
     }
     CanonicalRef identity = project.file_table.resolve(entry->file);
     auto ref = project.build.resolve(entry->file,
-                                     entry->config,
+                                     entry->command,
                                      CommandSource::CDBExact,
                                      identity,
                                      identity);
-    cdb.warm(ref);
-    auto rendered = render_command(cdb, ref);
+    project.toolchain.warm(ref);
+    auto rendered = render_command(project, ref);
     if(json) {
         print_json(DatabaseEntry{.directory = directory.str(),
                                  .file = sources.front().str(),
@@ -406,7 +412,7 @@ int convert_database(Workspace& workspace, const Spelling& path) {
     auto& project = *workspace.project;
     auto& cdb = project.cdb;
     auto& files = project.file_table;
-    cdb.set_workspace_root(CanonicalPath(workspace.root));
+    project.commands.set_workspace_root(CanonicalPath(workspace.root));
     project.build.reset_active(workspace.configuration);
     auto source = cdb.add_source(path);
     auto database = Spelling::absolute(cdb.source_path(source));
@@ -429,14 +435,14 @@ int convert_database(Workspace& workspace, const Spelling& path) {
     for(auto& entry: cdb.entries()) {
         CanonicalRef identity = files.resolve(entry.file);
         auto ref = project.build.resolve(entry.file,
-                                         entry.config,
+                                         entry.command,
                                          CommandSource::CDBExact,
                                          identity,
                                          identity);
         refs.try_emplace(entry.ordinal, ref);
         all.push_back(ref);
     }
-    cdb.warm(all);
+    project.toolchain.warm(all);
 
     // A relative directory is relative to the database's own; written out,
     // the database is read from anywhere.
@@ -458,13 +464,13 @@ int convert_database(Workspace& workspace, const Spelling& path) {
         } else if(ref != refs.end()) {
             // A database written inside Cygwin or MSYS2 converts to the
             // Windows paths clice read it as.
-            entry.directory = cdb.config(ref->second.config).directory;
+            entry.directory = project.commands.get(ref->second.command).directory;
             entry.file = files.resolve(ref->second.file).str();
         }
         // The command of one clice does not compile, another language's
         // source, is left as it is too.
         if(ref != refs.end()) {
-            auto rendered = render_command(cdb, ref->second);
+            auto rendered = render_command(project, ref->second);
             if(rendered.error) {
                 unresolved += 1;
             }

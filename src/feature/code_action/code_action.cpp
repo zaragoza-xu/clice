@@ -7,6 +7,8 @@ module clice;
 import :command.file_kind;
 import :compile.compilation;
 import :feature.code_action.action;
+import :feature.code_action.code_action;
+import :feature.formatting;
 import :semantic.display;
 import :semantic.semantics;
 import :syntax.lexer;

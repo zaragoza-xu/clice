@@ -2,26 +2,31 @@ module;
 
 #include "modules/prelude.h"
 
+#include "support/logging.macros.h"
+
 module clice;
 
+import :command.argument;
 import :command.toolchains.clang;
+import :support.logging;
 import :vfs.file_system;
 
 namespace clice {
 
 namespace {
 
-/// The first error clang's driver reports, which says why it built no job
-/// when it builds none; it builds one despite most (an unknown flag).
-struct FirstError : clang::DiagnosticConsumer {
-    std::string message;
+/// The errors clang's driver reports. The first says why it built no job
+/// when it builds none; it builds one despite most, leaving out what it
+/// could not read (a whole `-march` naming an extension it does not know).
+struct DriverErrors : clang::DiagnosticConsumer {
+    std::vector<std::string> messages;
 
     void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
                           const clang::Diagnostic& info) override {
-        if(level >= clang::DiagnosticsEngine::Error && message.empty()) {
+        if(level >= clang::DiagnosticsEngine::Error) {
             llvm::SmallString<128> text;
             info.FormatDiagnostic(text);
-            message = text.str();
+            messages.push_back(text.str().str());
         }
     }
 };
@@ -31,15 +36,15 @@ struct FirstError : clang::DiagnosticConsumer {
 std::expected<Job, std::string> query_driver(llvm::ArrayRef<std::string> args,
                                              llvm::StringRef cwd) {
     clang::DiagnosticOptions options;
-    FirstError first_error;
+    DriverErrors errors;
     clang::DiagnosticsEngine engine(new clang::DiagnosticIDs(),
                                     options,
-                                    &first_error,
+                                    &errors,
                                     /*ShouldOwnClient=*/false);
     auto failure = [&](llvm::StringRef what) {
-        return first_error.message.empty()
+        return errors.messages.empty()
                    ? std::format("{} for {}", what.str(), args.front())
-                   : std::format("{} for {}: {}", what.str(), args.front(), first_error.message);
+                   : std::format("{} for {}: {}", what.str(), args.front(), errors.messages[0]);
     };
 
     llvm::SmallVector<const char*, 256> list;
@@ -85,13 +90,18 @@ std::expected<Job, std::string> query_driver(llvm::ArrayRef<std::string> args,
         return std::unexpected(failure("No clang job found"));
     }
 
+    for(auto& message: errors.messages) {
+        LOG_WARN("clang's driver, reading the command of {}: {}", args.front(), message);
+    }
     Job job{arguments[0]};
     job.insert(job.end(), cmd->getArguments().begin(), cmd->getArguments().end());
     return job;
 }
 
 bool names_standard(llvm::ArrayRef<std::string> args) {
-    return std::ranges::any_of(args, [](llvm::StringRef arg) { return arg.starts_with("-std="); });
+    return std::ranges::any_of(args, [](llvm::StringRef arg) {
+        return arg.starts_with("-std=") || arg == "--std";
+    });
 }
 
 std::expected<Job, std::string> ask_clang(llvm::ArrayRef<std::string> args,
@@ -116,11 +126,9 @@ std::expected<Job, std::string> ask_clang_for(std::vector<std::string> args,
                                               llvm::StringRef cwd) {
     args.erase(args.begin() + 1, args.begin() + driver_tokens);
     std::vector<std::string> mode;
-    auto name = clang::driver::ToolChain::getTargetAndModeFromProgramName(args[0]);
-    // clang takes the prefix only when a backend it links knows it, and
-    // clice links none: any prefix naming an architecture is a target.
-    if(llvm::Triple(name.TargetPrefix).getArch() != llvm::Triple::UnknownArch) {
-        mode.push_back("--target=" + name.TargetPrefix);
+    if(auto target = name_target(args[0]); !target.empty()) {
+        LOG_INFO("clang reads the command of {} for {}, the target its name sets", args[0], target);
+        mode.push_back("--target=" + target);
     }
     return ask_clang(args, mode, cwd);
 }

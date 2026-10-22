@@ -214,7 +214,7 @@ Toolchain::QueryKey Toolchain::query_key(CommandID id, InputKind input) {
         if(!in_query_view(arg, command.family)) {
             continue;
         }
-        out.key += std::to_string(arg.opt_id);
+        out.key += std::to_string(keeps_alias(arg, command.family) ? arg.alias : arg.opt_id);
         out.key += '\0';
         /// All unknown options share one id; their identity is the spelling
         /// (the NVCC translation carries `-ccbin=<path>` through here, and
@@ -252,13 +252,6 @@ Toolchain::QueryArgv Toolchain::query_argv(const Command& command) {
         }
         if(arg.opt_id == option::OPT_UNKNOWN) {
             out.argv.push_back(arg.spelling);
-            continue;
-        }
-        // clang reads a bare -flto, and GCC's -flto=auto, as -flto=full,
-        // which GCC rejects.
-        if(arg.opt_id == option::OPT_flto_EQ && arg.values.size() == 1 &&
-           llvm::StringRef(arg.values[0]) == "full") {
-            out.argv.push_back("-flto");
             continue;
         }
         render_driver_arg(arg, command.family, emit);
@@ -341,6 +334,10 @@ Toolchain::Frontend Toolchain::frontend(llvm::ArrayRef<std::string> job) {
     std::vector<LocalArg> staged;
     for(auto& arg: kept) {
         if(target && !known_name(arg)) {
+            LOG_INFO("clang's target {} knows no CPU or ABI named {} ({}): its default stands in",
+                     triple,
+                     arg.values[0],
+                     option::table().option(arg.id)->prefixed_name());
             continue;
         }
         auto local = commands.local_arg(arg, tokens);
@@ -376,6 +373,7 @@ Toolchain::ResolvedID Toolchain::synthesize(CommandID id, const Frontend& query)
         return LocalArg{
             .opt_id = arg.opt_id,
             .cls = arg.cls,
+            .alias = arg.alias,
             .spelling = arg.spelling,
             .values = {arg.values.begin(), arg.values.end()}
         };

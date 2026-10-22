@@ -2,13 +2,17 @@ module;
 
 #include "modules/prelude.h"
 
+#include "support/logging.macros.h"
+
 module clice;
 
 import :command.argument;
 import :command.table;
 import :command.toolchains.clang;
 import :command.toolchains.gcc;
+import :support.logging;
 import :support.process;
+import :support.shell;
 import :vfs.cygwin;
 import :vfs.path;
 
@@ -67,16 +71,144 @@ kota::task<std::expected<GCCStyleOutput, std::string>> translate_posix_paths(GCC
     co_return output;
 }
 
-/// GCC's two-core tuning form, `-mcpu=cortex-a72.cortex-a53`, as the first
-/// core alone: clang knows no such name, and the first core's architecture
-/// is the code's. The features after the cores keep their dots
-/// (`-mcpu=cortex-m7+nofp.dp`).
-std::string first_core(llvm::StringRef arg) {
-    if(!arg.starts_with("-mcpu=")) {
-        return arg.str();
+/// The extensions of a RISC-V ISA string after its `rv32` or `rv64`, each
+/// with the version the string gives it, as the ISA string is written:
+/// single letters may run together, versioned or not (`imac`, `i2p0m2p0`,
+/// `gcv0p7`), and a multi-letter one (`zba`, a vendor's `xw`) runs to the
+/// next `_`, glued to the letters before it or not (`rv32imacxw`).
+llvm::SmallVector<llvm::StringRef> riscv_extensions(llvm::StringRef isa) {
+    llvm::SmallVector<llvm::StringRef> parts;
+    isa.split(parts, '_', -1, /*KeepEmpty=*/false);
+    llvm::SmallVector<llvm::StringRef> extensions;
+    for(auto part: parts) {
+        while(!part.empty()) {
+            if(llvm::StringRef("zsx").contains(part.front())) {
+                extensions.push_back(part);
+                break;
+            }
+            std::size_t length = 1;
+            auto digits = [&] {
+                auto start = length;
+                while(length < part.size() && llvm::isDigit(part[length])) {
+                    length += 1;
+                }
+                return length > start;
+            };
+            if(digits() && length + 1 < part.size() && part[length] == 'p' &&
+               llvm::isDigit(part[length + 1])) {
+                length += 1;
+                digits();
+            }
+            extensions.push_back(part.take_front(length));
+            part = part.drop_front(length);
+        }
     }
-    auto features = arg.find('+');
-    return (arg.substr(0, features).split('.').first + arg.substr(features)).str();
+    return extensions;
+}
+
+/// An extension without the version an ISA string may give it, `<major>` or
+/// `<major>p<minor>` (`i2p0`, `zba1`).
+llvm::StringRef unversioned(llvm::StringRef extension) {
+    constexpr llvm::StringLiteral digits = "0123456789";
+    auto name = extension.rtrim(digits);
+    auto major = name;
+    if(major.consume_back("p") && major.rtrim(digits).size() < major.size()) {
+        return major.rtrim(digits);
+    }
+    return name;
+}
+
+/// Whether LLVM reads `isa` as clang's driver does: a profile
+/// (`rva22u64`) as well as extensions.
+bool parses(llvm::StringRef isa) {
+    auto info = llvm::RISCVISAInfo::parseArchString(isa, /*EnableExperimentalExtension=*/false);
+    if(!info) {
+        llvm::consumeError(info.takeError());
+        return false;
+    }
+    return true;
+}
+
+/// A RISC-V ISA string as clang can read it. clang drops a whole string
+/// naming an extension LLVM does not know (a vendor's, WCH's `xw`), a
+/// version of one it does not know (older GCCs' `i2p0`, where LLVM's I is
+/// 2.1), or an extension LLVM has only as experimental (GCC 15's
+/// `zicfilp`), and every feature macro of the rest with it. The second
+/// takes the version LLVM knows, the others go; a string LLVM reads stays.
+std::string riscv_isa_for_clang(llvm::StringRef isa) {
+    if(parses(isa)) {
+        return isa.str();
+    }
+    auto usable = [](llvm::StringRef extension) {
+        auto feature = llvm::RISCVISAInfo::getTargetFeatureForExtension(extension);
+        return !feature.empty() && !llvm::StringRef(feature).starts_with("experimental-");
+    };
+    auto known = [&](llvm::StringRef extension) -> std::optional<llvm::StringRef> {
+        if(usable(extension)) {
+            return extension;
+        }
+        auto name = unversioned(extension);
+        if(name.size() < extension.size() && usable(name)) {
+            LOG_INFO("LLVM knows no version {} of the RISC-V extension {}: clang reads its own",
+                     extension.drop_front(name.size()),
+                     name);
+            return name;
+        }
+        return std::nullopt;
+    };
+
+    // The first part stays when LLVM reads it (`rv32imc`, a profile);
+    // else its width does, and its base (`i`, `e`, `g`, which LLVM has as
+    // no extension of its own) without a version LLVM does not know.
+    auto [first, rest] = isa.split('_');
+    std::string result;
+    llvm::SmallVector<llvm::StringRef> extensions;
+    if(parses(first)) {
+        result = first.str();
+        extensions = riscv_extensions(rest);
+    } else {
+        auto width = first.find_first_not_of("rv0123456789");
+        result = first.take_front(width).str();
+        extensions = riscv_extensions(isa.drop_front(width));
+        if(!extensions.empty()) {
+            result += known(extensions.front()).value_or(unversioned(extensions.front()));
+            extensions.erase(extensions.begin());
+        }
+    }
+    for(auto extension: extensions) {
+        if(auto name = known(extension)) {
+            result += '_';
+            result += *name;
+        } else {
+            LOG_WARN(
+                "clang takes no RISC-V extension {} (LLVM has none, or an experimental "
+                "one): it reads -march={} without it",
+                extension,
+                isa);
+        }
+    }
+    return result;
+}
+
+/// An option of GCC's as clang's driver takes it: GCC's two-core tuning
+/// form, `-mcpu=cortex-a72.cortex-a53`, as the first core alone (clang
+/// knows no such name, and the first core's architecture is the code's;
+/// the features after the cores keep their dots, `-mcpu=cortex-m7+nofp.dp`),
+/// and a RISC-V ISA string as clang can read it.
+std::string for_clang(llvm::StringRef arg, const llvm::Triple& target) {
+    if(arg.starts_with("-mcpu=")) {
+        auto features = arg.find('+');
+        auto first = (arg.substr(0, features).split('.').first + arg.substr(features)).str();
+        if(first != arg) {
+            LOG_INFO("clang reads {} as {}, its first core", arg, first);
+        }
+        return first;
+    }
+    llvm::StringRef isa = arg;
+    if(target.isRISCV() && isa.consume_front("-march=")) {
+        return "-march=" + riscv_isa_for_clang(isa);
+    }
+    return arg.str();
 }
 
 }  // namespace
@@ -137,6 +269,7 @@ GCCStyleOutput parse_gcc_style_output(llvm::StringRef out, llvm::StringRef err) 
 
     llvm::StringRef cplusplus;
     llvm::StringRef stdc_version;
+    llvm::StringRef riscv_xlen;
     bool strict = false;
     bool opencl = false;
     llvm::SmallVector<llvm::StringRef> macros;
@@ -150,6 +283,8 @@ GCCStyleOutput parse_gcc_style_output(llvm::StringRef out, llvm::StringRef err) 
             cplusplus = value;
         } else if(name == "__STDC_VERSION__") {
             stdc_version = value;
+        } else if(name == "__riscv_xlen") {
+            riscv_xlen = value;
         } else if(name == "__STRICT_ANSI__") {
             strict = true;
         } else if(name == "__OPENCL_C_VERSION__" || name == "__OPENCL_CPP_VERSION__") {
@@ -160,6 +295,15 @@ GCCStyleOutput parse_gcc_style_output(llvm::StringRef out, llvm::StringRef err) 
     if(!opencl) {
         output.standard = standard_from_macros(cplusplus, stdc_version, strict);
     }
+    llvm::Triple target(output.target);
+    if(target.getArch() == llvm::Triple::UnknownArch && target.getArchName() == "riscv" &&
+       !riscv_xlen.empty()) {
+        target.setArchName(("riscv" + riscv_xlen).str());
+        LOG_INFO("GCC's target {} names no width: clang reads it as {}, as __riscv_xlen says",
+                 output.target,
+                 target.str());
+        output.target = target.str();
+    }
     return output;
 }
 
@@ -168,16 +312,30 @@ kota::task<std::expected<GCCStyleOutput, std::string>>
     std::vector<std::string> argv(args.begin(), args.begin() + driver_tokens);
     argv.insert(argv.end(), {"-E", "-dM", "-v"});
     argv.insert(argv.end(), args.begin() + driver_tokens, args.end());
+    auto command = join_command(argv);
     auto output = co_await execute(std::move(argv), std::move(cwd));
     if(!output) {
         co_return std::unexpected(std::move(output.error()));
     }
     auto parsed = parse_gcc_style_output(output->out, output->err);
     if(parsed.clang_job.empty() && !output->failure.empty()) {
-        auto last_line = llvm::StringRef(output->err).rtrim();
-        last_line = last_line.substr(last_line.rfind('\n') + 1);
-        auto error = last_line.empty() ? output->failure
-                                       : std::format("{}: {}", output->failure, last_line.str());
+        // The version GCC prints last says nothing: its errors come before
+        // it (an unknown option), or before "compilation terminated.".
+        llvm::SmallVector<llvm::StringRef> lines;
+        llvm::StringRef(output->err).split(lines, '\n', -1, false);
+        std::string reported;
+        for(auto line: lines) {
+            line = line.trim();
+            if(line.contains(" error: ")) {
+                reported += reported.empty() ? "" : "; ";
+                reported += line;
+            }
+        }
+        if(reported.empty() && !lines.empty()) {
+            reported = lines.back().trim();
+        }
+        auto error =
+            reported.empty() ? output->failure : std::format("{}: {}", output->failure, reported);
 #ifdef _WIN32
         // Windows looks for a program's DLLs on PATH: without its runtime's
         // directory there, a Cygwin or MSYS2 driver cannot start (exception
@@ -189,6 +347,7 @@ kota::task<std::expected<GCCStyleOutput, std::string>>
                 "MSYS2's, belongs on clice's PATH, which clice.serverEnv sets in VS Code)";
         }
 #endif
+        LOG_WARN("The toolchain query {} failed: {}", command, error);
         co_return std::unexpected(std::move(error));
     }
     co_return co_await translate_posix_paths(std::move(parsed), args[0]);
@@ -204,13 +363,14 @@ std::expected<Job, std::string> query_as_gcc(const GCCStyleOutput& output,
                                            resource_dir().str()};
     auto parse_options =
         kota::option::ParseOptions{.visibility = family_visibility(CompilerFamily::GCC)};
+    llvm::Triple target(output.target);
     for(auto& parsed: option::table().parse(output.gcc_options, parse_options)) {
         if(parsed && parsed->id != option::OPT_UNKNOWN) {
-            clang_args.push_back(first_core(output.gcc_options[parsed->index]));
+            clang_args.push_back(for_clang(output.gcc_options[parsed->index], target));
         }
     }
     for(llvm::StringRef arg: args.drop_front()) {
-        clang_args.push_back(first_core(arg));
+        clang_args.push_back(for_clang(arg, target));
     }
 
     auto job = query_driver(clang_args, cwd);

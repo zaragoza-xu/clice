@@ -2,11 +2,14 @@ module;
 
 #include "modules/prelude.h"
 
+#include "support/logging.macros.h"
+
 module clice;
 
 import :command.argument;
 import :command.file_kind;
 import :command.table;
+import :support.logging;
 import :vfs.path;
 
 namespace clice {
@@ -95,7 +98,7 @@ LocalArg CommandTable::local_arg(
                 .cls = ArgClass::Unknown,
                 .spelling = strings.save(tokens[index]).data()};
     }
-    LocalArg local{.opt_id = parsed->id};
+    LocalArg local{.opt_id = parsed->id, .alias = written_alias(*parsed)};
     for(llvm::StringRef value: parsed->values) {
         local.values.push_back(strings.save(value).data());
     }
@@ -272,6 +275,18 @@ std::vector<const char*> CommandTable::render_driver(const CommandRef& ref,
     argv.push_back(command.driver);
     if(command.subcommand) {
         argv.push_back(command.subcommand);
+    }
+
+    // clang reads a target off its program's name in its main alone, never
+    // when its library builds the invocation.
+    bool names_target = ranges::any_of(command.args, [](const Arg& arg) {
+        return arg.opt_id == option::OPT_target;
+    });
+    if(auto target = name_target(command.driver); !target.empty() && !names_target) {
+        LOG_INFO("clang reads the command of {} for {}, the target its name sets",
+                 command.driver,
+                 target);
+        argv.push_back(intern("--target=" + target).data());
     }
 
     // Inject our resource dir if the command names none, so the embedded

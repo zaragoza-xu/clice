@@ -117,6 +117,17 @@ ZEST_CASE(KeyTracksSemantics) {
     ZEXPECT(f.key(base) != f.key(semantic));
 }
 
+ZEST_CASE(KeyTracksWrittenAlias) {
+    /// A GCC may know an option by one name alone; nvcc's query reads
+    /// clang's names, whichever the command wrote.
+    auto g = f.add("/fake", "/tmp/a.c", {"gcc", "-G", "8", "/tmp/a.c"});
+    auto limit = f.add("/fake", "/tmp/b.c", {"gcc", "-msmall-data-limit=8", "/tmp/b.c"});
+    ZEXPECT(f.key(g) != f.key(limit));
+    auto offload = f.add("/fake", "/tmp/c.cu", {"nvcc", "--offload-host-only", "/tmp/c.cu"});
+    auto cuda = f.add("/fake", "/tmp/d.cu", {"nvcc", "--cuda-host-only", "/tmp/d.cu"});
+    ZEXPECT(f.key(offload) == f.key(cuda));
+}
+
 ZEST_CASE(KeyTracksConfigFile) {
     /// A --config path resolves against the compilation directory, so
     /// identical commands in different directories must not share a query.
@@ -171,6 +182,22 @@ ZEST_CASE(FailedQueryRetries, skip = Windows) {
     f.toolchain.warm(refs);
     ZEXPECT(f.toolchain.failed_count() == std::size_t(0));
     ZEXPECT(f.toolchain.query_count() == std::size_t(2));
+}
+
+ZEST_CASE(FallbackTargetFromName) {
+    // Without the compiler's answer, clang's own driver reads the command
+    // for the target the compiler's name sets, as for an unqueried one.
+    auto ref = add("a.c", {tmp.c_path("riscv32-wch-elf-gcc"), "-mcmodel=medany", "-c"});
+    ZEXPECT(!f.toolchain.resolve(ref.command, ref.input));
+    auto argv = f.toolchain.render(ref, f.db.spelling(ref.file));
+    ZEXPECT(contains(argv, "--target=riscv32-wch-elf"));
+
+    /// A target the command names is the one.
+    auto own = add("b.c", {tmp.c_path("riscv32-wch-elf-gcc"), "-target", "riscv64-unknown-elf"});
+    ZEXPECT(!f.toolchain.resolve(own.command, own.input));
+    argv = f.toolchain.render(own, f.db.spelling(own.file));
+    ZEXPECT(!contains(argv, "--target=riscv32-wch-elf"));
+    ZEXPECT(adjacent(argv, "-target", "riscv64-unknown-elf"));
 }
 
 ZEST_CASE(WarmPartialFailure, skip = Windows) {

@@ -164,6 +164,123 @@ ZEST_CASE(DriverFamily) {
     ZEXPECT(driver_family("zig.exe") == Zig);
 };
 
+ZEST_CASE(NameTarget) {
+    ZEXPECT(name_target("riscv32-wch-elf-gcc") == "riscv32-wch-elf");
+    ZEXPECT(name_target("/opt/arm/bin/arm-none-eabi-g++") == "arm-none-eabi");
+    ZEXPECT(name_target("gcc").empty());
+    ZEXPECT(name_target("clang++").empty());
+    /// A prefix naming no architecture is no target.
+    ZEXPECT(name_target("ccache-gcc").empty());
+};
+
+ZEST_CASE(NameTargetWindows, skip = !Windows) {
+    /// A database written on Windows may name the driver this way.
+    ZEXPECT(name_target(R"(C:/MounRiver/toolchain/gcc15/bin\riscv32-wch-elf-gcc.EXE)") ==
+            "riscv32-wch-elf");
+};
+
+ZEST_CASE(EveryAliasRendersBack) {
+    /// Every alias a GCC-style command can write renders back to itself:
+    /// read again, the same option through the same alias, the same values.
+    auto visibility = family_visibility(CompilerFamily::GCC);
+    auto parse_options = kota::option::ParseOptions{.visibility = visibility};
+    llvm::BumpPtrAllocator allocator;
+    llvm::StringSaver strings(allocator);
+    std::size_t checked = 0;
+    for(auto& option: option::table().option_infos) {
+        if(!option.alias_id || !(option.visibility & visibility)) {
+            continue;
+        }
+        std::string name(option.prefixed_name);
+        std::vector<std::string> written;
+        switch(option.kind) {
+            case kota::option::Kind::Flag: written = {name}; break;
+            case kota::option::Kind::Joined: written = {name + "1"}; break;
+            case kota::option::Kind::CommaJoined: written = {name + "a,b"}; break;
+            case kota::option::Kind::Separate:
+            case kota::option::Kind::JoinedOrSeparate: written = {name, "1"}; break;
+            default: continue;
+        }
+        auto read = [&](std::vector<std::string>& args) -> std::optional<Arg> {
+            std::optional<Arg> arg;
+            for(auto& parsed: option::table().parse(args, parse_options)) {
+                if(!parsed || arg) {
+                    return std::nullopt;
+                }
+                arg = Arg{.opt_id = parsed->id, .alias = written_alias(*parsed)};
+                std::vector<const char*> values;
+                for(auto value: parsed->values) {
+                    values.push_back(strings.save(llvm::StringRef(value)).data());
+                }
+                arg->values = llvm::ArrayRef(values).copy(allocator);
+            }
+            return arg;
+        };
+        // The parse may read the name as a longer option's: not one a
+        // command writes through this alias.
+        auto first = read(written);
+        if(!first || first->alias != option.id) {
+            continue;
+        }
+        std::vector<std::string> rendered;
+        render_driver_arg(*first, CompilerFamily::GCC, [&](std::string_view fragment) {
+            rendered.emplace_back(fragment);
+        });
+        auto again = read(rendered);
+        ZEXPECT(again.has_value());
+        if(again) {
+            ZEXPECT(again->opt_id == first->opt_id);
+            ZEXPECT(again->alias == first->alias);
+            ZEXPECT(
+                std::ranges::equal(again->values, first->values, [](const char* l, const char* r) {
+                    return llvm::StringRef(l) == r;
+                }));
+        }
+        checked += 1;
+    }
+    ZEXPECT(checked > 100U);
+};
+
+ZEST_CASE(DriverKeepsAlias) {
+    /// GCC names its own way options clang knows as aliases: clang's own
+    /// names reach a clang only.
+    auto render = [](std::vector<std::string> args, CompilerFamily family) {
+        std::vector<std::string> rendered;
+        for(auto& parsed: option::table().parse(args)) {
+            ZASSERT(parsed.has_value());
+            std::vector<std::string> values(parsed->values.begin(), parsed->values.end());
+            std::vector<const char*> pointers;
+            for(auto& value: values) {
+                pointers.push_back(value.c_str());
+            }
+            Arg arg{.opt_id = parsed->id, .alias = written_alias(*parsed), .values = pointers};
+            render_driver_arg(arg, family, [&](std::string_view fragment) {
+                rendered.emplace_back(fragment);
+            });
+        }
+        return rendered;
+    };
+    using enum CompilerFamily;
+    for(std::vector<std::string> args: {
+            std::vector<std::string>{"-msmall-data-limit=8"},
+            {"-flto"},
+            {"-flto=auto"},
+            {"-trigraphs"},
+            {"-marm"},
+            {"-mmacosx-version-min=11.0"},
+            {"--sysroot", "/opt/sysroot"},
+            {"-G", "8"},
+            {"-std=c++20"}
+    }) {
+        ZEXPECT(render(args, GCC) == args);
+    }
+    std::vector<std::string> unaliased = {"-G", "8"};
+    ZEXPECT(render({"-msmall-data-limit=8"}, NVCC) == unaliased);
+    /// A second prefix of an option names no alias.
+    std::vector<std::string> standard = {"-std=c++20"};
+    ZEXPECT(render({"--std=c++20"}, GCC) == standard);
+};
+
 };  // ZEST_SUITE(Argument)
 
 ZEST_SUITE(Canonicalize) {

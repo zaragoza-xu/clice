@@ -4,10 +4,12 @@ module;
 
 module clice;
 
+import :command.edit;
 import :command.table;
 import :command.toolchains.gcc;
 import :unittests.utils;
 import :unittests.utils.toolchain_fixture;
+import :vfs.file_system;
 import :vfs.path;
 
 namespace clice::testing {
@@ -188,6 +190,27 @@ ZEST_CASE(StandardFromMacros) {
                 .empty());
 }
 
+ZEST_CASE(RISCVTargetWidth) {
+    /// xPack's and MounRiver's GCCs name a RISC-V target of no width, which
+    /// clang cannot read, nor any -march for it: GCC's macros name the width.
+    auto none = parse_gcc_style_output("#define __riscv_xlen 32\n", "Target: riscv-none-elf\n");
+    ZEXPECT(none.target == "riscv32-none-elf");
+    auto embed = parse_gcc_style_output("#define __riscv_xlen 64", "Target: riscv-none-embed");
+    ZEXPECT(embed.target == "riscv64-none-embed");
+    auto wch = parse_gcc_style_output("#define __riscv_xlen 32", "Target: riscv32-wch-elf");
+    ZEXPECT(wch.target == "riscv32-wch-elf");
+}
+
+ZEST_CASE(RISCVTargetFeatures, skip = Windows) {
+    auto driver = fake_driver("riscv-none-elf-gcc", R"(echo 'Target: riscv-none-elf' >&2
+echo ' /opt/xpack/libexec/gcc/riscv-none-elf/15.2.0/cc1 -E -quiet query.c -march=rv32imac_zicsr -mabi=ilp32 -dM' >&2
+echo '#define __riscv_xlen 32'
+)");
+    auto argv = f.resolve(add("a.c", {driver.c_str(), "-c"}));
+    ZEXPECT(adjacent(argv, "-target-feature", "+a"));
+    ZEXPECT(adjacent(argv, "-target-abi", "ilp32"));
+}
+
 ZEST_CASE(NoCompilerJob, skip = Windows) {
     /// A driver that is neither GCC nor clang (Intel's icc).
     auto ref = add("a.cpp", {fake_driver("icc", "").c_str()});
@@ -287,20 +310,105 @@ ZEST_CASE(GCCTargetNames, skip = Windows) {
     /// A CPU newer than clang's target table.
     auto x86 = render("x86_64-linux-gnu", "-march=clice-future-cpu");
     ZEXPECT(!contains(x86, "clice-future-cpu"));
+    /// A vendor's RISC-V extension LLVM does not know goes, and the rest
+    /// stay: as a command writes them, and as GCC's job versions them.
+    auto wch = render("riscv32-wch-elf", "-march=rv32imc_zba_zbb_zbc_zbs_xw -mabi=ilp32");
+    ZEXPECT(adjacent(wch, "-target-feature", "+m"));
+    ZEXPECT(adjacent(wch, "-target-feature", "+zba"));
+    auto andes = render("riscv32-elf",
+                        "-march=rv32imc_xandes -march=rv32i2p0_m2p0_c2p0_xandes5p0 -mabi=ilp32");
+    ZEXPECT(adjacent(andes, "-target-feature", "+m"));
+    ZEXPECT(adjacent(andes, "-target-feature", "+c"));
+    /// A vendor's extension glued to the letters before it, and letters
+    /// running on after an underscore.
+    auto glued = render("riscv32-none-elf", "-march=rv32imacxw -mabi=ilp32");
+    ZEXPECT(adjacent(glued, "-target-feature", "+a"));
+    auto run = render("riscv32-unknown-linux-gnu", "-march=rv32i_mac -mabi=ilp32");
+    ZEXPECT(adjacent(run, "-target-feature", "+a"));
+    ZEXPECT(adjacent(run, "-target-feature", "+c"));
+    /// A version LLVM does not know, and an extension LLVM has only as
+    /// experimental, which clang's driver takes only when asked to.
+    auto thead = render("riscv64-unknown-elf", "-march=rv64gcv0p7_zicfilp_xtheadc -mabi=lp64d");
+    ZEXPECT(adjacent(thead, "-target-feature", "+v"));
+    ZEXPECT(adjacent(thead, "-target-feature", "+d"));
+    ZEXPECT(!contains(thead, "+experimental-zicfilp"));
+    /// A profile, which LLVM reads as it stands, with a vendor's extension
+    /// or without.
+    auto profile = render("riscv64-unknown-linux-gnu", "-march=rva22u64 -mabi=lp64d");
+    ZEXPECT(adjacent(profile, "-target-feature", "+zba"));
+    auto vendor = render("riscv64-linux-gnu", "-march=rva22u64_xw -mabi=lp64d");
+    ZEXPECT(adjacent(vendor, "-target-feature", "+zba"));
 }
 
-ZEST_CASE(GCCSeesBareLTO, skip = Windows) {
-    /// clang spells LTO -flto=full, which GCC rejects.
-    auto driver = fake_driver("g++", R"(case " $* " in
-*" -flto=full "*)
-  echo "cc1plus: error: unrecognized argument to '-flto=' option: 'full'" >&2
-  exit 1 ;;
-esac
-echo 'Target: x86_64-linux-gnu' >&2
-echo ' /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -E -quiet query.cpp -flto -dM' >&2
-)");
-    auto ref = add("a.cpp", {driver.c_str(), "-flto=auto", "-c"});
+ZEST_CASE(GCCSeesWrittenAliases, skip = Windows) {
+    /// clang reads these as aliases of options GCC names otherwise or not
+    /// at all (`-G 8`, `-flto=full`, `-ftrigraphs`), which GCC rejects.
+    auto args = tmp.path("args");
+    auto driver = fake_driver("riscv32-unknown-elf-gcc",
+                              std::format(R"(printf '%s\n' "$@" > '{}'
+echo 'Target: riscv32-unknown-elf' >&2
+echo ' /opt/riscv/libexec/gcc/riscv32-unknown-elf/15/cc1 -E -quiet query.c -dM' >&2
+)",
+                                          args));
+    std::vector<const char*> written = {"-msmall-data-limit=8", "-flto=auto", "-trigraphs"};
+    auto command = written;
+    command.insert(command.begin(), driver.c_str());
+    command.push_back("-c");
+    auto ref = add("a.c", command);
     ZEXPECT(f.toolchain.resolve(ref.command, ref.input).has_value());
+
+    auto passed = vfs::read(args);
+    ZASSERT(passed);
+    llvm::SmallVector<llvm::StringRef> lines;
+    (*passed)->getBuffer().split(lines, '\n', -1, false);
+    for(llvm::StringRef arg: written) {
+        ZEXPECT(contains(lines, arg));
+    }
+    ZEXPECT(!contains(lines, "-G"));
+
+    /// A rule's edit keeps what the command wrote.
+    std::vector<CommandEdit> edits = {
+        {.kind = CommandEdit::Kind::Append, .flags = {"-fno-common"}}
+    };
+    auto edited = ref;
+    edited.command = apply_edits(f.commands, f.file_table, ref.command, {.edits = edits});
+    ZEXPECT(f.toolchain.resolve(edited.command, edited.input).has_value());
+    passed = vfs::read(args);
+    ZASSERT(passed);
+    ZEXPECT((*passed)->getBuffer().contains("-msmall-data-limit=8\n"));
+
+    /// Two names of one option are two queries: GCC may take one alone.
+    auto clang_name = add("b.c", {driver.c_str(), "-G", "8", "-c"});
+    auto gcc_name = add("c.c", {driver.c_str(), "-msmall-data-limit=8", "-c"});
+    ZEXPECT(f.key(clang_name) != f.key(gcc_name));
+}
+
+ZEST_CASE(CommandISAForClang, skip = Windows) {
+    /// The command's own -march, which GCC takes as written and clang
+    /// without what LLVM does not know.
+    auto driver = fake_driver("riscv32-wch-elf-gcc", R"(echo 'Target: riscv32-wch-elf' >&2
+echo ' /opt/wch/libexec/gcc/riscv32-wch-elf/15/cc1 -E -quiet query.c -dM' >&2
+)");
+    auto argv = f.resolve(
+        add("a.c", {driver.c_str(), "-march=rv32imc_zba_zbb_zbc_zbs_xw", "-mabi=ilp32", "-c"}));
+    ZEXPECT(adjacent(argv, "-target-feature", "+m"));
+    ZEXPECT(adjacent(argv, "-target-feature", "+zbs"));
+}
+
+ZEST_CASE(GCCErrorReported, skip = Windows) {
+    /// GCC rejects an option before `-v` prints its version, the last line.
+    auto driver = fake_driver("riscv32-unknown-elf-gcc", R"(echo 'Using built-in specs.' >&2
+echo "riscv32-unknown-elf-gcc: error: unrecognized command-line option '-mclice-future'" >&2
+echo 'Target: riscv32-unknown-elf' >&2
+echo 'gcc version 15.2.0 (g5115c7e44-dirty)' >&2
+exit 1
+)");
+    auto ref = add("a.c", {driver.c_str(), "-c"});
+    auto resolved = f.toolchain.resolve(ref.command, ref.input);
+    ZASSERT(!resolved);
+    llvm::StringRef error = resolved.error();
+    ZEXPECT(error.contains("error: unrecognized command-line option '-mclice-future'"));
+    ZEXPECT(!error.contains("gcc version"));
 }
 
 ZEST_CASE(GCCFailureRejected, skip = Windows) {
@@ -309,6 +417,7 @@ ZEST_CASE(GCCFailureRejected, skip = Windows) {
     auto driver = fake_driver("g++", R"(echo 'Target: x86_64-linux-gnu' >&2
 echo ' /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -E -quiet -imacros missing.h query.cpp -dM' >&2
 echo 'cc1plus: fatal error: missing.h: No such file or directory' >&2
+echo 'compilation terminated.' >&2
 exit 1
 )");
     auto ref = add("a.cpp", {driver.c_str(), "-c"});

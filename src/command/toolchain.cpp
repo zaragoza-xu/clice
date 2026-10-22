@@ -7,6 +7,7 @@ module;
 module clice;
 
 import :command.argument_parser;
+import :command.cygwin;
 import :command.driver_report;
 import :command.nvcc;
 import :command.toolchain;
@@ -103,6 +104,35 @@ std::expected<Job, std::string> query_driver(llvm::ArrayRef<std::string> args,
     return job;
 }
 
+/// A Cygwin or MSYS2 driver reports its job's paths and its search list as
+/// POSIX paths, which the mount table of the runtime it loads maps to the
+/// Windows paths clang opens. Such a driver names its job's program
+/// POSIX-style too: a native clang's job for a Linux target names
+/// `/usr/include`, which is clang's to resolve, not a runtime's.
+kota::task<std::expected<DriverReport, std::string>> translate_posix_paths(DriverReport report,
+                                                                           std::string driver) {
+    auto program = report.clang_job.empty() ? report.gcc_job : report.clang_job.front();
+    if(!is_posix_path(program)) {
+        co_return report;
+    }
+    auto table = co_await find_mount_table(driver, {program});
+    if(!table) {
+        co_return std::unexpected(
+            std::format("{} reports POSIX paths ({}): {}", driver, program, table.error()));
+    }
+    for(auto& dir: report.search_dirs) {
+        if(is_posix_path(dir.path)) {
+            dir.path = table->to_windows(dir.path);
+        }
+    }
+    for(auto& token: report.clang_job) {
+        if(is_posix_path(token)) {
+            token = table->to_windows(token);
+        }
+    }
+    co_return report;
+}
+
 /// Asks a GCC-style driver how it compiles `args`, the driver (its first
 /// `driver_tokens`: two for `zig cc`) followed by its flags and the input:
 /// `-E -dM -v` has it preprocess the input verbosely, printing the job it
@@ -124,9 +154,22 @@ kota::task<std::expected<DriverReport, std::string>> ask_driver(llvm::ArrayRef<s
     if(report.clang_job.empty() && !output->failure.empty()) {
         auto last_line = llvm::StringRef(output->err).rtrim();
         last_line = last_line.substr(last_line.rfind('\n') + 1);
-        co_return std::unexpected(std::format("{}: {}", output->failure, last_line.str()));
+        auto error = last_line.empty() ? output->failure
+                                       : std::format("{}: {}", output->failure, last_line.str());
+#ifdef _WIN32
+        // Windows looks for a program's DLLs on PATH: without its runtime's
+        // directory there, a Cygwin or MSYS2 driver cannot start (exception
+        // 0xC0000135), or cannot start its compiler proper.
+        if(output->failure.ends_with("0xC0000135") ||
+           output->err.contains("error while loading shared libraries")) {
+            error +=
+                " (a DLL it loads is missing: the bin directory of its runtime, Cygwin's or "
+                "MSYS2's, belongs on clice's PATH, which clice.serverEnv sets in VS Code)";
+        }
+#endif
+        co_return std::unexpected(std::move(error));
     }
-    co_return report;
+    co_return co_await translate_posix_paths(std::move(report), args[0]);
 }
 
 /// GCC's two-core tuning form, `-mcpu=cortex-a72.cortex-a53`, as the first
@@ -324,7 +367,7 @@ kota::task<std::expected<Job, std::string>> ask_gcc_style(std::vector<std::strin
         }
         co_return job;
     }
-    if(!report->gcc_job) {
+    if(report->gcc_job.empty()) {
         co_return std::unexpected(std::format("{} runs no compiler job for the input", args[0]));
     }
     if(!standard.empty()) {
@@ -412,7 +455,7 @@ kota::task<std::expected<Job, std::string>> ask_nvcc(llvm::ArrayRef<std::string>
     if(!host_report) {
         co_return std::unexpected(std::move(host_report.error()));
     }
-    if(host_report->clang_job.empty() && !host_report->gcc_job) {
+    if(host_report->clang_job.empty() && host_report->gcc_job.empty()) {
         co_return std::unexpected(std::format("Unsupported nvcc host compiler: {}", *host));
     }
 
@@ -490,8 +533,8 @@ kota::task<std::expected<Job, std::string>> ask_nvcc(llvm::ArrayRef<std::string>
 
     /// A clang host needs no setup: clang's own driver already defaults to
     /// the running machine's triple.
-    co_return host_report->gcc_job ? query_as_gcc(*host_report, cuda_args, cwd)
-                                   : query_driver(cuda_args, cwd);
+    co_return !host_report->gcc_job.empty() ? query_as_gcc(*host_report, cuda_args, cwd)
+                                            : query_driver(cuda_args, cwd);
 }
 
 /// The probe working directory, empty when the wanted one does not exist
@@ -545,7 +588,8 @@ struct QuerySpec {
 /// The driver as a path. The name used to invoke it matters: `clang++` is
 /// often a symlink to `clang`, and the name decides C++ mode. So it is
 /// never realpath'd, only found: a bare name on PATH, a relative one in the
-/// probe working directory.
+/// probe working directory. Only a Cygwin symlink is followed, which
+/// Windows cannot start.
 std::expected<std::string, std::string> find_driver(llvm::StringRef driver, llvm::StringRef cwd) {
     llvm::SmallString<128> found(driver);
     if(!path::is_absolute(driver)) {
@@ -560,6 +604,31 @@ std::expected<std::string, std::string> find_driver(llvm::StringRef driver, llvm
             return std::unexpected(std::format("Cannot find driver: {}", driver.str()));
         }
     }
+#ifdef _WIN32
+    // Cygwin and MSYS2 tools, and a Cygwin symlink's target, name programs
+    // without the `.exe` Windows adds when it starts one (`gcc-12.2.0`).
+    auto with_exe = [](llvm::SmallString<128>& program) {
+        if(!vfs::exists(program) && !program.str().ends_with_insensitive(".exe") &&
+           vfs::exists(program.str().str() + ".exe")) {
+            program += ".exe";
+        }
+    };
+    with_exe(found);
+    // A link may name another (clang++ -> clang -> clang-15), and a chain
+    // that loops ends at the bound.
+    int links = 0;
+    while(auto target = read_cygwin_symlink(found)) {
+        links += 1;
+        if(is_posix_path(*target) || links > 16) {
+            return std::unexpected(
+                std::format("Driver {} is a Cygwin symlink to {}: name the program it links to",
+                            found.str(),
+                            *target));
+        }
+        found = (path::parent_path(found) + "/" + *target).str();
+        with_exe(found);
+    }
+#endif
     if(!vfs::exists(found) || !llvm::sys::fs::can_execute(found)) {
         return std::unexpected(std::format("Driver {} not found or not executable", found.str()));
     }

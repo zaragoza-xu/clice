@@ -5,6 +5,7 @@ module;
 module clice:command.command;
 
 import :command.argument_parser;
+import :command.cygwin;
 import :command.search_config;
 import :support.object_pool;
 import :vfs.file_table;
@@ -366,8 +367,9 @@ public:
     /// and configs survive (path ids stay stable across reloads).
     ///
     /// Parsing is atomic at the top level: if the file cannot be read, is
-    /// not valid JSON, or has a root that is not an array, the previously
-    /// loaded entries are kept and nullopt is returned. Individual
+    /// not valid JSON, has a root that is not an array, or spells POSIX
+    /// paths no Cygwin or MSYS2 runtime on PATH maps, the previously loaded
+    /// entries are kept and nullopt is returned. Individual
     /// malformed entries are still skipped — which means a file truncated
     /// mid-array loads as a partial set; the poll-side debounce is
     /// what guards against reading half-written files.
@@ -613,6 +615,11 @@ private:
     /// The source being loaded, which records the response files its
     /// commands expand among its inputs; nullopt outside a load.
     std::optional<SourceID> loading;
+
+    /// The mount table mapping the POSIX paths of the database entry being
+    /// loaded, one written inside Cygwin or MSYS2 (CMake run from their
+    /// shell); null outside such an entry.
+    const MountTable* mounts = nullptr;
 
     /// Every source's entries, sorted by (file, source, ordinal).
     std::vector<CompilationEntry> entry_list;

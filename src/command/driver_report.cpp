@@ -4,6 +4,7 @@ module;
 
 module clice;
 
+import :command.cygwin;
 import :command.driver_report;
 import :vfs.path;
 
@@ -70,17 +71,18 @@ std::string standard_from_macros(llvm::StringRef cplusplus,
     return (strict ? "c" : "gnu") + year.str();
 }
 
-/// The options of `line` when it runs GCC's compiler proper (cc1,
-/// cc1plus, ...), else nothing. GCC prints the job unquoted: the program
-/// ends where the first option starts.
-std::optional<llvm::StringRef> gcc_job_options(llvm::StringRef line) {
+/// The program and the options of `line` when it runs GCC's compiler
+/// proper (cc1, cc1plus, ...), else nothing. GCC prints the job unquoted:
+/// the program ends where the first option starts.
+std::optional<std::pair<llvm::StringRef, llvm::StringRef>> gcc_job_line(llvm::StringRef line) {
     line = line.ltrim();
     auto end = line.find(" -");
-    auto name = llvm::sys::path::stem(line.take_front(end), llvm::sys::path::Style::windows_slash);
+    auto program = line.take_front(end);
+    auto name = llvm::sys::path::stem(program, llvm::sys::path::Style::windows_slash);
     if(end == llvm::StringRef::npos || !name.starts_with("cc1")) {
         return std::nullopt;
     }
-    return line.drop_front(end);
+    return std::pair{program, line.drop_front(end)};
 }
 
 }  // namespace
@@ -108,17 +110,19 @@ DriverReport parse_driver_report(llvm::StringRef out, llvm::StringRef err) {
         } else if(line.consume_front("Target: ")) {
             report.target = line.trim().str();
         } else if(line.consume_front("LIBRARY_PATH=")) {
+            // A Cygwin or MSYS2 GCC lists POSIX paths, separated POSIX-style.
+            char separator = is_posix_path(line) ? ':' : path::list_separator;
             llvm::SmallVector<llvm::StringRef> dirs;
-            line.split(dirs, path::list_separator, -1, false);
+            line.split(dirs, separator, -1, false);
             for(auto dir: dirs) {
                 library_path.push_back(lexical((dir + "/include").str()));
             }
-        } else if(auto options = gcc_job_options(line); options && report.clang_job.empty()) {
-            report.gcc_job = true;
+        } else if(auto job = gcc_job_line(line); job && report.clang_job.empty()) {
+            report.gcc_job = job->first.str();
             // The options kept are joined forms: splitting at spaces cuts
             // none of them.
             llvm::SmallVector<llvm::StringRef> tokens;
-            llvm::SplitString(*options, tokens);
+            llvm::SplitString(job->second, tokens);
             for(auto token: tokens) {
                 if(token.starts_with("-D") || token.starts_with("-U") || token.starts_with("-m") ||
                    token.starts_with("-f")) {

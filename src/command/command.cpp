@@ -2,14 +2,17 @@ module;
 
 #include "modules/prelude.h"
 
+#include "support/anomaly.macros.h"
 #include "support/logging.macros.h"
 
 module clice;
 
 import :command.command;
+import :command.cygwin;
 import :command.nvcc;
 import :command.search_config;
 import :command.toolchain;
+import :support.anomaly;
 import :support.logging;
 import :support.shell;
 import :vfs.file_system;
@@ -72,16 +75,31 @@ namespace ranges = std::ranges;
 /// produce the same bytes.
 constexpr llvm::StringRef identity_salt = "clice-cmd-v9";
 
+/// `text` spelled against `base`, a POSIX path naming what `mounts` maps
+/// it to.
+Spelling spelled(llvm::StringRef text, const Spelling& base, const MountTable* mounts) {
+    if(mounts && is_posix_path(text)) {
+        return Spelling::absolute(mounts->to_windows(text));
+    }
+    return Spelling(text, base);
+}
+
 /// `value` spelled against `anchor` when it names a path (names_path),
 /// else `value` itself.
 llvm::StringRef anchored(unsigned id,
                          llvm::StringRef value,
                          const Spelling& anchor,
-                         llvm::UniqueStringSaver& strings) {
+                         llvm::UniqueStringSaver& strings,
+                         const MountTable* mounts = nullptr) {
+    // A forced include names a file too, which clang looks for rather than
+    // anchors when relative.
+    if(mounts && is_posix_path(value) && (id == option::OPT_include || id == option::OPT_imacros)) {
+        return strings.save(mounts->to_windows(value));
+    }
     if(!names_path(id, value)) {
         return value;
     }
-    return strings.save(Spelling(value, anchor).str());
+    return strings.save(spelled(value, anchor, mounts).str());
 }
 
 /// Whether `args` hold dependency file options alone. The preprocessor's -MD
@@ -433,7 +451,10 @@ std::optional<ConfigID> CompilationDatabase::normalize(const Spelling& directory
 
     CompileConfig config;
     config.directory = strings.save(directory.str()).data();
-    config.driver = strings.save(arguments[0]).data();
+    llvm::StringRef driver = arguments[0];
+    config.driver =
+        strings.save(mounts && is_posix_path(driver) ? mounts->to_windows(driver) : driver.str())
+            .data();
     arguments = arguments.drop_front();
 
     config.family = Toolchain::driver_family(config.driver);
@@ -504,13 +525,14 @@ std::optional<ConfigID> CompilationDatabase::normalize(const Spelling& directory
     auto anchor = directory;
     for(auto& parsed: staged) {
         if(parsed && parsed->id == option::OPT_working_directory && parsed->values.size() == 1) {
-            anchor = Spelling(parsed->values[0], directory);
+            anchor = spelled(parsed->values[0], directory, mounts);
         }
     }
 
     /// Does this token name the entry's file? Compared by identity.
     auto matches_entry = [&](llvm::StringRef token) {
-        return file.valid() && !token.empty() && file_table.find(Spelling(token, anchor)) == file;
+        return file.valid() && !token.empty() &&
+               file_table.find(spelled(token, anchor, mounts)) == file;
     };
 
     /// A per-file selector naming the entry file forces its language and
@@ -592,7 +614,8 @@ std::optional<ConfigID> CompilationDatabase::normalize(const Spelling& directory
                 args.push_back({
                     .opt_id = option::OPT_include_pch,
                     .cls = ArgClass::Discarded,
-                    .values = {anchored(option::OPT_include_pch, value, anchor, strings).data()},
+                    .values =
+                        {anchored(option::OPT_include_pch, value, anchor, strings, mounts).data()},
                 });
                 continue;
             }
@@ -621,7 +644,7 @@ std::optional<ConfigID> CompilationDatabase::normalize(const Spelling& directory
         // The working directory itself is relative to the entry's.
         bool working = id == option::OPT_working_directory;
         for(auto& value: local.values) {
-            value = anchored(id, value, working ? directory : anchor, strings).data();
+            value = anchored(id, value, working ? directory : anchor, strings, mounts).data();
         }
 
         args.push_back(std::move(local));
@@ -638,7 +661,11 @@ std::optional<ConfigID> CompilationDatabase::normalize(const Spelling& directory
                                                        llvm::StringRef command) {
     llvm::BumpPtrAllocator local;
     llvm::StringSaver saver(local);
-    return normalize(directory, file, tokenize_command(command, saver));
+    // A database written inside Cygwin or MSYS2 quotes its commands for sh.
+    return normalize(directory,
+                     file,
+                     mounts ? tokenize_sh_command(command, saver)
+                            : tokenize_command(command, saver));
 }
 
 void CompilationDatabase::expand_response_files(llvm::SmallVectorImpl<const char*>& tokens,
@@ -656,7 +683,7 @@ void CompilationDatabase::expand_response_files(llvm::SmallVectorImpl<const char
     /// Splice the arguments of the file `name`, false when it cannot be
     /// read. Read or not, it is among the load's inputs.
     auto splice = [&](llvm::StringRef name) {
-        Spelling full(name, directory);
+        auto full = spelled(name, directory, mounts);
         auto file = file_table.intern(full);
         auto observed = vfs::read_observed(file_table.resolve(file));
         if(observed) {
@@ -950,6 +977,12 @@ std::optional<std::size_t> CompilationDatabase::load_source(SourceID id) {
     loading = id;
     auto recording = llvm::make_scope_exit([&] { loading.reset(); });
 
+    // A database written inside Cygwin or MSYS2 (CMake run from their shell)
+    // spells its paths POSIX-style: the mount table of the runtime on PATH,
+    // found at the first such entry, maps the entries so spelled.
+    std::optional<MountTable> table;
+    auto unmount = llvm::make_scope_exit([&] { mounts = nullptr; });
+
     llvm::StringMap<Spelling> working_dirs;
     std::uint32_t index = 0;
     for(auto element: arr) {
@@ -1027,11 +1060,40 @@ std::optional<std::size_t> CompilationDatabase::load_source(SourceID id) {
             continue;
         }
 
+        llvm::StringRef dir_ref(dir_sv.data(), dir_sv.size());
+        mounts = nullptr;
+        if(is_posix_path(dir_ref)) {
+            if(!table) {
+                // Another runtime's table maps the directory under its own
+                // root; another of one kind, Git for Windows' MSYS2 beside
+                // MSYS2, maps a drive's paths alike but lacks the compiler.
+                std::vector<std::string> written = {dir_ref.str()};
+                auto tokens = command ? tokenize_sh_command(*command, saver) : args;
+                auto compiler = wrapper_prefix_len(tokens);
+                if(compiler < tokens.size() && is_posix_path(tokens[compiler])) {
+                    written.emplace_back(tokens[compiler]);
+                }
+                auto [found] = kota::run(find_mount_table({}, std::move(written)));
+                if(!*found) {
+                    LOG_GUIDANCE(
+                        "Compilation database {} spells its paths POSIX-style ({}), and they "
+                        "cannot be mapped: {}. Put the bin directory of the Cygwin or MSYS2 "
+                        "that wrote it on clice's PATH (in VS Code, clice.serverEnv); one "
+                        "written outside them names its directories with a drive.",
+                        path,
+                        dir_ref,
+                        found->error());
+                    return std::nullopt;
+                }
+                table = std::move(**found);
+            }
+            mounts = &*table;
+        }
+
         // A relative `directory` anchors to the CDB file's own location —
         // self-contained, so every consumer of the same file (server,
         // batch, inspect) resolves it identically.
-        Spelling directory(llvm::StringRef(dir_sv.data(), dir_sv.size()),
-                           Spelling::absolute(path).parent());
+        auto directory = spelled(dir_ref, Spelling::absolute(path).parent(), mounts);
         // The compile runs in the directory itself, whichever way the
         // database spells it: its identity keys the command.
         auto [known, fresh] = working_dirs.try_emplace(directory.str());
@@ -1047,7 +1109,7 @@ std::optional<std::size_t> CompilationDatabase::load_source(SourceID id) {
         // skipped, as the server and inspect skip it.
         bool c_family = is_c_family_file(file_ref);
 
-        Spelling file(file_ref, directory);
+        auto file = spelled(file_ref, directory, mounts);
         auto path_id = file_table.intern_spelled(file);
         llvm::StringRef spelling = file.str() != llvm::StringRef(file_table.resolve(path_id))
                                        ? strings.save(file.str())

@@ -102,8 +102,10 @@ namespace clice::index {
 /// their own, symbol records are varint-packed bytes, and file sets are
 /// varint lists unless a roaring image is smaller; v47: manifests name their
 /// file versions by the ids of the database's version records, and their
-/// imports and failed lookups as Elias–Fano sets.
-constexpr inline std::uint32_t index_format_version = 47;
+/// imports and failed lookups as Elias–Fano sets; v48: a preamble's TU index
+/// carries the search blob of its completable names, and neither an include
+/// guard nor a macro its own file undefines is completable.
+constexpr inline std::uint32_t index_format_version = 48;
 
 /// The bytes of `blob`, the writer form of a blob layout. A blob holds less
 /// than 4 GiB; index blobs stay far below it (LLVM's search blob, the
@@ -572,6 +574,12 @@ struct TUIndexBlobOf {
     /// as published (a JSON array of LSP diagnostics) — a compile that
     /// consumes the PCH never raises them again.
     Seq<char> diagnostics;
+
+    /// Preamble ride-along: the search blob (build_search_blob) of the
+    /// names unqualified completion may offer from the preamble —
+    /// SymbolFlags::Completable, of external scope — looked up by name as
+    /// the project's search index is.
+    Seq<std::byte> names;
 };
 
 using TUIndexBlob = TUIndexBlobOf<codec::blob::Owned>;

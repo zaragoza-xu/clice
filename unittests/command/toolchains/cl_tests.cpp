@@ -4,10 +4,12 @@ module;
 
 module clice;
 
+import :command.table;
 import :command.toolchains.cl;
 import :unittests.utils;
 import :unittests.utils.toolchain_fixture;
 import :vfs.file_system;
+import :vfs.path;
 
 namespace clice::testing {
 
@@ -83,6 +85,26 @@ ZEST_CASE(ClangCLOwnVersion, skip = Windows) {
     auto argv = f.resolve(add("a.cpp", {clang_cl.c_str(), "/std:c++latest"}));
     ZEXPECT(last_standard(argv) == "-std=c++26");
     ZEXPECT(!contains(argv, "-fms-compatibility-version=19.44.35207"));
+}
+
+ZEST_CASE(ClangCLBuiltinHeaders, skip = Windows) {
+    // clang-cl's own builtin headers, in the resource directory its job
+    // names, stay right after clice's.
+    tmp.touch("llvm/lib/clang/20/include/xray/xray_interface.h");
+    auto clang_cl = fake_driver("clang-cl",
+                                std::format(R"(case " $* " in *" -v "*)
+  echo ' "{0}/bin/clang-cl" "-cc1" "-resource-dir" "{0}/lib/clang/20"' >&2 ;;
+esac
+echo 'msvc_lang 202002L'
+echo 'msc_full_ver 194435207'
+)",
+                                            tmp.path("llvm")));
+    auto argv = f.resolve(add("a.cpp", {clang_cl.c_str()}));
+    auto builtin_headers = path::join(resource_dir(), "include");
+    auto ours = ranges::find_if(argv, [&](llvm::StringRef arg) { return arg == builtin_headers; });
+    ZASSERT(argv.end() - ours > 2);
+    ZEXPECT(ours[1] == "-internal-isystem"sv);
+    ZEXPECT(ours[2] == tmp.path("llvm/lib/clang/20/include"));
 }
 
 ZEST_CASE(UnqueriedCLRunsNothing, skip = Windows) {

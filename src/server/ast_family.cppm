@@ -5,6 +5,7 @@ module;
 module clice:server.ast_family;
 
 import :feature.diagnostics;
+import :project.command_resolver;
 import :project.project;
 import :sched.families.pch;
 import :sched.families.pcm;
@@ -295,7 +296,7 @@ private:
                      std::optional<std::uint32_t> point,
                      const std::string& directory,
                      const std::vector<std::string>& arguments,
-                     const SynthesizedContext* synthesized,
+                     const Resolution& resolution,
                      const PCMFamily::ModuleDeps& imports,
                      llvm::StringRef base);
 

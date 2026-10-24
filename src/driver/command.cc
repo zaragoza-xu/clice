@@ -119,6 +119,10 @@ struct EntryCommands {
     /// driver command clang's own driver reads in its place; absent on
     /// success.
     protocol::optional<std::string> toolchain_error;
+
+    /// The files in the directories `resolved` searches that clice's
+    /// compiles of it do not see; absent for none.
+    protocol::optional<vfs::HiddenFiles> hidden;
 };
 
 struct FileCommands {
@@ -188,16 +192,19 @@ struct Rendered {
     /// Why the compiler could not be queried, which leaves `arguments` the
     /// driver command clang's own driver reads in its place.
     std::optional<std::string> error;
+
+    vfs::HiddenFiles hidden;
 };
 
-Rendered render_command(Project& project, const CommandRef& ref) {
+Rendered render_command(Project& project, const CommandRef& ref, const RenderOptions& opts = {}) {
     auto path = project.cdb.spelling(ref.file);
     auto resolution = project.toolchain.resolve(ref.command, ref.input);
     if(resolution && resolution->query_failure.empty()) {
         // The resolution is cached: rendering resolves it the same.
-        auto argv = project.toolchain.render(ref, path).argv;
+        auto rendered = project.toolchain.render(ref, path, opts);
         return {
-            .arguments = {argv.begin(), argv.end()}
+            .arguments = {rendered.argv.begin(), rendered.argv.end()},
+            .hidden = std::move(rendered.hidden),
         };
     }
     // Shown as clang's own driver reads it, a command whose compiler could
@@ -230,7 +237,7 @@ std::optional<DatabaseEntry> written_entry(const CompilationDatabase& cdb,
 
 void print_text(const FileCommands& commands) {
     for(std::size_t i = 0; i < commands.commands.size(); i += 1) {
-        auto& [database, entry, resolved, error] = commands.commands[i];
+        auto& [database, entry, resolved, error, hidden] = commands.commands[i];
         if(i != 0) {
             driver::println();
         }
@@ -240,6 +247,11 @@ void print_text(const FileCommands& commands) {
         driver::println("  resolved:  {}", join_command(resolved.arguments));
         if(error) {
             driver::println("  error:     the compiler could not be queried: {}", *error);
+        }
+        if(hidden) {
+            for(auto& dir: hidden->dirs) {
+                driver::println("  hidden:    {} of the files in {}", dir.names.size(), dir.path);
+            }
         }
     }
 }
@@ -300,6 +312,9 @@ int run_file(const FileOptions& opts) {
                          .arguments = std::move(rendered.arguments)},
             .toolchain_error = std::move(rendered.error),
         });
+        if(!rendered.hidden.dirs.empty()) {
+            commands.commands.back().hidden = std::move(rendered.hidden);
+        }
     }
     if(opts.json) {
         print_json(commands);
@@ -391,7 +406,7 @@ int convert_command(Workspace& workspace, llvm::ArrayRef<std::string> command, b
                                      identity,
                                      identity);
     project.toolchain.warm(ref);
-    auto rendered = render_command(project, ref);
+    auto rendered = render_command(project, ref, {.shadowed_dirs = false});
     if(json) {
         print_json(DatabaseEntry{.directory = directory.str(),
                                  .file = sources.front().str(),
@@ -478,7 +493,7 @@ int convert_database(Workspace& workspace, const Spelling& path) {
         // The command of one clice does not compile, another language's
         // source, is left as it is too.
         if(ref != refs.end()) {
-            auto rendered = render_command(project, ref->second);
+            auto rendered = render_command(project, ref->second, {.shadowed_dirs = false});
             if(rendered.error) {
                 unconverted += 1;
             }

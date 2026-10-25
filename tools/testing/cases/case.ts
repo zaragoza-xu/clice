@@ -216,7 +216,8 @@ export function loadCases(root: string): Case[] {
         if (!Object.hasOwn(TOPICS, topic.name)) {
             fail(topic.name, "not a topic: topics.ts lists them, as tests/README.md does");
         }
-        for (const subtopic of subdirs(topicDir, topic.name, ["project.jsonc", "test.ts"])) {
+        const topicProject = readProject(topicDir);
+        for (const subtopic of subdirs(topicDir, topic.name, ["project.toml", "test.ts"])) {
             const subDir = path.join(topicDir, subtopic);
             const where = `${topic.name}/${subtopic}`;
             if (!NAME.test(subtopic) || subtopic === topic.name) {
@@ -226,11 +227,11 @@ export function loadCases(root: string): Case[] {
                 );
             }
             const outer = {
-                projects: [readProject(topicDir), readProject(subDir)],
+                projects: [topicProject, readProject(subDir)],
                 scripts: [...scriptIn(topicDir), ...scriptIn(subDir)],
             };
             outerScripts.push(...outer.scripts);
-            for (const name of subdirs(subDir, where, ["project.jsonc", "test.ts"])) {
+            for (const name of subdirs(subDir, where, ["project.toml", "test.ts"])) {
                 if (!CASE.test(name)) {
                     fail(
                         `${where}/${name}`,

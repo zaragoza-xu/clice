@@ -115,6 +115,89 @@ int x = FROM_GEN;
     ZASSERT(built->diagnostics().empty());
 }
 
+ZEST_CASE(ForcedSystemHeaderPragma) {
+    /// Headers the command forces in declare themselves system headers, as
+    /// CMake's cmake_pch.hxx does: the headers they include stay the
+    /// project's, their warnings silenced up to the end of each, along with
+    /// the diagnostic pushes left open in them.
+    TempDir tmp;
+    tmp.touch("prefix.h", R"(
+#pragma GCC system_header
+#include "wrapper.h"
+)");
+    tmp.touch("wrapper.h", R"(
+#pragma clang diagnostic push
+#include "shape.h"
+)");
+    tmp.touch("shape.h", R"(
+#pragma once
+struct Shape {};
+inline int ratio() { return 1 / 0; }
+)");
+    tmp.touch("microsoft.h", R"(
+#pragma system_header
+#include "panel.h"
+)");
+    tmp.touch("panel.h", R"(
+#pragma once
+struct Panel {};
+inline int share() { return 2 / 0; }
+)");
+    tmp.touch("library.h", R"(
+#pragma clang system_header
+struct Library {};
+)");
+    // A diagnostic pragma starts from the state the last one left, which the
+    // ends of the forced headers must have restored.
+    tmp.touch("main.cpp", R"(
+#include "library.h"
+#pragma clang diagnostic ignored "-Wunused-variable"
+Shape shape;
+Panel panel;
+Library library;
+int quotient = 1 / 0;
+)");
+
+    params.kind = CompilationKind::Content;
+    params.input.arguments = {"clang++",
+                              "-std=c++20",
+                              "-fms-extensions",
+                              "-include",
+                              tmp.path("prefix.h"),
+                              "-include",
+                              tmp.path("microsoft.h"),
+                              tmp.path("main.cpp")};
+    params.input.directory = tmp.root.str().str();
+    auto shown = [](CompilationUnit& unit) {
+        return ranges::to<std::vector>(
+            unit.diagnostics() | views::filter([](const Diagnostic& diag) {
+                return diag.id.value == clang::diag::warn_remainder_division_by_zero;
+            }) |
+            views::transform(&Diagnostic::fid));
+    };
+
+    CompilationParams showing{.kind = CompilationKind::Content, .input = params.input};
+    showing.input.arguments.insert(showing.input.arguments.end() - 1, "-Wsystem-headers");
+    auto built = clice::compile(std::move(params));
+    ZASSERT(built->completed());
+    auto system = [&](llvm::StringRef name) {
+        auto found = built->tu()->lookup(&built->context().Idents.get(name));
+        ZASSERT(found.isSingleResult());
+        return built->context().getSourceManager().isInSystemHeader(found.front()->getLocation());
+    };
+    ZEXPECT(!system("Shape"));
+    ZEXPECT(!system("Panel"));
+    ZEXPECT(system("Library"));
+    auto warned = shown(*built);
+    ZASSERT(warned.size() == 1U);
+    ZEXPECT(warned[0] == built->focus_file().file());
+
+    // Under -Wsystem-headers the compiler shows a system header's warnings.
+    auto unsilenced = clice::compile(std::move(showing));
+    ZASSERT(unsilenced->completed());
+    ZEXPECT(shown(*unsilenced).size() == 3U);
+}
+
 ZEST_CASE(OverlayNamesRedirectedFile) {
     /// A header an -ivfsoverlay maps under a virtual name is a dependency
     /// under the name of the file actually read.

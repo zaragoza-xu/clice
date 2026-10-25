@@ -7,6 +7,8 @@ module;
 #endif
 
 #ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -129,6 +131,144 @@ void remove_database_files(llvm::StringRef path) {
     vfs::remove(path.str() + "-lock");
 }
 
+/// The environment settings every open of the file uses.
+void configure(MDB_env* env, std::size_t mapsize) {
+    mdb_env_set_mapsize(env, mapsize);
+    // Every `clice query` beside a server holds a slot while it runs;
+    // LMDB's default of 126 is within reach of an agent's parallel calls.
+    mdb_env_set_maxreaders(env, 1024);
+}
+
+constexpr unsigned lmdb_flags = MDB_NOSUBDIR | MDB_NOTLS;
+
+/// The `-open` file beside the database: every process holding the
+/// database open but its writer locks it shared, and the writer locks it
+/// exclusively to swap in a compact copy. The locks belong to the open file, not to
+/// the process (flock, LockFileEx), so two handles of one process exclude
+/// each other as two processes do. The file is never removed: a process
+/// locking a new one would not exclude the holders of the old.
+class OpenLock {
+public:
+    enum class Kind : std::uint8_t {
+        Shared,
+        Exclusive,
+    };
+
+    /// Lock the file of the database at `path`, creating it; `wait` for a
+    /// conflicting lock to go, else fail at once. None when the lock is
+    /// held elsewhere or the file cannot be opened.
+    static std::optional<OpenLock> acquire(llvm::StringRef path, Kind kind, bool wait) {
+        auto file = path.str() + "-open";
+        int fd = -1;
+        // A reader may not write the directory of a database it can read;
+        // the writer created the file then.
+        if(llvm::sys::fs::openFileForReadWrite(file,
+                                               fd,
+                                               llvm::sys::fs::CD_OpenAlways,
+                                               llvm::sys::fs::OF_None) &&
+           llvm::sys::fs::openFileForRead(file, fd)) {
+            return std::nullopt;
+        }
+        OpenLock lock(fd);
+        if(!lock.lock(kind, wait)) {
+            return std::nullopt;
+        }
+        lock.locked = true;
+        return lock;
+    }
+
+    OpenLock(OpenLock&& other) noexcept :
+        fd(std::exchange(other.fd, -1)), locked(std::exchange(other.locked, false)) {}
+
+    OpenLock& operator=(OpenLock&& other) noexcept {
+        release();
+        fd = std::exchange(other.fd, -1);
+        locked = std::exchange(other.locked, false);
+        return *this;
+    }
+
+    ~OpenLock() {
+        release();
+    }
+
+private:
+    explicit OpenLock(int fd) : fd(fd) {}
+
+    bool lock(Kind kind, bool wait) {
+#ifdef _WIN32
+        OVERLAPPED at = {};
+        DWORD flags = wait ? 0 : LOCKFILE_FAIL_IMMEDIATELY;
+        if(kind == Kind::Exclusive) {
+            flags |= LOCKFILE_EXCLUSIVE_LOCK;
+        }
+        return ::LockFileEx(llvm::sys::fs::convertFDToNativeFile(fd), flags, 0, 1, 0, &at);
+#else
+        int operation = (kind == Kind::Exclusive ? LOCK_EX : LOCK_SH) | (wait ? 0 : LOCK_NB);
+        while(::flock(fd, operation) != 0) {
+            if(errno != EINTR) {
+                return false;
+            }
+        }
+        return true;
+#endif
+    }
+
+    void release() {
+        if(fd == -1) {
+            return;
+        }
+        if(locked) {
+#ifdef _WIN32
+            OVERLAPPED at = {};
+            ::UnlockFileEx(llvm::sys::fs::convertFDToNativeFile(fd), 0, 1, 0, &at);
+#else
+            ::flock(fd, LOCK_UN);
+#endif
+        }
+        llvm::sys::Process::SafelyCloseFileDescriptor(fd);
+        fd = -1;
+        locked = false;
+    }
+
+private:
+    int fd = -1;
+
+    bool locked = false;
+};
+
+/// Whether a process outside the `-open` file's protocol (an older clice)
+/// has the database at `path` open: every LMDB opener holds a lock on the
+/// first byte of the `-lock` file. On POSIX it is a record lock, which
+/// belongs to the process: asked only while this process has the database
+/// closed, as closing any descriptor of a file drops the process's record
+/// locks on it.
+bool opened_elsewhere(llvm::StringRef path) {
+    int fd = -1;
+    if(llvm::sys::fs::openFileForReadWrite(path + "-lock",
+                                           fd,
+                                           llvm::sys::fs::CD_OpenExisting,
+                                           llvm::sys::fs::OF_None)) {
+        return false;
+    }
+#ifdef _WIN32
+    OVERLAPPED at = {};
+    auto handle = llvm::sys::fs::convertFDToNativeFile(fd);
+    bool held =
+        !::LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &at);
+    if(!held) {
+        ::UnlockFileEx(handle, 0, 1, 0, &at);
+    }
+#else
+    struct flock lock{};
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_len = 1;
+    bool held = ::fcntl(fd, F_GETLK, &lock) == 0 && lock.l_type != F_UNLCK;
+#endif
+    llvm::sys::Process::SafelyCloseFileDescriptor(fd);
+    return held;
+}
+
 /// The file's length against the length its newest meta page guarantees:
 /// every page up to the last one it declares.
 struct Coverage {
@@ -230,10 +370,37 @@ std::optional<std::string> growth_refused(MDB_env* env, std::uint64_t extra) {
 #endif
 }
 
+#ifdef _WIN32
+/// Without the sparse attribute Windows backs the whole mapsize with real
+/// disk (CreateFileMapping allocates eagerly), so the file is marked
+/// sparse before LMDB first maps it. Best effort: on a volume without
+/// sparse support each mapsize is simply committed up front, which the
+/// small default keeps tolerable.
+void make_sparse(llvm::StringRef path) {
+    int fd = -1;
+    if(llvm::sys::fs::openFileForReadWrite(path,
+                                           fd,
+                                           llvm::sys::fs::CD_OpenAlways,
+                                           llvm::sys::fs::OF_None)) {
+        return;
+    }
+    auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    DWORD returned = 0;
+    DeviceIoControl(handle, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
+    llvm::sys::Process::SafelyCloseFileDescriptor(fd);
+}
+#endif
+
 class LmdbDatabase final : public BlobDatabase {
 public:
-    LmdbDatabase(MDB_env* env, MDB_dbi dbi, MDB_txn* txn, std::string path, bool read_only) :
-        env(env), dbi(dbi), txn(txn), path(std::move(path)), read_only_(read_only) {}
+    LmdbDatabase(MDB_env* env,
+                 MDB_dbi dbi,
+                 MDB_txn* txn,
+                 std::string path,
+                 bool read_only,
+                 std::optional<OpenLock> open_lock) :
+        env(env), dbi(dbi), txn(txn), path(std::move(path)), read_only_(read_only),
+        open_lock(std::move(open_lock)) {}
 
     bool read_only() const override {
         return read_only_;
@@ -247,6 +414,10 @@ public:
         // writer lock lets the next open start from an empty database.
         if(condemned) {
             remove_database_files(path);
+        }
+        // A shrink cancelled between the copy and the swap leaves its copy.
+        if(!read_only_) {
+            vfs::remove(path + "-compact");
         }
     }
 
@@ -388,6 +559,78 @@ public:
         return Growth::Grown;
     }
 
+    Copy write_compact_copy() override {
+        if(!OpenLock::acquire(path, OpenLock::Kind::Exclusive, /*wait=*/false)) {
+            return Copy::Busy;
+        }
+        // The copy holds the live pages; a volume it would fill fails every
+        // other write on it until the copy fails. Off the event loop, the
+        // resident snapshot is the loop's to read.
+        MDB_txn* own = nullptr;
+        if(int rc = mdb_txn_begin(env, nullptr, MDB_RDONLY, &own)) {
+            note_error(rc);
+            return Copy::Failed;
+        }
+        auto live = usage_of(own);
+        mdb_txn_abort(own);
+        auto space = llvm::sys::fs::disk_space(llvm::sys::path::parent_path(path));
+        if(live && space) {
+            auto needed = (live->pages - live->free_pages) * live->page_size;
+            if(space->available < needed + needed / 4) {
+                LOG_INFO("{} free beside the index database, too little for a compact copy of {}",
+                         format_bytes(space->available),
+                         format_bytes(needed));
+                return Copy::Failed;
+            }
+        }
+        auto copy = path + "-compact";
+        if(int rc = mdb_env_copy2(env, copy.c_str(), MDB_CP_COMPACT)) {
+            note_error(rc);
+            LOG_WARN("Cannot write a compact copy of the index database: {}", mdb_strerror(rc));
+            vfs::remove(copy);
+            return Copy::Failed;
+        }
+        // LMDB writes the copy without syncing it, while the swap renames
+        // it over the file whose commits it syncs.
+        if(auto error = vfs::sync(copy)) {
+            LOG_WARN("Cannot sync the compact copy of the index database: {}", error.message());
+            vfs::remove(copy);
+            return Copy::Failed;
+        }
+        return Copy::Written;
+    }
+
+    Swap swap_compact_copy() override {
+        auto copy = path + "-compact";
+        auto exclusive = OpenLock::acquire(path, OpenLock::Kind::Exclusive, /*wait=*/false);
+        if(!exclusive) {
+            vfs::remove(copy);
+            return Swap::Busy;
+        }
+        MDB_envinfo info;
+        mdb_env_info(env, &info);
+        retire_old_snapshot();
+        mdb_txn_abort(txn);
+        txn = nullptr;
+        mdb_env_close(env);
+        env = nullptr;
+        bool replaced = false;
+        if(opened_elsewhere(path)) {
+            LOG_INFO("A process of an older clice has the index database open; its file is kept");
+        } else if(auto error = llvm::sys::fs::rename(copy, path)) {
+            LOG_WARN("Cannot replace the index database by its compact copy: {}", error.message());
+        } else {
+            replaced = true;
+        }
+        if(!replaced) {
+            vfs::remove(copy);
+        }
+        if(!reopen(info.me_mapsize)) {
+            return Swap::Lost;
+        }
+        return replaced ? Swap::Replaced : Swap::Kept;
+    }
+
     bool corrupted() const override {
         return poisoned.load(std::memory_order_relaxed);
     }
@@ -397,10 +640,16 @@ public:
     }
 
     std::optional<PageUsage> usage() override {
+        return usage_of(txn);
+    }
+
+private:
+    /// How the file's pages are used as of `snapshot`.
+    std::optional<PageUsage> usage_of(MDB_txn* snapshot) const {
         MDB_envinfo info;
         mdb_env_info(env, &info);
         MDB_stat tree;
-        if(mdb_stat(txn, dbi, &tree)) {
+        if(mdb_stat(snapshot, dbi, &tree)) {
             return std::nullopt;
         }
         PageUsage usage{
@@ -412,7 +661,7 @@ public:
         // LMDB keeps its free list in database 0, one record per write
         // transaction that freed pages: their count, then their numbers.
         MDB_cursor* cursor = nullptr;
-        if(mdb_cursor_open(txn, 0, &cursor)) {
+        if(mdb_cursor_open(snapshot, 0, &cursor)) {
             return std::nullopt;
         }
         MDB_val key;
@@ -426,7 +675,35 @@ public:
         return usage;
     }
 
-private:
+    /// Open the environment again after swap_compact_copy() closed it; false,
+    /// the handle unusable, when that fails (logged).
+    bool reopen(std::size_t mapsize) {
+#ifdef _WIN32
+        make_sparse(path);
+#endif
+        int rc = mdb_env_create(&env);
+        if(rc == 0) {
+            configure(env, mapsize);
+            rc = mdb_env_open(env, path.c_str(), lmdb_flags, 0644);
+        }
+        if(rc == 0) {
+            rc = mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
+        }
+        if(rc == 0) {
+            rc = mdb_dbi_open(txn, nullptr, 0, &dbi);
+        }
+        if(rc != 0) {
+            LOG_ERROR("Cannot open the index database at {} again: {}", path, mdb_strerror(rc));
+            mdb_txn_abort(txn);
+            txn = nullptr;
+            mdb_env_close(env);
+            env = nullptr;
+            return false;
+        }
+        generation += 1;
+        return true;
+    }
+
     /// A value of the read snapshot as a ReadBlob. LMDB keeps bytes
     /// readable_in_place only for overflow-page values; a small inline
     /// value is copied and the copy is immortal (generation 0).
@@ -516,28 +793,12 @@ private:
     bool condemned = false;
 
     bool read_only_ = false;
-};
 
-#ifdef _WIN32
-/// Without the sparse attribute Windows backs the whole mapsize with real
-/// disk (CreateFileMapping allocates eagerly), so the file is marked
-/// sparse before LMDB first maps it. Best effort: on a volume without
-/// sparse support each mapsize is simply committed up front, which the
-/// small default keeps tolerable.
-void make_sparse(llvm::StringRef path) {
-    int fd = -1;
-    if(llvm::sys::fs::openFileForReadWrite(path,
-                                           fd,
-                                           llvm::sys::fs::CD_OpenAlways,
-                                           llvm::sys::fs::OF_None)) {
-        return;
-    }
-    auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-    DWORD returned = 0;
-    DeviceIoControl(handle, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
-    llvm::sys::Process::SafelyCloseFileDescriptor(fd);
-}
-#endif
+    /// A reader's lock on the `-open` file, held as long as the database
+    /// is open; the writer holds none, and neither does a reader that cannot
+    /// open the file, in a directory it may not write.
+    std::optional<OpenLock> open_lock;
+};
 
 enum class MetaCheck : std::uint8_t {
     Ok,
@@ -608,6 +869,33 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef directory,
 
     auto mapsize = initial_mapsize != 0 ? initial_mapsize : default_mapsize();
 
+    // A writer killed while writing a compact copy left it behind; only a
+    // writer writes one.
+    if(!read_only) {
+        vfs::remove(path + "-compact");
+    }
+
+    // The writer swaps in a compact copy while no reader has the file open,
+    // for milliseconds, which a reader arriving meanwhile waits out. The
+    // writer itself only makes sure the lock file exists for readers that
+    // may not create it.
+    std::optional<OpenLock> open_lock;
+    if(read_only) {
+        open_lock = OpenLock::acquire(path, OpenLock::Kind::Shared, /*wait=*/true);
+        if(!open_lock) {
+            LOG_WARN("Cannot lock the index database at {} for reading ({}-open)", path, path);
+            return nullptr;
+        }
+    } else {
+        int fd = -1;
+        if(!llvm::sys::fs::openFileForReadWrite(path + "-open",
+                                                fd,
+                                                llvm::sys::fs::CD_OpenAlways,
+                                                llvm::sys::fs::OF_None)) {
+            llvm::sys::Process::SafelyCloseFileDescriptor(fd);
+        }
+    }
+
     // One recovery retry: confirmed corruption (or a meta mismatch) is
     // repaired by deleting the database — it is a rebuildable cache, and
     // the writer lock guarantees no other live process is using it.
@@ -638,11 +926,8 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef directory,
             discard_created();
             return nullptr;
         }
-        mdb_env_set_mapsize(env, mapsize);
-        // Every `clice query` beside a server holds a slot while it runs;
-        // LMDB's default of 126 is within reach of an agent's parallel calls.
-        mdb_env_set_maxreaders(env, 1024);
-        unsigned flags = MDB_NOSUBDIR | MDB_NOTLS | (read_only ? MDB_RDONLY : 0);
+        configure(env, mapsize);
+        unsigned flags = lmdb_flags | (read_only ? MDB_RDONLY : 0);
         // True = the failure was repaired by deleting the database and the
         // loop should retry; false = give up with persistence disabled.
         auto fail = [&](int rc, llvm::StringRef stage) {
@@ -781,7 +1066,12 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef directory,
                 return nullptr;
             }
         }
-        return std::make_unique<LmdbDatabase>(env, dbi, txn, std::move(path), read_only);
+        return std::make_unique<LmdbDatabase>(env,
+                                              dbi,
+                                              txn,
+                                              std::move(path),
+                                              read_only,
+                                              std::move(open_lock));
     }
 }
 

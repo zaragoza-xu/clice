@@ -225,4 +225,73 @@ kota::task<index::IndexReport> save_project(Project& project,
     co_return report;
 }
 
+bool shrink_due(const index::PageUsage& usage) {
+    constexpr std::uint64_t worth = 64ull << 20;
+    auto free = usage.free_pages * usage.page_size;
+    return free >= worth && free * 4 >= usage.pages * usage.page_size;
+}
+
+kota::task<index::IndexReport> shrink_database(Project& project, kota::event_loop& loop) {
+    index::IndexReport report;
+    if(!project.database || project.database->read_only()) {
+        co_return report;
+    }
+    co_await project.save_gate.acquire();
+    auto gate = llvm::make_scope_exit([&] { project.save_gate.release(); });
+    // Re-checked: the gate holder we waited out may have failed to reopen
+    // the database. A damaged one is the next save's to discard.
+    if(!project.database || project.database->corrupted() || project.index.damaged() ||
+       project.shrink_failed) {
+        co_return report;
+    }
+    auto& db = *project.database;
+    auto before = db.usage();
+    if(!before || !shrink_due(*before)) {
+        co_return report;
+    }
+    ScopedTimer timer;
+    using Database = index::BlobDatabase;
+    auto copy = Database::Copy::Failed;
+    co_await kota::queue([&] { copy = db.write_compact_copy(); });
+    switch(copy) {
+        case Database::Copy::Written: break;
+        case Database::Copy::Busy: co_return report;
+        case Database::Copy::Failed:
+            project.shrink_failed = true;
+            // The copy read every page: a damaged one it met is discarded
+            // now, as a save meeting it would.
+            if(db.corrupted()) {
+                recover_corrupt_database(project, report);
+            }
+            co_return report;
+    }
+    // A handle lost in the swap lists no unit any more.
+    llvm::SmallVector<Fid> units;
+    project.index.for_each_unit([&](Fid unit) { units.push_back(unit); });
+    switch(db.swap_compact_copy()) {
+        case Database::Swap::Busy:
+            LOG_INFO("Another process opened the index database; its file shrinks later");
+            co_return report;
+        case Database::Swap::Lost:
+            recover_corrupt_database(project, report);
+            for(auto unit: units) {
+                report.add_reindex(unit);
+            }
+            co_return report;
+        case Database::Swap::Kept: project.shrink_failed = true; break;
+        case Database::Swap::Replaced: break;
+    }
+    if(!co_await project.index.rebind_views(db, loop, /*at_once=*/true)) {
+        recover_corrupt_database(project, report);
+        co_return report;
+    }
+    auto after = db.usage();
+    LOG_PERF("index",
+             "phase=shrink before_mb={} after_mb={} elapsed_ms={}",
+             before->pages * before->page_size >> 20,
+             after ? after->pages * after->page_size >> 20 : 0,
+             timer.ms());
+    co_return report;
+}
+
 }  // namespace clice

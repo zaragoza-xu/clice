@@ -13,7 +13,6 @@ import :command.toolchains.nvcc;
 import :command.table;
 import :support.logging;
 import :support.shell;
-import :vfs.cygwin;
 import :vfs.file_system;
 import :vfs.path;
 
@@ -43,9 +42,11 @@ bool is_assignment_token(llvm::StringRef token) {
 
 }  // namespace
 
-Spelling spelled(llvm::StringRef text, const Spelling& base, const MountTable* mounts) {
-    if(mounts && is_posix_path(text)) {
-        return Spelling::absolute(mounts->to_windows(text));
+Spelling spelled(llvm::StringRef text, const Spelling& base, const fs::cygwin::MountTable* mounts) {
+    if(mounts && fs::cygwin::is_posix_path(text)) {
+        std::string windows;
+        mounts->to_windows(windows, text);
+        return Spelling::absolute(windows);
     }
     return Spelling(text, base);
 }
@@ -54,11 +55,14 @@ llvm::StringRef anchored(CommandTable& commands,
                          unsigned id,
                          llvm::StringRef value,
                          const Spelling& anchor,
-                         const MountTable* mounts) {
+                         const fs::cygwin::MountTable* mounts) {
     // A forced include names a file too, which clang looks for rather than
     // anchors when relative.
-    if(mounts && is_posix_path(value) && (id == option::OPT_include || id == option::OPT_imacros)) {
-        return commands.intern(mounts->to_windows(value));
+    if(mounts && fs::cygwin::is_posix_path(value) &&
+       (id == option::OPT_include || id == option::OPT_imacros)) {
+        std::string windows;
+        mounts->to_windows(windows, value);
+        return commands.intern(windows);
     }
     if(!names_path(id, value)) {
         return value;
@@ -99,9 +103,12 @@ std::optional<CommandID> Normalizer::normalize(const Spelling& directory,
     Command command;
     command.directory = commands.intern(directory.str()).data();
     llvm::StringRef driver = arguments[0];
-    command.driver =
-        commands.intern(mounts && is_posix_path(driver) ? mounts->to_windows(driver) : driver.str())
-            .data();
+    std::string windows;
+    if(mounts && fs::cygwin::is_posix_path(driver)) {
+        mounts->to_windows(windows, driver);
+        driver = windows;
+    }
+    command.driver = commands.intern(driver).data();
     arguments = arguments.drop_front();
 
     command.family = driver_family(command.driver);
@@ -350,12 +357,15 @@ void Normalizer::expand_response_files(llvm::SmallVectorImpl<const char*>& token
         }
 
         /// UTF-16 response files (MSVC tooling emits them) convert first.
-        llvm::StringRef text = observed->content->getBuffer();
+        llvm::StringRef text = observed->text;
         std::string utf8;
         if(text.size() >= 2 &&
            ((text[0] == '\xff' && text[1] == '\xfe') || (text[0] == '\xfe' && text[1] == '\xff'))) {
-            llvm::ArrayRef<char> bytes(text.data(), text.size());
-            if(!llvm::convertUTF16ToUTF8String(bytes, utf8)) {
+            // Copied: a string's bytes need not be aligned for UTF-16 (libc++
+            // keeps a short one at an odd address).
+            llvm::SmallVector<llvm::UTF16, 256> units(text.size() / 2);
+            std::memcpy(units.data(), text.data(), units.size() * sizeof(llvm::UTF16));
+            if(text.size() % 2 != 0 || !llvm::convertUTF16ToUTF8String(units, utf8)) {
                 LOG_WARN("Cannot decode UTF-16 response file {}", full);
                 return false;
             }
@@ -364,7 +374,10 @@ void Normalizer::expand_response_files(llvm::SmallVectorImpl<const char*>& token
 
         llvm::SmallVector<const char*, 32> inner;
         if(cl_mode(family)) {
-            llvm::cl::TokenizeWindowsCommandLineFull(text, saver, inner);
+            for(auto argument:
+                sys::windows::split_command_line(text, sys::windows::CommandLineRules::LLVM)) {
+                inner.push_back(saver.save(llvm::StringRef(argument)).data());
+            }
         } else {
             llvm::cl::TokenizeGNUCommandLine(text, saver, inner);
         }

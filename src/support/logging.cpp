@@ -77,19 +77,18 @@ std::string session_log_directory(std::string_view logging_dir) {
 #endif
     char timestamp[32];
     std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", &local);
-    llvm::SmallString<256> directory(logging_dir);
-    llvm::sys::path::append(directory,
-                            std::format("{}_{}", timestamp, llvm::sys::Process::getProcessId()));
-    return directory.str().str();
+    std::string directory(logging_dir);
+    fs::path::push(directory, std::format("{}_{}", timestamp, sys::pid()));
+    return directory;
 }
 
 /// Why `dir` could not be created: a file standing where one of its
 /// directories goes is named, which Windows reports as a missing path.
 static std::string creation_error(llvm::StringRef dir, std::error_code error) {
-    for(auto at = dir; !at.empty(); at = llvm::sys::path::parent_path(at)) {
-        if(llvm::sys::fs::exists(at)) {
-            if(!llvm::sys::fs::is_directory(at)) {
-                return std::format("{} is not a directory", at.str());
+    for(auto at: fs::path::ancestors(dir)) {
+        if(fs::exists(at).value_or(false)) {
+            if(!fs::is_directory(at)) {
+                return std::format("{} is not a directory", at);
             }
             break;
         }
@@ -101,15 +100,14 @@ bool file_logger(std::string_view name,
                  std::string_view dir,
                  const Options& options,
                  bool mirror_stderr) {
-    if(auto ec = llvm::sys::fs::create_directories(dir)) {
+    if(auto made = fs::create_directories(dir); !made) {
         spdlog::error("Failed to create log directory {}: {}",
                       std::string(dir),
-                      creation_error(dir, ec));
+                      creation_error(dir, made.error()));
         return false;
     }
-    llvm::SmallString<256> joined(dir);
-    llvm::sys::path::append(joined, std::format("{}.log", name));
-    auto filepath = joined.str().str();
+    std::string filepath(dir);
+    fs::path::push(filepath, std::format("{}.log", name));
     auto opened = FileSink::open(filepath);
     if(!opened) {
         spdlog::error("Failed to open log file {}: {}", filepath, opened.error().message());
@@ -269,16 +267,15 @@ static void crash_handler(void*) {
 
 void install_crash_handler(std::string_view log_path, bool stderr_trace) {
     executable_base = main_executable_base();
-    std::error_code ec;
-    crash_log_stream =
-        std::make_unique<llvm::raw_fd_ostream>(llvm::StringRef(log_path.data(), log_path.size()),
-                                               ec,
-                                               llvm::sys::fs::OF_Append);
-    if(ec) {
-        LOG_WARN("Failed to install crash handler for {}: {}", log_path, ec.message());
-        crash_log_stream.reset();
+    auto fd =
+        fs::File::open(log_path, {.append = true, .create = true}).and_then([](fs::File file) {
+            return std::move(file).into_descriptor();
+        });
+    if(!fd) {
+        LOG_WARN("Failed to install crash handler for {}: {}", log_path, fd.error().message());
         return;
     }
+    crash_log_stream = std::make_unique<llvm::raw_fd_ostream>(*fd, /*shouldClose=*/true);
     llvm::sys::AddSignalHandler(crash_handler, nullptr);
     // Workers skip the stderr backtrace: their crash traces belong in their
     // own log file only, not relayed into the master log via the stderr pipe.

@@ -264,7 +264,7 @@ struct WorkerPoolFixture {
                std::uint32_t stateful = 0,
                std::uint32_t min_stateless = 0) {
         WorkerPoolOptions opts;
-        opts.self_path = clice_binary();
+        opts.program = clice_binary();
         opts.stateless_count = stateless;
         opts.stateful_count = stateful;
         opts.min_stateless = min_stateless;
@@ -907,7 +907,7 @@ ZEST_CASE(SpawnFailReportsAnomaly) {
     logging::set_anomaly_trap_for_testing([&](logging::AnomalyId id) { trapped.push_back(id); });
 
     WorkerPoolOptions opts;
-    opts.self_path = "/nonexistent/clice-binary";
+    opts.program = "/nonexistent/clice-binary";
     opts.stateless_count = 1;
     opts.stateful_count = 0;
     ZEXPECT(!f.pool.start(opts));
@@ -1546,8 +1546,11 @@ ZEST_CASE(FloorAboveStartupKept) {
 #ifdef __linux__
 ZEST_CASE(IdleKeepsSessionScore) {
     auto score = [](llvm::StringRef pid) {
-        auto file = llvm::MemoryBuffer::getFileAsStream("/proc/" + pid + "/oom_score_adj");
-        return file ? (*file)->getBuffer().trim().str() : std::string();
+        std::string text;
+        if(fs::read_file(text, "/proc/" + pid.str() + "/oom_score_adj")) {
+            return std::string();
+        }
+        return llvm::StringRef(text).trim().str();
     };
     WorkerPoolFixture f;
     bool done = false;
@@ -1567,9 +1570,10 @@ ZEST_CASE(IdleKeepsSessionScore) {
 
 ZEST_CASE(BusyRanksAboveMaster) {
     auto score = [](const std::string& pid) {
-        auto file = llvm::MemoryBuffer::getFileAsStream("/proc/" + pid + "/oom_score_adj");
+        std::string text;
         int value = -2000;
-        if(file && (*file)->getBuffer().trim().getAsInteger(10, value)) {
+        if(fs::read_file(text, "/proc/" + pid + "/oom_score_adj") ||
+           llvm::StringRef(text).trim().getAsInteger(10, value)) {
             value = -2000;
         }
         return value;

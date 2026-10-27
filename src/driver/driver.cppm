@@ -17,7 +17,6 @@ import :server.query_commands;
 import :support.json;
 import :support.logging;
 import :support.process;
-import :vfs.file_system;
 import :vfs.path;
 
 namespace clice::driver {
@@ -43,10 +42,10 @@ enum class Command : std::uint8_t {
 using CommandHandler = kota::function<int(std::span<std::string>)>;
 
 /// A subcommand as its file registers it: its line of `clice --help`, and
-/// what makes its handler, given the path of this executable.
+/// what makes its handler.
 struct CommandEntry {
     std::string_view description;
-    CommandHandler (*build)(const char* self_path) = nullptr;
+    CommandHandler (*build)() = nullptr;
 };
 
 inline auto& command_entries() {
@@ -74,14 +73,14 @@ int run_worker(std::span<std::string> args);
 
 /// Add every subcommand to `root`, in the order of Command. One whose file
 /// did not register it stops the program.
-inline void add_commands(kota::deco::cli::SubCommander& root, const char* self_path) {
+inline void add_commands(kota::deco::cli::SubCommander& root) {
     for(auto command: kota::meta::reflection<Command>::member_values) {
         auto name = kota::meta::enum_name(command);
         auto& entry = command_entries()[std::to_underlying(command)];
         if(!entry.build) {
             logging::critical("The {} subcommand is not registered", name);
         }
-        root.add({.name = name, .description = entry.description}, entry.build(self_path));
+        root.add({.name = name, .description = entry.description}, entry.build());
     }
 }
 
@@ -100,7 +99,7 @@ inline void add_commands(kota::deco::cli::SubCommander& root, const char* self_p
 /// line must not end a run before it saves.
 inline void write_output(std::FILE* stream, std::string_view text) {
     int fd = ::fileno(stream);
-    if(write_console(fd, text)) {
+    if(sys::is_console(fd) && !sys::write_console(fd, text)) {
         return;
     }
     if(std::fwrite(text.data(), 1, text.size(), stream) == text.size() &&
@@ -111,7 +110,7 @@ inline void write_output(std::FILE* stream, std::string_view text) {
         return;
     }
     int error = errno;
-    if(error != EAGAIN && is_pipe_or_socket(fd)) {
+    if(error != EAGAIN && sys::is_pipe(fd)) {
 #ifdef _WIN32
         std::_Exit(141);
 #else
@@ -257,7 +256,7 @@ struct FreshOption {
 /// Whether the workspace a batch subcommand names is a directory; one that
 /// is not is reported, never created for the run's cache and logs.
 inline bool workspace_exists(const Spelling& workspace) {
-    if(vfs::is_directory(workspace)) {
+    if(fs::is_directory(workspace)) {
         return true;
     }
     LOG_ERROR("{}: not a directory", workspace);
@@ -453,8 +452,7 @@ inline CommandHandler with_operations(std::string_view overview,
 /// failed to index, or why the refresh could not run.
 inline std::expected<std::vector<std::string>, std::string> refresh(const Spelling& workspace,
                                                                     const Config& config,
-                                                                    llvm::StringRef configuration,
-                                                                    const char* self_path) {
+                                                                    llvm::StringRef configuration) {
     auto& cache_dir = config.project.cache_dir;
     auto writer = index::probe_writer(cache_dir);
     switch(writer.state) {
@@ -482,7 +480,6 @@ inline std::expected<std::vector<std::string>, std::string> refresh(const Spelli
         .root = workspace,
         .config = config,
         .configuration = configuration.str(),
-        .self_path = self_path,
         .on_progress = report_progress,
     });
     if(!result.completed) {
